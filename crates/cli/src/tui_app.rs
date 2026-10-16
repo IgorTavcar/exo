@@ -418,12 +418,14 @@ struct TuiApp {
     /// A finished drag is waiting to be copied from the rendered buffer.
     copy_pending: bool,
     spinner_frame: usize,
+    status: String,
     session_id: Option<SessionId>,
     watch_after: Arc<Mutex<Option<EventId>>>,
     /// Transcript index of the assistant line currently streaming.
     open_assistant: Option<usize>,
     /// Whether the streaming assistant message already got its prefix line.
     assistant_prefixed: bool,
+    streamed_message: String,
     /// Transcript index of each unresolved tool-call line, by call id.
     open_calls: HashMap<String, usize>,
     /// Tool names by call id, for full-mode results and fallbacks.
@@ -459,10 +461,12 @@ impl TuiApp {
             transcript_inner: Rect::ZERO,
             copy_pending: false,
             spinner_frame: 0,
+            status: "Thinking".into(),
             session_id: None,
             watch_after,
             open_assistant: None,
             assistant_prefixed: false,
+            streamed_message: String::new(),
             open_calls: HashMap::new(),
             pending_tool_names: HashMap::new(),
             approvals: VecDeque::new(),
@@ -809,6 +813,8 @@ impl TuiApp {
     }
 
     fn start_send(&mut self, text: String, tx: mpsc::UnboundedSender<AppEvent>) {
+        self.streamed_message.clear();
+        self.status = "Starting turn".into();
         self.busy.store(true, Ordering::Relaxed);
         self.open_assistant = None;
         self.assistant_prefixed = false;
@@ -910,6 +916,29 @@ impl TuiApp {
 
     fn handle_stream_event(&mut self, event: ExecutionStreamEvent) {
         match event {
+            ExecutionStreamEvent::Messages { messages } => {
+                for message in messages {
+                    if let Message::Assistant { content, .. } = message {
+                        let text =
+                            crate::render::render_assistant_content(&content, Verbosity::Minimal);
+                        let tail = text
+                            .strip_prefix(&self.streamed_message)
+                            .unwrap_or(&text)
+                            .to_owned();
+                        if !tail.is_empty() {
+                            self.append_assistant_text(&tail);
+                        }
+                        if !text.is_empty() {
+                            self.streamed_message.clear();
+                            self.open_assistant = None;
+                            self.assistant_prefixed = false;
+                        }
+                    }
+                }
+            }
+            ExecutionStreamEvent::Checkpoint { event_id } => {
+                *self.watch_after.lock().expect("watch cursor poisoned") = Some(event_id);
+            }
             ExecutionStreamEvent::Status { message } => self.runtime_status = Some(message),
             ExecutionStreamEvent::ApprovalRequested { turn, approval } => {
                 self.runtime_status = None;
@@ -926,6 +955,7 @@ impl TuiApp {
                 let text = chunk_text(&chunk);
                 if !text.is_empty() {
                     self.append_assistant_text(&text);
+                    self.streamed_message.push_str(&text);
                 }
             }
             ExecutionStreamEvent::ToolCall {

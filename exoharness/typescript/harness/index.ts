@@ -421,6 +421,7 @@ export interface TurnContext {
   ): Promise<SandboxProcess>;
   executePendingTools(toolCalls: PendingToolCall[]): Promise<EventData[]>;
   stream: {
+    status(message: string): Promise<void>;
     firstChunk(ttftMs: number): Promise<void>;
     text(text: string): Promise<void>;
     /** For custom tool events (e.g. RLM); canonical tool events stream after persistence. */
@@ -958,5 +959,4 @@ export function toJsonObject(value: unknown): JsonObject {
 export * from "./tools";
 export * from "./built-in-tools";
 export * from "./tool-modules";
-export * from "./adapter-tools";
 export * from "./skill-tools";

@@ -214,10 +214,18 @@ impl ActiveEventTurn {
             })
             .collect::<Result<Vec<_>>>()?;
         if let Some(stream) = &self.stream {
+            let mut checkpoint = None;
             for event in &events {
                 if let Some(output) = execution_stream_event(event.data.clone()) {
                     crate::shared::try_send_stream_event(stream, output);
+                    checkpoint = Some(event.id);
                 }
+            }
+            if let Some(event_id) = checkpoint {
+                crate::shared::try_send_stream_event(
+                    stream,
+                    ExecutionStreamEvent::Checkpoint { event_id },
+                );
             }
         }
         Ok(HarnessEventAck { events })
@@ -226,6 +234,7 @@ impl ActiveEventTurn {
 
 fn execution_stream_event(data: EventData) -> Option<ExecutionStreamEvent> {
     match data {
+        EventData::Messages { messages, .. } => Some(ExecutionStreamEvent::Messages { messages }),
         EventData::LinguaStreamChunk { chunk } => Some(ExecutionStreamEvent::Chunk(chunk)),
         EventData::ToolRequested {
             tool_call_id,
@@ -309,13 +318,21 @@ impl HarnessEventHandler for HarnessEvents {
 pub(crate) fn turn_stream(
     events: exoharness::EventStream,
     turn: exoharness::TurnRecord,
+    failure: Option<String>,
 ) -> impl futures::Stream<Item = Result<crate::ExecutionStreamEvent>> + Send {
-    futures::stream::try_unfold(Some((events, None)), move |state| {
+    use crate::ExecutionStreamEvent as Output;
+    futures::stream::try_unfold(Some((events, failure, None)), move |state| {
         let turn = turn.clone();
         async move {
-            let Some((mut events, mut failure)) = state else {
+            let Some((mut events, mut failure, checkpoint)) = state else {
                 return Ok(None);
             };
+            if let Some(event_id) = checkpoint {
+                return Ok(Some((
+                    Output::Checkpoint { event_id },
+                    Some((events, failure, None)),
+                )));
+            }
             loop {
                 let event = events.next().await.context(
                     "runtime progress disconnected; reconnect to retrieve saved history",
@@ -323,7 +340,6 @@ pub(crate) fn turn_stream(
                 if event.turn_id != Some(turn.id) {
                     continue;
                 }
-                use crate::ExecutionStreamEvent as Output;
                 let output = match event.data {
                     EventData::Custom {
                         event_type,
@@ -352,7 +368,7 @@ pub(crate) fn turn_stream(
                     }
                     EventData::TurnEnded => {
                         if let Some(message) = failure {
-                            bail!(message);
+                            return Err(crate::turn_queue::TurnFailed(message).into());
                         }
                         return Ok(Some((
                             Output::Completed(crate::SendResult {
@@ -366,7 +382,7 @@ pub(crate) fn turn_stream(
                     data => execution_stream_event(data),
                 };
                 if let Some(output) = output {
-                    return Ok(Some((output, Some((events, failure)))));
+                    return Ok(Some((output, Some((events, failure, Some(event.id))))));
                 }
             }
         }

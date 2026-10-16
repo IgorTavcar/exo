@@ -33,8 +33,20 @@ pub async fn connect_mcp(
             selection.validate_servers(&servers)?;
             let credentials = managed::vaults::VaultMcpCredentials::new(vaults, selection.clone());
             Arc::new(
-                McpToolSet::connect_with_connector(&servers, Arc::new(credentials), connector)
-                    .await?,
+                if thread
+                    .caller()
+                    .is_some_and(|caller| caller.principal.starts_with("adapter-"))
+                {
+                    McpToolSet::connect_available_with_connector(
+                        &servers,
+                        Arc::new(credentials),
+                        connector,
+                    )
+                    .await?
+                } else {
+                    McpToolSet::connect_with_connector(&servers, Arc::new(credentials), connector)
+                        .await?
+                },
             )
         }
         None => Arc::default(),

@@ -847,11 +847,13 @@ async fn approval_decisions_cancellation_sessions_and_reconnect() -> Result<()> 
                 let approval = tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
                         match stream.next().await.context("approval event")?? {
-                            crate::ExecutionStreamEvent::Status { .. } => continue,
+                            crate::ExecutionStreamEvent::Completed(_) => {
+                                panic!("turn finished without approval")
+                            }
                             crate::ExecutionStreamEvent::ApprovalRequested { approval, .. } => {
                                 return Ok::<_, anyhow::Error>(approval);
                             }
-                            event => panic!("expected approval, got {event:?}"),
+                            _ => {}
                         }
                     }
                 })
