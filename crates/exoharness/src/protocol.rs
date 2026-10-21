@@ -211,6 +211,7 @@ pub enum Request {
     SnapshotSandbox {
         scope: SnapshotScope,
         sandbox_id: SandboxId,
+        snapshot_kind: crate::SnapshotKind,
     },
     StartSandbox {
         scope: SnapshotScope,
