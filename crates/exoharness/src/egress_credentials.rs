@@ -29,6 +29,7 @@ pub struct EgressDestination {
 /// Looks up a binding for this sandbox's agent/thread on every use. The local
 /// implementation reads Exo's encrypted store; a hosted implementation can use
 /// its own vault and authorization. Only the proxy receives the returned value.
+/// Return [`EgressError::Rejected`] to explain a denial safely to the sandbox.
 #[async_trait]
 pub trait EgressCredentialResolver: Send + Sync {
     async fn resolve(
@@ -36,7 +37,7 @@ pub trait EgressCredentialResolver: Send + Sync {
         identity: &EgressIdentity,
         binding_name: &str,
         destination: &EgressDestination,
-    ) -> Result<String>;
+    ) -> Result<String, EgressError>;
 
     async fn refresh(
         &self,
@@ -44,7 +45,7 @@ pub trait EgressCredentialResolver: Send + Sync {
         _binding_name: &str,
         _destination: &EgressDestination,
         _rejected: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<String>, EgressError> {
         Ok(None)
     }
 }
@@ -166,7 +167,7 @@ pub(crate) async fn substitute_credentials(
     destination: &EgressDestination,
     identity: &EgressIdentity,
     resolver: &dyn EgressCredentialResolver,
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<(String, String)>, EgressError> {
     let mut credentials = Vec::new();
     for (header, header_value) in headers.iter_mut() {
         let basic = basic_credential_placeholder(header, header_value)?;
@@ -176,7 +177,10 @@ pub(crate) async fn substitute_credentials(
         let encode_basic = basic.is_some();
         let mut replacement = match basic {
             Some(value) => value,
-            None => header_value.to_str()?.to_owned(),
+            None => header_value
+                .to_str()
+                .context("invalid credential header")?
+                .to_owned(),
         };
         for binding in bindings {
             if !binding.permits_header(destination) || !replacement.contains(&binding.placeholder) {
@@ -184,8 +188,7 @@ pub(crate) async fn substitute_credentials(
             }
             let value = resolver
                 .resolve(identity, &binding.config.name, destination)
-                .await
-                .context("credential is unavailable or not authorized")?;
+                .await?;
             replacement = replacement.replace(&binding.placeholder, &value);
             credentials.push((binding.config.name.clone(), value));
         }
@@ -300,7 +303,7 @@ impl CredentialBindings {
         destination: &EgressDestination,
         identity: &EgressIdentity,
         resolver: &dyn EgressCredentialResolver,
-    ) -> Result<()> {
+    ) -> Result<(), EgressError> {
         self.substitute_tracked(headers, destination, identity, resolver)
             .await?;
         Ok(())
@@ -313,17 +316,27 @@ impl CredentialBindings {
         destination: &EgressDestination,
         identity: &EgressIdentity,
         resolver: &dyn EgressCredentialResolver,
-    ) -> Result<Vec<(String, String)>> {
+    ) -> Result<Vec<(String, String)>, EgressError> {
         substitute_credentials(&self.bindings, headers, destination, identity, resolver).await
     }
 }
 
-/// Only policy rejections receive 403; I/O and corrupt stored state remain errors.
+/// Failures while authorizing or forwarding an egress request.
 #[derive(Debug, thiserror::Error)]
-#[error("egress request denied")]
-pub struct EgressDenied;
-pub fn denied(error: impl Into<anyhow::Error>) -> anyhow::Error {
-    error.into().context(EgressDenied)
+pub enum EgressError {
+    /// A denial with a sandbox-safe message, returned as plain-text HTTP 403.
+    #[error("{0}")]
+    Rejected(String),
+    /// A policy denial whose diagnostic must not be exposed by the native proxy.
+    #[error("egress request denied: {0}")]
+    Denied(#[source] anyhow::Error),
+    /// I/O, corrupt stored state, or another internal failure.
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+pub fn denied(error: impl Into<anyhow::Error>) -> EgressError {
+    EgressError::Denied(error.into())
 }
 
 pub fn credential_fingerprint(value: &str) -> String {
@@ -424,7 +437,7 @@ pub(crate) async fn rewrite_headers(
     tls: bool,
     identity: &EgressIdentity,
     resolver: &dyn EgressCredentialResolver,
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<(String, String)>, EgressError> {
     if headers.contains_key(http::header::UPGRADE) {
         return Err(denied(anyhow!("protocol upgrades are not supported")));
     }
@@ -447,7 +460,7 @@ impl CredentialBindings {
         tls: bool,
         identity: &EgressIdentity,
         resolver: &dyn EgressCredentialResolver,
-    ) -> Result<Vec<(String, String)>> {
+    ) -> Result<Vec<(String, String)>, EgressError> {
         rewrite_headers(
             &self.bindings,
             headers,
