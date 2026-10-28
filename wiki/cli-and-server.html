@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CLI, server &amp; tooling · Exo internals</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav id="nav"></nav>
+<main>
+<header>
+  <div class="kicker">Runtime internals</div>
+  <h1>CLI, server &amp; tooling</h1>
+  <p class="lede">The <code>exo</code> binary is a thin clap front-end over one <code>executor::Runtime</code>, built either in-process on local files or as an HTTP client of a remote runtime. This page covers how <code>exo run</code> works, the provider/env config model, the three terminal UIs, the test strategy, and the engineering workflow (hooks, CI, fuzzing, docs site, Harbor evals).</p>
+</header>
+
+<h2 id="shape">The shape of the binary</h2>
+
+<p><code>crates/cli</code> is one crate that produces <code>exo</code> (<span class="src">crates/cli/src/main.rs</span>, 2.8k lines, mostly the clap tree and a giant <code>match</code>) plus an optional <code>exo-provider-contract</code> test binary (<span class="src">crates/cli/src/bin/provider_contract.rs:1-25</span>) that runs <code>executor::contract_tests::test_provider</code> against any managed-agent HTTP endpoint. There is no daemon and no background service: every invocation builds its own runtime, does one thing, and shuts it down (<span class="src">crates/cli/src/main.rs:2005-2007</span>). Almost every command is written against <code>Runtime</code>; whether that runtime is backed by local files or by HTTP is decided once, up front.</p>
+
+<table>
+<thead><tr><th>File</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><span class="src">crates/cli/src/main.rs</span></td><td>Clap tree (<code>Cli</code>, <code>Commands</code>), <code>run</code>/<code>run_selected</code> dispatch, mount/slug/env-name helpers, <code>agent doctor</code></td></tr>
+<tr><td><span class="src">crates/cli/src/providers.rs</span></td><td>Provider profiles store, selection precedence, alias pinning, and <code>providers::runtime()</code> (local vs HTTP)</td></tr>
+<tr><td><span class="src">crates/cli/src/providers/oauth.rs</span></td><td>OAuth login for HTTP providers; tokens in the OS keychain via <code>keyring</code></td></tr>
+<tr><td><span class="src">crates/cli/src/managed_agents.rs</span></td><td><code>ThreadArgs</code>, agent-file loading, <code>open_agent</code>/<code>open_thread</code>, model-credential pre-flight</td></tr>
+<tr><td><span class="src">crates/cli/src/serve.rs</span></td><td><code>exo run --serve</code>: HTTP service + adapter supervision + preview listener</td></tr>
+<tr><td><span class="src">crates/cli/src/tui.rs</span></td><td>Line-mode REPL (<code>rustyline</code>) and <code>--prompt</code> one-shot; also the shared slash-command helpers</td></tr>
+<tr><td><span class="src">crates/cli/src/tui_app.rs</span></td><td>Full-screen <code>ratatui</code> UI (<code>--tui</code>)</td></tr>
+<tr><td><span class="src">crates/cli/src/render.rs</span>, <span class="src">crates/cli/src/turn_display.rs</span></td><td>Transcript rendering by verbosity; spinner, progress side-channel, usage/cost tracker</td></tr>
+<tr><td><span class="src">crates/cli/src/environment.rs</span>, <span class="src">crates/cli/src/identity.rs</span>, <span class="src">crates/cli/src/vaults.rs</span></td><td><code>environment</code>, <code>identity</code>, <code>vault</code> subcommands (vault internals: <a href="egress-and-vaults.html">egress &amp; vaults</a>)</td></tr>
+<tr><td><span class="src">crates/cli/src/port_forward.rs</span>, <span class="src">crates/cli/src/previews.rs</span></td><td><code>sandbox forward</code> TCP proxy; browser-preview URL printing</td></tr>
+<tr><td><span class="src">crates/cli/src/env.rs</span></td><td><code>--env-file</code> parser (<code>CliEnvironment</code>)</td></tr>
+</tbody>
+</table>
+
+<h2 id="commands">Command tree</h2>
+
+<p>Top-level names are in <span class="src">crates/cli/src/main.rs:536-608</span>. Three global options live on <code>Cli</code> itself (<span class="src">crates/cli/src/main.rs:66-80</span>): <code>--root</code>/<code>EXO_HOME</code> (default <code>~/.exo</code>), <code>--provider</code> (a provider <em>profile</em>, not a sandbox provider), and <code>--config-dir</code>/<code>EXO_CONFIG_DIR</code> (default <code>&lt;root&gt;/config</code>). <code>RuntimeArgs</code> (<code>--secret-backend</code>, <code>--master-key-path</code>, <code>--env-file</code>) are flattened into every command except <code>provider</code> (<span class="src">crates/cli/src/main.rs:82-93</span>); <code>ExecutionArgs</code> (<code>--harness</code>, <code>--egress-policy</code>, pricing, Braintrust) only exist on <code>run</code> and <code>thread send</code> (<span class="src">crates/cli/src/main.rs:104-124</span>).</p>
+
+<table>
+<thead><tr><th>Command</th><th>Subcommands / purpose</th><th>Works on HTTP provider?</th></tr></thead>
+<tbody>
+<tr><td><code>exo run &lt;AGENT&gt;</code></td><td>Agent is a Markdown spec path or a saved agent name/ID. Default: line REPL. <code>--prompt</code> one-shot, <code>--tui</code> full-screen, <code>--serve</code> HTTP server. Also <code>--thread</code>, <code>--model</code>, <code>--vault</code>, <code>--environment[-file]</code>, <code>--sandbox</code>, <code>--sandbox-image</code>, <code>--mount HOST:GUEST[:ro|rw]</code>, <code>--verbosity</code></td><td>Inline chat and <code>--prompt</code> only; no <code>--serve</code>, <code>--tui</code>, sandbox overrides or mounts</td></tr>
+<tr><td><code>exo agent</code></td><td><code>list</code>, <code>create &lt;file&gt;</code>, <code>update &lt;file&gt;</code>, <code>get</code> (alias <code>show</code>), <code>delete</code>, <code>doctor</code>, <code>mount {list,create|add,delete|remove}</code></td><td>All but <code>mount</code></td></tr>
+<tr><td><code>exo thread</code> (alias <code>conversation</code>)</td><td><code>list</code>, <code>create</code>, <code>fork --up-to</code>, <code>update</code> (model override, sandbox scope/image/provider, <code>--vault</code>), <code>get</code>, <code>events</code> (typed, paginated JSON), <code>ports</code>, <code>mount</code>, <code>send</code> (wake-up message, no chat UI), <code>delete</code>, <code>complete-rebuild-update</code></td><td><code>list</code>, <code>get</code>, <code>ports</code>, <code>events</code>, <code>send</code>, <code>delete</code>, and <code>update --vault</code> only</td></tr>
+<tr><td><code>exo sandbox</code></td><td><code>forward --port</code> (local TCP listener to a sandbox port), <code>attach</code>/<code>detach</code> (Docker container only), <code>run &lt;cmd&gt;</code></td><td>No</td></tr>
+<tr><td><code>exo vault</code></td><td><code>create</code>, <code>list</code>, <code>get</code>, <code>delete</code>, <code>bind</code>, <code>secret {create,update,delete}</code></td><td>Allowed by the CLI allow-list. <span class="src">docs/providers.md</span> says vault create/delete and secret writes need local Exo, but <span class="src">crates/cli/src/vaults.rs:197-207</span> has remote branches (default vault <code>personal</code> instead of <code>global</code>), so that doc line looks behind the code</td></tr>
+<tr><td><code>exo environment</code></td><td><code>list/get/create/update/delete</code> (YAML), <code>provider {list,create}</code> configures sandbox backend bindings + their vault credential</td><td>CRUD yes; <code>provider</code> must be done on the runtime host</td></tr>
+<tr><td><code>exo identity</code></td><td><code>list</code>, <code>bind/unbind slack</code>, <code>trust/untrust slack</code> (Slack sender &#8594; Exo account pinning)</td><td>Yes (local mode needs the server stopped)</td></tr>
+<tr><td><code>exo provider</code></td><td><code>list/get/clear/create/update/delete/switch/login/logout</code> &mdash; manage <em>where</em> commands run</td><td>n/a (never needs a runtime)</td></tr>
+<tr><td><code>exo firecracker-bridge</code></td><td>Hidden; re-entry point used when Exo runs the egress bridge inside a Lima VM (see <a href="sandboxes.html">sandboxes</a>)</td><td>n/a</td></tr>
+</tbody>
+</table>
+
+<p>The &quot;works on HTTP&quot; column is not documentation: it is the allow-list <code>validate_http_command</code> (<span class="src">crates/cli/src/providers.rs:112-173</span>), which rejects everything else with <em>&quot;this command is not supported by the managed-agent HTTP provider&quot;</em>. The remote HTTP surface itself is documented in <a href="managed-agents.html">managed agents</a>.</p>
+
+<h2 id="exo-run">How <code>exo run</code> works end to end</h2>
+
+<p>There is <strong>no service auto-start</strong>. <code>exo run agent.md</code> constructs the full runtime inside the CLI process (state under <code>~/.exo</code>, sandbox backends registered, model calls made directly), runs the turn loop, and exits. The only long-lived server is <code>exo run --serve</code>, which is something you start yourself. The alternative to in-process is a saved <em>provider profile</em> that points at an HTTP runtime; the same <code>run</code> code then talks to it through <code>HttpProvider</code>.</p>
+
+<pre class="diagram">
+ exo run support.md --prompt "..."            (main.rs:1000  #[tokio::main])
+        |
+        v
+ Cli::parse -&gt; init progress tracing layer (non-serve) -&gt; run()          main.rs:1022
+        |
+        |  providers::Store::load(&lt;root&gt;/config)          providers.json
+        |  Store::selected(--provider | alias | cwd dir | global default)
+        v
+ run_selected()                                                          main.rs:1065
+   |-- profile is Http  -&gt; RuntimeClient (+ API key env or keychain OAuth)
+   |-- profile is Local -&gt; cli.root = profile.root         (a named EXO_HOME)
+   |-- none selected    -&gt; built-in local at --root / ~/.exo
+        |
+        |  CliEnvironment::load(--env-file); load_definition(agent.md)
+        v
+ providers::runtime()                                              providers.rs:17
+   |-- HttpProvider  ----------------------------&gt; remote exo server
+   `-- BasicExoHarness (files) + LocalProvider::managed + cost table
+        |
+        v
+ open_thread(): sync agent from spec -&gt; create/resume thread -&gt; print ids
+ check_model_credentials (local only) -&gt; start_inline_previews
+        |
+        +-- --prompt            -&gt; tui::run_prompt        (one send, then exit)
+        +-- --tui + TTY         -&gt; tui_app::run_chat_tui  (ratatui)
+        `-- otherwise           -&gt; tui::run_chat_repl     (rustyline)
+        |
+        v
+ harness.shutdown()  (always runs, even if the command failed)      main.rs:2005
+</pre>
+
+<h3 id="run-steps">Step by step</h3>
+<ol class="steps">
+<li><strong>Parse and progress setup.</strong> For <code>run</code> without <code>--serve</code>, <code>turn_display::init_progress</code> installs a tracing subscriber whose only job is to turn log events with target <code>exoharness::progress</code> into spinner text (<span class="src">crates/cli/src/main.rs:1000-1014</span>, <span class="src">crates/cli/src/turn_display.rs:14-66</span>).</li>
+<li><strong>Provider selection.</strong> <code>run</code> loads <code>providers.json</code>, then picks a profile (or none). <code>run --serve</code> deliberately ignores any saved selection unless <code>--provider</code> is passed explicitly (<span class="src">crates/cli/src/main.rs:1043-1053</span>). A <code>Connection::Local { root }</code> profile simply rewrites <code>cli.root</code>, so a &quot;local provider&quot; is just a named state directory (<span class="src">crates/cli/src/main.rs:1082-1085</span>).</li>
+<li><strong>Stderr banner for mutations.</strong> Except for read-only commands (list/get/events/doctor), the selected provider and account are printed to <em>stderr</em> as <code>provider: NAME; account: ID</code>, keeping stdout machine-parseable (<span class="src">crates/cli/src/main.rs:1087-1125</span>; asserted in <span class="src">crates/cli/tests/provider_workflow.rs:6-14</span>).</li>
+<li><strong>Alias resolution.</strong> Saved agent/thread aliases are rewritten to remote IDs (<span class="src">crates/cli/src/providers.rs:567-588</span>), then <code>--env-file</code> is loaded and the agent Markdown (<code>AgentDefinition</code>) parsed.</li>
+<li><strong>Runtime construction.</strong> <code>providers::runtime</code> branches HTTP vs local (code below). Local mode builds <code>BasicExoHarness</code> at <code>&lt;root&gt;/exoharness</code>, registers every sandbox backend (<span class="src">crates/cli/src/main.rs:453-468</span>), loads the LiteLLM price table (cached at <code>&lt;root&gt;/cache/litellm_prices.json</code>), and hands the CLI's harness/model/mount flags to the provider as <code>LocalAgentSetup</code>.</li>
+<li><strong>Open thread.</strong> <code>open_thread</code> resolves <code>--environment</code>/<code>--environment-file</code>, attaches <code>--vault</code>s, then either resumes a saved thread (by slug or ID) or creates one; new names are validated to 1&ndash;128 ASCII <code>[A-Za-z0-9_-]</code> chars (<span class="src">crates/cli/src/managed_agents.rs:16-31</span>, <span class="src">crates/cli/src/managed_agents.rs:224-327</span>). It prints <code>agent:</code>, <code>thread:</code>, <code>vault:</code>, <code>model:</code>, and <code>mcp:</code> lines on stdout; tests parse the <code>thread: slug (id)</code> line.</li>
+<li><strong>Pre-flight.</strong> Locally, <code>check_model_credentials</code> verifies the model credential exists in the thread's vaults <em>and</em> its policy permits the model endpoint, and prints the exact <code>exo vault secret update ... --allow-origin</code> fix if not (<span class="src">crates/cli/src/managed_agents.rs:329-383</span>). Then <code>start_inline_previews</code> and the preview URLs are printed.</li>
+<li><strong>Front-end.</strong> One of three UIs, chosen at <span class="src">crates/cli/src/main.rs:1209-1224</span> (see below). The thread slug is pinned as an alias to the provider/account if a provider was selected.</li>
+<li><strong>Teardown.</strong> The command body is wrapped in an async block so <code>harness.shutdown()</code> always runs; the command's error wins, otherwise the shutdown error is returned (<span class="src">crates/cli/src/main.rs:1160</span>, <span class="src">crates/cli/src/main.rs:2003-2007</span>).</li>
+</ol>
+
+<figure class="code">
+<figcaption><strong>One CLI, two runtimes: the fork happens exactly once</strong> <span class="src">crates/cli/src/providers.rs:36-110</span></figcaption>
+<pre><code class="language-rust">    if let Some(client) = client {
+        validate_http_command(&amp;cli.command)?;
+        if matches!(selection, Some(HarnessSelection::TypeScriptModule(_))) {
+            bail!("a remote provider cannot load a client-side TypeScript harness module");
+        }
+        return Ok(Arc::new(executor::Runtime::new(
+            executor::HttpProvider::with_options(
+                client,
+                model,
+                selection.map(crate::format_harness_selection),
+            ),
+            None,
+        )));
+    }
+
+    let state_root = state_root.context("local provider requires a state root")?;
+    let config = crate::build_exo_config(cli, state_root)?;
+    // ...
+    let state = Arc::new(
+        BasicExoHarness::new(config.clone())
+            .await?
+            .with_local_sessions(state_root.to_owned()),
+    );
+    // ...
+    let turns = state.turn_coordinator();
+    let provider = executor::LocalProvider::managed(state.clone(), config, env_vars, pricing)?
+        .with_managed_agents(setup)
+        .with_turn_coordinator(turns);</code></pre>
+</figure>
+
+<figure class="code">
+<figcaption><strong>The front-end choice is three lines of control flow</strong> <span class="src">crates/cli/src/main.rs:1209-1224</span></figcaption>
+<pre><code class="language-rust">            let interactive = io::stdin().is_terminal() &amp;&amp; io::stdout().is_terminal();
+            if let Some(prompt) = prompt {
+                tui::run_prompt(
+                    Arc::clone(&amp;harness), agent, conversation, thread.verbosity, &amp;prompt,
+                ).await?;
+            } else if tui &amp;&amp; interactive {
+                tui_app::run_chat_tui(
+                    Arc::clone(&amp;harness),
+                    agent,
+                    conversation,
+                    thread.verbosity,
+                )
+                .await?;
+            } else {
+                run_chat_repl(Arc::clone(&amp;harness), agent, conversation, thread.verbosity).await?;
+            }</code></pre>
+</figure>
+
+<div class="callout surprise"><p class="callout-title">No daemon, and <code>--tui</code> degrades silently</p>
+<p>Two things differ from what you might expect. First, nothing is auto-started: preview links and scheduled/Slack work only exist while an Exo process owns the root (<span class="src">crates/cli/src/previews.rs:31</span>). Second, <code>--tui</code> on a non-TTY quietly falls back to the plain REPL (the <code>interactive</code> check above), whereas <code>--tui</code> with an HTTP provider is a hard error (<span class="src">crates/cli/src/providers.rs:122</span>). <code>--prompt</code> conflicts with <code>--tui</code> and <code>--serve</code> at the clap level (<span class="src">crates/cli/src/main.rs:577-584</span>).</p></div>
+
+<h3 id="local-only">What only works locally</h3>
+<ul>
+<li><code>--egress-policy FILE</code> is rejected with a remote provider (&quot;put the policy in the remote environment definition&quot;), and conflicts with an environment that already carries a policy (<span class="src">crates/cli/src/main.rs:1142-1149</span>, <span class="src">crates/cli/src/managed_agents.rs:238-265</span>). The file may be JSON, YAML or TOML, picked by extension (<span class="src">crates/cli/src/main.rs:390-404</span>).</li>
+<li>Sandbox overrides and mounts are refused remotely because &quot;remote providers manage their own sandboxes&quot; (<span class="src">crates/cli/src/managed_agents.rs:136-143</span>). Mounts are canonicalized and must be existing directories; mount paths must be absolute (<span class="src">crates/cli/src/main.rs:2216-2280</span>).</li>
+<li>Default sandbox is smolvm (<span class="src">crates/cli/src/main.rs:480-482</span>), the default Cargo feature (<span class="src">crates/cli/Cargo.toml:9-13</span>). Firecracker args exist only with <code>--features firecracker</code>; for commands that do not flatten them, the CLI builds defaults by parsing an empty argv through the same clap struct (<span class="src">crates/cli/src/main.rs:417-425</span>).</li>
+</ul>
+
+<h2 id="serve">Server mode: <code>exo run --serve</code></h2>
+
+<p><span class="src">crates/cli/src/serve.rs:40-183</span> (args at <span class="src">crates/cli/src/serve.rs:15-38</span>) is the whole server entry point. It wires <code>executor::http_service::RuntimeHttpService</code> (the managed-agent HTTP API; see <a href="managed-agents.html">managed agents</a>) to an actix <code>server</code>, plus an <code>AdapterService</code> that supervises Slack and other adapters, plus the browser preview proxy.</p>
+
+<table>
+<thead><tr><th>Flag</th><th>Default</th><th>Behaviour</th></tr></thead>
+<tbody>
+<tr><td><code>--bind</code></td><td><code>127.0.0.1:4766</code></td><td>Non-loopback bind requires <code>--auth-file</code> (OIDC config) unless <code>--adapters-only</code> (<span class="src">crates/cli/src/serve.rs:47-50</span>)</td></tr>
+<tr><td><code>--auth-file</code></td><td>none</td><td>Builds an <code>AuthServer</code> and adopts existing local state into it; prints the OIDC callback URL</td></tr>
+<tr><td><code>--multiplayer</code></td><td>off</td><td>Requires <code>--auth-file</code>; share agents/threads between admitted users, keep vaults private</td></tr>
+<tr><td><code>--preview-domain</code></td><td><code>localhost</code></td><td>DNS suffix for browser previews; a separate preview listener port is printed</td></tr>
+<tr><td><code>--recovery-thread-concurrency</code></td><td>4</td><td>How many interrupted threads resume in parallel after a restart</td></tr>
+<tr><td><code>--adapters-only</code></td><td>off</td><td>Supervise adapters without opening HTTP; fails if any adapter needs a webhook path</td></tr>
+<tr><td>positional <code>AGENT</code></td><td>all agents</td><td>Optional; restricts the service to one agent (<code>for_agent</code>). The test <span class="src">crates/cli/tests/serve.rs:10-60</span> asserts other agents return 404 and creation/deletion return 403</td></tr>
+</tbody>
+</table>
+
+<p>Mutual exclusion is a plain file lock: <code>serve</code> takes <code>&lt;root&gt;/service.lock</code> with <code>try_lock</code> (&quot;another agent service is using this root&quot;) (<span class="src">crates/cli/src/serve.rs:52-62</span>), and <code>exo identity</code> in local mode tries the same lock and refuses to run if the server holds it (<span class="src">crates/cli/src/identity.rs:99-115</span>). Those are the only two users of the lock; a plain <code>exo run</code> does not take it. Shutdown handling is two-phase: the first SIGINT/SIGTERM cancels adapters and stops the HTTP server gracefully, and a second Ctrl-C calls <code>process::exit(130)</code> (<span class="src">crates/cli/src/serve.rs:150-183</span>).</p>
+
+<h2 id="config">Provider, environment and secret configuration</h2>
+
+<p>Three different things are called &quot;provider&quot; or &quot;environment&quot; in this CLI. Keep them apart.</p>
+<table>
+<thead><tr><th>Concept</th><th>What it is</th><th>Where it lives</th></tr></thead>
+<tbody>
+<tr><td><strong>Provider profile</strong> (<code>exo provider</code>, global <code>--provider</code>)</td><td>Where commands <em>execute</em>: built-in local, a named local root, or an HTTP endpoint + credential + context map</td><td><code>&lt;config-dir&gt;/providers.json</code> (<span class="src">crates/cli/src/providers.rs:337-390</span>); OAuth tokens in the OS keychain</td></tr>
+<tr><td><strong>Sandbox provider</strong> (<code>--sandbox docker|smolvm|daytona|...</code>)</td><td>Which sandbox backend runs tool calls (ten values, <span class="src">crates/cli/src/main.rs:354-371</span>); see <a href="sandboxes.html">sandboxes</a></td><td>Per thread/agent config in the harness store</td></tr>
+<tr><td><strong>Environment</strong> (<code>exo environment</code>, <code>--environment</code>)</td><td>A reusable YAML <code>EnvironmentDefinition</code>: image, provider, mounts, egress policy</td><td>The harness store; <code>environment provider create</code> writes <code>Binding::Sandbox</code> records (<span class="src">crates/cli/src/environment.rs:205-333</span>)</td></tr>
+</tbody>
+</table>
+
+<h3 id="profiles">Provider profiles</h3>
+<p><code>Connection</code> is a two-variant serde-tagged enum, <code>Local { root }</code> or <code>Http { endpoint }</code> (<span class="src">crates/cli/src/providers.rs:337-342</span>). A <code>Profile</code> adds an <code>api_key_env</code> <em>name</em> or <code>stored_credentials</code> (keychain OAuth), the authenticated <code>account_id</code>, and a free-form <code>context</code> string map that is sent as JSON in the <code>X-Exo-Context</code> header and otherwise not interpreted (<span class="src">docs/providers.md</span>; <span class="src">crates/cli/src/providers.rs:344-357</span>). Selection precedence in <code>Store::selected</code> (<span class="src">crates/cli/src/providers.rs:491-553</span>):</p>
+<ol class="steps">
+<li>A saved <strong>thread or agent alias</strong> (it carries its own provider, endpoint, account, context). An explicit <code>--provider</code> that disagrees is an error.</li>
+<li>Explicit <code>--provider NAME</code> (uses that profile's context).</li>
+<li>Nearest <strong>directory default</strong> (walks <code>cwd.ancestors()</code>; set by <code>provider switch --local</code>).</li>
+<li>The <strong>global default</strong> (<code>provider switch</code>).</li>
+<li>None: built-in local Exo.</li>
+</ol>
+
+<p><strong>Aliases pin.</strong> After <code>agent create</code> or <code>run</code>, the agent/thread slug is stored with the provider name, connection, account and context at that moment (<span class="src">crates/cli/src/providers.rs:590-648</span>). A later endpoint change makes the alias fail with &quot;provider configuration changed for this alias&quot; instead of silently pointing the name at a different server, and a different logged-in account is rejected with &quot;belongs to a different account&quot; (<span class="src">crates/cli/src/providers.rs:519-523</span>, <span class="src">crates/cli/src/providers.rs:567-588</span>).</p>
+
+<figure class="code">
+<figcaption><strong>Config writes are cross-process safe: flock, reload, mutate, fsync, atomic rename</strong> <span class="src">crates/cli/src/providers.rs:409-432</span></figcaption>
+<pre><code class="language-rust">    fn update&lt;T&gt;(&amp;mut self, operation: impl FnOnce(&amp;mut Config) -&gt; Result&lt;T&gt;) -&gt; Result&lt;T&gt; {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&amp;self.directory)?;
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(self.directory.join("providers.lock"))?;
+        lock.lock()?;
+        let mut config = Self::load(self.directory.clone())?.config;
+        let result = operation(&amp;mut config)?;
+        let mut file = tempfile::NamedTempFile::new_in(&amp;self.directory)?;
+        serde_json::to_writer_pretty(&amp;mut file, &amp;config)?;
+        file.flush()?;
+        file.as_file().sync_all()?;
+        file.persist(self.directory.join("providers.json"))?;
+        self.config = config;
+        Ok(result)
+    }</code></pre>
+</figure>
+
+<p>The closure runs against a <em>freshly reloaded</em> config under the lock, so unrelated changes by another process survive. Profile edits additionally compare-and-swap against the profile the command started from and bail with &quot;changed in another process; retry&quot; (<span class="src">crates/cli/src/providers.rs:434-442</span>); <code>login</code> compares the keychain contents before and after the browser round-trip (<span class="src">crates/cli/src/providers/oauth.rs:325-368</span>). These are covered by the &quot;stale store&quot; unit tests in <span class="src">crates/cli/src/providers/tests.rs:294-395</span>. Credentials: an <code>api_key_env</code> profile reads a bearer token from that env var every run; otherwise OAuth credentials (via <code>rmcp</code>'s <code>AuthorizationManager</code>) are stored in the OS keychain under service <code>exo-provider</code>, keyed by the profile's UUID, with a per-profile lock file (<span class="src">crates/cli/src/providers/oauth.rs:20-93</span>). On a headless box without a keychain, the error tells you to use <code>--api-key-env</code> (<span class="src">crates/cli/src/providers/oauth.rs:39-41</span>).</p>
+
+<p>When a server answers <code>400 {"code":"context_required", ...}</code>, <code>request_error</code> turns that into a ready-to-paste repair command that depends on <em>where the selection came from</em> (<code>provider update</code> for explicit profile, <code>provider switch</code> for global, a <code>cd dir &amp;&amp; ... --local</code> form for directory selections, or an explanation for pinned aliases) (<span class="src">crates/cli/src/providers.rs:294-335</span>).</p>
+
+<h3 id="env">Environment variables, env files, and secrets</h3>
+<table>
+<thead><tr><th>Variable / flag</th><th>Meaning</th><th>Ref</th></tr></thead>
+<tbody>
+<tr><td><code>EXO_HOME</code> / <code>--root</code></td><td>State root; default <code>$HOME/.exo</code>. Harness data lives in <code>&lt;root&gt;/exoharness</code>.</td><td><span class="src">crates/cli/src/main.rs:70-71</span>, <span class="src">crates/cli/src/main.rs:434-440</span></td></tr>
+<tr><td><code>EXO_CONFIG_DIR</code> / <code>--config-dir</code></td><td>Where <code>providers.json</code> and auth locks live (default <code>&lt;root&gt;/config</code>)</td><td><span class="src">crates/cli/src/main.rs:75-77</span>, <span class="src">crates/cli/src/main.rs:1035-1038</span></td></tr>
+<tr><td><code>EXO_SECRET_BACKEND</code>, <code>EXO_MASTER_KEY_PATH</code></td><td>Vault encryption: <code>apple-keychain</code> (macOS default) or <code>file</code> (elsewhere)</td><td><span class="src">crates/cli/src/main.rs:84-88</span>, <span class="src">crates/cli/src/main.rs:470-478</span></td></tr>
+<tr><td><code>--env-file</code></td><td>Dotenv-style file (<code>export </code> prefix, quotes stripped, no interpolation). Values go into the harness's env map and are looked up first by <code>--token-env</code>-style flags; they are not exported into the CLI's own environment.</td><td><span class="src">crates/cli/src/env.rs:41-79</span>, <span class="src">crates/cli/src/main.rs:2521-2537</span></td></tr>
+<tr><td><code>EXO_LITELLM_PRICES_PATH</code> / <code>_URL</code></td><td>Price table for cost reporting (cached under <code>&lt;root&gt;/cache</code>)</td><td><span class="src">crates/cli/src/main.rs:118-123</span>, <span class="src">crates/cli/src/providers.rs:79-89</span></td></tr>
+<tr><td><code>BRAINTRUST_API_KEY</code> / <code>_APP_URL</code> / <code>_API_URL</code></td><td>Optional tracing; flag, then env file</td><td><span class="src">crates/cli/src/env.rs:24-35</span></td></tr>
+<tr><td><code>EXO_FIRECRACKER_*</code>, <code>SMOLVM_BIN</code>, <code>SMOLVM_BOOT_BINARY</code></td><td>Sandbox backend binaries and limits</td><td><span class="src">crates/cli/src/main.rs:157-258</span>, <span class="src">crates/cli/src/environment.rs:183-190</span></td></tr>
+</tbody>
+</table>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: secret flags take variable <em>names</em>, never values</p>
+<p><code>--token-env</code>, <code>--api-key-env</code>, <code>--client-secret-env</code> are validated by <code>parse_env_var_name</code>, which rejects anything that is not an identifier with &quot;pass an environment variable name such as OPENAI_API_KEY, not the secret value&quot; (<span class="src">crates/cli/src/main.rs:2510-2519</span>). A pasted key therefore fails fast instead of landing in shell history or <code>ps</code>. Resolution order is env-file first, then process env (<span class="src">crates/cli/src/main.rs:2521-2537</span>).</p></div>
+
+<h2 id="ui">Terminal UIs and how turn events render</h2>
+
+<p>All three front-ends consume the same stream type, <code>executor::ExecutionStreamEvent</code>, obtained from the <code>Runtime</code> (so they behave identically over local and HTTP providers). The events handled are: <code>Messages</code>, <code>Chunk</code>/<code>FirstChunk</code> (token deltas), <code>ToolCall</code>, <code>ToolResult</code>, <code>ApprovalRequested</code>, <code>Status</code>, <code>Checkpoint</code>, <code>Suspended</code>, <code>Completed</code> (<span class="src">crates/cli/src/tui.rs:696-786</span>).</p>
+
+<table>
+<thead><tr><th></th><th>Line REPL / <code>--prompt</code></th><th>Full-screen <code>--tui</code></th></tr></thead>
+<tbody>
+<tr><td>Code</td><td><span class="src">crates/cli/src/tui.rs:66-93</span>, <code>ChatRepl</code> at <span class="src">crates/cli/src/tui.rs:402-657</span></td><td><span class="src">crates/cli/src/tui_app.rs:376-541</span>, <code>TuiApp</code> at <span class="src">crates/cli/src/tui_app.rs:400-443</span></td></tr>
+<tr><td>Input</td><td><code>rustyline</code>; Alt+Enter for newline; <code>ChatHistory</code> merges this session's lines with earlier user messages fetched lazily from the thread's event log</td><td>Own <code>InputBuffer</code> (UTF-8-safe cursor, wrapping, up to 8 rows), bracketed paste, readline-style Ctrl keys</td></tr>
+<tr><td>Start a turn</td><td><code>runtime.start_turn(..)</code>, returns <code>(TurnRecord, stream)</code> (<span class="src">crates/cli/src/tui.rs:641-656</span>)</td><td><code>runtime.send_stream(..)</code> on a spawned task, events forwarded over an <code>mpsc</code> channel (<span class="src">crates/cli/src/tui_app.rs:821-894</span>)</td></tr>
+<tr><td>Ctrl-C</td><td>Cancels the active turn via <code>runtime.cancel_turn</code>; REPL also calls <code>reconnect_turn</code> at startup to re-attach to a turn still running (<span class="src">crates/cli/src/tui.rs:659-670</span>)</td><td>Clears input, else quits. No <code>cancel_turn</code> or <code>reconnect_turn</code> anywhere in the file</td></tr>
+<tr><td>Approvals</td><td>Blocking <code>Allow? [y]es / [n]o / [a]ll</code> prompt on the same editor (<span class="src">crates/cli/src/tui.rs:814-858</span>)</td><td>Queued in a <code>VecDeque</code>; the next line you type (<code>y/n/a</code>) answers the head of the queue (<span class="src">crates/cli/src/tui_app.rs:674-711</span>)</td></tr>
+<tr><td>Out-of-band messages</td><td>Polled before each prompt via <code>get_events(cursor)</code> (<span class="src">crates/cli/src/tui.rs:860-881</span>)</td><td>1 s background watcher, paused while a turn is busy (<span class="src">crates/cli/src/tui_app.rs:1139-1181</span>)</td></tr>
+</tbody>
+</table>
+
+<h3 id="slash">Slash commands are a clap tree</h3>
+<p>The TUI's <code>/quit /cost /verbosity /shell /snapshot /snapshots /rewind /teleport /help</code> are not a hand-rolled <code>match</code> on strings. They are a clap <code>Subcommand</code> parsed in <code>multicall</code> mode, so aliases, per-command usage, argument types (<code>SnapshotKind</code> is a real parsed enum) and <code>/help</code> output all come from the derive (<span class="src">crates/cli/src/tui_app.rs:35-150</span>). The line REPL implements the same commands with plain string matching (<span class="src">crates/cli/src/tui.rs:444-561</span>), and both reuse the same <code>*_lines</code> helpers that return <code>Vec&lt;String&gt;</code> so a screen-owning UI never writes to stdout directly.</p>
+
+<figure class="code">
+<figcaption><strong>Parsing a REPL line: chat, escaped chat, or a clap command</strong> <span class="src">crates/cli/src/tui_app.rs:35-47</span>, <span class="src">crates/cli/src/tui_app.rs:188-217</span></figcaption>
+<pre><code class="language-rust">#[derive(Debug, clap::Parser)]
+#[command(
+    name = "repl",
+    multicall = true,
+    disable_help_flag = true,
+    about = "repl slash commands"
+)]
+struct ReplCli {
+    #[command(subcommand)]
+    command: ReplCommand,
+}
+
+// ...
+    let Some(stripped) = trimmed.strip_prefix('/') else {
+        return Ok(ReplInput::Chat(trimmed.to_string()));
+    };
+    // `//text` escapes to the chat message `/text`.
+    if stripped.starts_with('/') {
+        return Ok(ReplInput::Chat(stripped.to_string()));
+    }
+    // ...
+    // Shell source must reach the sandbox verbatim: shlex-splitting and
+    // rejoining would change quoting, expansion, pipes, and redirections.
+    let argv: Vec&lt;String&gt; = if matches!(head, "shell" | "sandbox") &amp;&amp; !rest.is_empty() {
+        vec![head.to_string(), rest.to_string()]
+    } else {
+        shlex::split(stripped).ok_or_else(|| {
+            ReplCli::command().error(
+                clap::error::ErrorKind::InvalidValue,
+                "unbalanced quotes in command input",
+            )
+        })?
+    };
+    Ok(ReplInput::Command(ReplCli::try_parse_from(argv)?.command))</code></pre>
+</figure>
+
+<h3 id="render">Rendering: verbosity, folding and the progress side-channel</h3>
+<ul>
+<li><strong>Three verbosity levels</strong> (<code>--verbosity</code>, <code>/verbosity</code>): <code>minimal</code> hides tools, <code>compact</code> (default) shows one line per tool call with its primary argument (first of <code>command</code>, <code>cmd</code>, <code>code</code>) and result status, <code>full</code> expands every argument and result (<span class="src">crates/cli/src/render.rs:22-36</span>).</li>
+<li><strong>Result folding.</strong> For history replay in compact mode, <code>TranscriptFold</code> pre-scans the whole message list, maps each tool-call ID to its result status (<code>✓</code>, <code>✗ exit 2</code>) and appends it to the call line, then suppresses the standalone result (<span class="src">crates/cli/src/render.rs:86-138</span>, <span class="src">crates/cli/src/render.rs:210-253</span>). Live streaming does the same with a <code>pending_tool_calls</code> map (<span class="src">crates/cli/src/tui.rs:736-774</span>).</li>
+<li><strong>Streaming dedupe.</strong> Token deltas are written as they arrive; when the final <code>Messages</code> event lands, only the part of the text not already streamed (<code>strip_prefix(&amp;streamed_message)</code>) is printed (<span class="src">crates/cli/src/tui.rs:697-710</span>). <code>AssistantLine</code> tracks whether a label is open so tool lines interleave cleanly (<span class="src">crates/cli/src/tui.rs:34-64</span>, with unit tests at the bottom of the file).</li>
+<li><strong>Spinner and backend progress.</strong> <code>TurnProgress::wait</code> races a future against Ctrl-C and a 120 ms tick that paints <code>\r\x1b[2K- status</code> to stderr (only when stderr is a TTY). Backend code reports sub-steps (&quot;Pulling image...&quot;) by emitting <code>tracing::info!(target: "exoharness::progress", ..)</code>; a custom layer stores the last message in a global mutex that the spinner swaps into its label. When stderr is not a TTY the same events print as plain log lines (<span class="src">crates/cli/src/turn_display.rs:14-130</span>).</li>
+<li><strong>Usage line.</strong> After each turn, <code>UsageTracker::refresh</code> pages through <code>messages</code> events by cursor, groups <code>UsageRecord</code>s by turn, and prints <code>ttft, duration (tok/s), tokens [total], cost [total]</code>; unmetered assistant messages count as a record with unknown fields so totals degrade to &quot;unavailable&quot; rather than silently under-reporting (<span class="src">crates/cli/src/turn_display.rs:174-262</span>, <span class="src">crates/cli/src/turn_display.rs:311-348</span>). <code>/cost</code> shows the same data per model.</li>
+</ul>
+
+<div class="callout surprise"><p class="callout-title">Replayed history is stamped with &quot;now&quot;</p>
+<p><code>render_message_lines</code> calls <code>compact_timestamp()</code> when it renders each message (<span class="src">crates/cli/src/render.rs:145</span>), and that function formats the current UTC time-of-day (<span class="src">crates/cli/src/render.rs:268-277</span>). So <code>/history</code> or a resumed thread shows every old message with the time you printed it, not the time the event was recorded. Event IDs are UUIDv7, so the real time is recoverable (<code>snapshots_lines</code> does exactly that for snapshot IDs, <span class="src">crates/cli/src/tui.rs:1030-1036</span>), it just is not used here.</p></div>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: the TUI never owns turn state</p>
+<p>The thread's event log is the only source of truth. Background-event display (scheduled-task wake-ups, Slack-initiated messages) is a polling watcher over <code>get_events(cursor)</code> that is <em>paused</em> while <code>busy</code> is set, because the streaming path already rendered those messages and the cursor only advances on <code>Completed</code> (<span class="src">crates/cli/src/tui_app.rs:1151-1158</span>). Only user messages starting with <code>Scheduled task `</code> are shown from the log (<span class="src">crates/cli/src/tui.rs:932-940</span>). Clipboard copy is OSC 52 from the rendered ratatui buffer, with a tmux <code>set-clipboard</code> check that warns when the escape would be swallowed (<span class="src">crates/cli/src/tui_app.rs:1085-1113</span>, <span class="src">crates/cli/src/tui_app.rs:1328-1345</span>).</p></div>
+
+<h2 id="misc-cli">Other CLI pieces worth knowing</h2>
+<ul>
+<li><strong>Mounts.</strong> <code>--mount HOST:GUEST[:ro|rw]</code> (read-only by default) is parsed by <code>parse_mount_spec</code> (<span class="src">crates/cli/src/main.rs:2216-2240</span>); <code>agent mount</code>/<code>thread mount</code> edit the saved config and, when no guest path is given, choose <code>/home/exo/workspace/&lt;basename&gt;[-N]</code> via <code>default_mount_path</code> (<span class="src">crates/cli/src/main.rs:2263-2280</span>; the constant is <span class="src">crates/exoharness/src/sandbox.rs:511</span>). Thread mounts are refused when the thread has an environment, since the environment owns them (<span class="src">crates/cli/src/main.rs:1731-1734</span>). Unit tests: <span class="src">crates/cli/src/mount_tests.rs</span>.</li>
+<li><strong>Thread names.</strong> Auto slugs are <code>word-word-&lt;last 8 hex of a UUIDv7&gt;</code> (e.g. <code>north-anchor-70b08878</code>), with the words picked from two 24-word lists by UUID bytes (<span class="src">crates/cli/src/main.rs:2551-2580</span>; tests in <span class="src">crates/cli/src/naming_tests.rs</span>).</li>
+<li><strong><code>sandbox forward</code></strong> opens a local TCP listener and bridges each connection with <code>copy_bidirectional</code> to <code>conversation.connect_sandbox_tcp</code>, after checking the provider supports TCP (<span class="src">crates/cli/src/port_forward.rs:8-61</span>). Browser previews are the HTTP counterpart, set up by <code>start_inline_previews</code> and printed by <span class="src">crates/cli/src/previews.rs</span>; their implementation is in <a href="sandboxes.html">sandboxes</a>.</li>
+<li><strong><code>agent doctor</code></strong> merges CLI-side checks (definition loads, each adapter's transport vault holds required secrets) with the agent's own <code>diagnose()</code>, prints <code>ok/warning/error: name: message</code> plus a <code>fix:</code> line, and exits 1 on any error (<span class="src">crates/cli/src/main.rs:1413-1438</span>, <span class="src">crates/cli/src/main.rs:2305-2410</span>).</li>
+<li><strong>MCP auth errors</strong> are rendered as one friendly line with the exact <code>exo vault secret create ... --from-agent FILE</code> command to run, unless <code>--verbosity full</code> (<span class="src">crates/cli/src/main.rs:922-998</span>; tests <span class="src">crates/cli/tests/mcp_auth_error.rs</span>).</li>
+<li><strong><code>thread complete-rebuild-update</code></strong> is plumbing for the self-improving example: a guardian process reports the result of a <code>rebuild_and_restart_exo</code>, written first to a side-channel file and then appended to the thread as a host event (<span class="src">crates/cli/src/main.rs:1921-1963</span>).</li>
+</ul>
+
+<h2 id="tests">Test strategy</h2>
+
+<p>There are no real LLM calls and, by default, no real sandboxes. Four styles coexist in <span class="src">crates/cli/tests</span> (24 files plus <span class="src">crates/cli/tests/support/mod.rs</span>) alongside unit tests inside <code>src/</code> (<code>env_tests.rs</code>, <code>mount_tests.rs</code>, <code>naming_tests.rs</code>, <code>secret_tests.rs</code>, <code>providers/tests.rs</code>, <code>managed_agents/tests.rs</code>, and inline <code>#[cfg(test)]</code> in <code>tui.rs</code>, <code>tui_app.rs</code>, <code>environment.rs</code>).</p>
+
+<table>
+<thead><tr><th>Style</th><th>Files</th><th>How the fake works</th></tr></thead>
+<tbody>
+<tr><td><strong>1. Real binary + fake model + in-process server</strong> (the default CI path)</td><td><code>provider_workflow</code>, <code>permissions</code>, <code>environments</code>, <code>previews</code>, <code>serve</code>, <code>mcp_auth_error</code>, <code>chat_model_error</code></td><td>Spawn <code>CARGO_BIN_EXE_exo</code> with a scrubbed env. A <code>wiremock</code> server impersonates the OpenAI <em>Responses</em> endpoint, replaying canned SSE events (<code>response.created</code> ... <code>response.completed</code>). Agent specs set <code>model.base_url</code> to that mock. Sandboxes use <code>LocalProcess</code>.</td></tr>
+<tr><td><strong>2. Fake <code>ModelClient</code> trait object</strong></td><td><code>http_usage</code></td><td>Implements <code>executor::ModelClient</code> in-test (<code>MeteredModel</code>) to inject exact token/cost combinations (<code>"priced"</code>, <code>"cost-only"</code>, <code>"unpriced"</code>, <code>"missing"</code>), then checks the CLI's usage report over HTTP and across restarts (<span class="src">crates/cli/tests/http_usage.rs:19-66</span>).</td></tr>
+<tr><td><strong>3. Wire-contract tests for hosted sandbox backends</strong></td><td><code>daytona_backend</code>, <code>e2b_backend</code>, <code>sprites_backend</code>, <code>vercel_backend</code></td><td>Point the Rust backend at a <code>wiremock</code> fake of the vendor REST API and assert endpoints, bodies and find-or-create behaviour. &quot;Hermetic by design, so it catches code defects but not upstream drift&quot; (<span class="src">crates/cli/tests/daytona_backend.rs:1-5</span>).</td></tr>
+<tr><td><strong>4. Live, <code>#[ignore]</code>d</strong></td><td><code>integration_chat</code>, <code>smolvm_sandbox_live</code>, <code>smolvm_harness_e2e</code>, <code>container_live</code>, <code>snapshot_round_trip[_daytona]</code>, <code>teleport_docker_to_daytona</code>, <code>sandbox_start_process_live</code></td><td>Boot real smolvm/Firecracker/Docker/Daytona/E2B/Sprites. Gated by env (<code>EXO_SMOLVM_TEST_IMAGE</code>, <code>DAYTONA_API_KEY</code>, <code>EXO_TEST_SANDBOX_BACKEND</code>). Only <code>integration_chat</code> runs in CI, with <code>--ignored</code>, against a mocked model.</td></tr>
+<tr><td>Other</td><td><code>global_state</code>, <code>launcher</code>, <code>mcp_session</code>, <code>vault_oauth</code></td><td><code>global_state</code> asserts <code>$HOME/.exo</code> state is shared across working directories. <code>launcher</code> runs the self-improving example's <code>exo.sh</code> against a wrapper binary. <code>vault_oauth</code> (1.5k lines) and <code>mcp_session</code> fake OAuth/MCP servers to test that credentials stay host-side (<a href="egress-and-vaults.html">egress &amp; vaults</a>).</td></tr>
+</tbody>
+</table>
+
+<figure class="code">
+<figcaption><strong>The Fixture: scrubbed-env real binary, plus a live HTTP service sharing the same runtime</strong> <span class="src">crates/cli/tests/support/mod.rs:182-195</span></figcaption>
+<pre><code class="language-rust">    pub fn command(&amp;self, args: &amp;[&amp;str]) -> Command {
+        let binary =
+            std::env::var_os("EXO_TEST_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_exo").into());
+        let mut command = Command::new(binary);
+        command
+            .env_clear()
+            .env("EXO_HOME", &amp;self.root)
+            .env("EXO_CONFIG_DIR", self.temp.path().join("config"))
+            .env("SMOKE_API_KEY", "fixture-model-key")
+            .env("RUNTIME_TOKEN", "workflow-token")
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .current_dir(self.temp.path())
+            .kill_on_drop(true);</code></pre>
+</figure>
+
+<figure class="code">
+<figcaption><strong>Local/HTTP parity: the same CLI script, run once per profile</strong> <span class="src">crates/cli/tests/provider_workflow.rs:16-31</span></figcaption>
+<pre><code class="language-rust">#[actix_web::test]
+async fn local_and_http_cli_workflows() -> Result&lt;()&gt; {
+    for provider in ["local", "remote"] {
+        let f = Fixture::new().await?;
+        let file = f.agent_file.to_str().unwrap();
+        f.cli(&amp;["provider", "switch", provider]).await?;
+        let created = mutation_output(
+            f.output(&amp;["agent", "create", file, "--name", "saved"], None, None)
+                .await?,
+            provider,
+        )?;
+        assert!(created.contains("created agent saved"), "{created}");</code></pre>
+</figure>
+
+<p>How the Fixture works (<span class="src">crates/cli/tests/support/mod.rs:49-125</span>): it starts a <code>wiremock</code> model server, builds a <code>BasicExoHarness</code> + <code>LocalProvider</code> + <code>Runtime</code> in the test process, serves that runtime over actix at <code>127.0.0.1:0/exo</code> behind a bearer token (<code>RuntimeHttpService::new(runtime, Some("workflow-token"))</code>), and records every request's <code>x-exo-context</code> header. It then invokes the real <code>exo</code> binary to create two provider profiles, <code>local</code> (<code>--local-root</code> at the same directory) and <code>remote</code> (<code>--url</code> at the in-process server). Because both profiles ultimately drive the same runtime code, a test body can loop over <code>["local", "remote"]</code> and assert identical behaviour: <code>permissions.rs</code> does it for approval prompts on shell and MCP tools with y/n answers piped to stdin; <code>environments.rs</code> does it for named-thread resume.</p>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: parity testing is the architecture's payoff</p>
+<p>Because <code>Runtime</code> hides local vs HTTP behind one <code>Provider</code> trait (<span class="src">crates/executor/src/provider.rs:19</span>), the CLI's e2e coverage doubles for free: every workflow test is two tests. The same trick also gives a conformance tool: <code>exo-provider-contract</code> (feature <code>contract-tests</code>) points <code>test_provider</code> at an arbitrary HTTP endpoint with a token, so a third-party implementation can be checked with the same code (<span class="src">crates/cli/src/bin/provider_contract.rs:7-25</span>).</p></div>
+
+<p>Smaller conventions: every spawn has a 20 s timeout (<span class="src">crates/cli/tests/support/mod.rs:250</span>) and <code>kill_on_drop</code>; tests reach <code>PATH</code> but nothing else from the host env; the master key is a file in a tempdir (<code>--secret-backend file</code>) so the macOS keychain is never touched. CI fails rather than skips when a live runtime is missing (<span class="src">crates/cli/tests/integration_chat.rs:5-9</span>).</p>
+
+<h2 id="dev-loop">Dev loop and repo tooling</h2>
+
+<table>
+<thead><tr><th>Piece</th><th>What it does</th><th>Ref</th></tr></thead>
+<tbody>
+<tr><td><code>mise.toml</code></td><td>Pins toolchains only: node 22.15.0, pnpm 10.26.2, python 3.11, rust 1.95. Its <code>[env]</code> prepends <code>./target/debug</code> to PATH so a debug build is simply <code>exo</code>. <strong>There are no mise tasks.</strong></td><td><span class="src">mise.toml:1-9</span></td></tr>
+<tr><td><code>package.json</code> scripts</td><td><code>check</code> = <code>lint</code> (oxlint, deny warnings) + <code>typecheck</code> (<code>tsgo</code>, the native TypeScript compiler) + <code>test</code> (vitest); <code>format</code> = oxfmt; <code>docs:*</code>, <code>website:*</code></td><td><span class="src">package.json:7-23</span></td></tr>
+<tr><td>pnpm workspace</td><td>Root package plus <code>exoharness/cloudflare</code> only</td><td><span class="src">pnpm-workspace.yaml:1-3</span></td></tr>
+<tr><td>Git hooks</td><td><code>pnpm prepare</code> sets <code>core.hooksPath=.githooks</code>. <strong>pre-commit</strong> runs <code>scripts/precommit.mjs</code>; <strong>pre-push</strong> runs <code>cargo clippy --workspace --all-targets -- -D warnings</code></td><td><span class="src">scripts/setup-hooks.mjs</span>, <span class="src">.githooks/pre-commit</span>, <span class="src">.githooks/pre-push</span></td></tr>
+<tr><td><code>scripts/precommit.mjs</code></td><td>On <em>staged</em> files only: oxfmt (then re-<code>git add</code>), oxlint <code>--fix</code> on JS/TS, <code>rustfmt --edition 2024</code> on <code>.rs</code>, then the whole <code>pnpm check</code>. Excludes <code>website/docs-src/</code> because &quot;oxfmt breaks the VitePress markdown&quot;.</td><td><span class="src">scripts/precommit.mjs:45-71</span></td></tr>
+<tr><td><code>clippy.toml</code></td><td><code>too-many-arguments-threshold = 9</code></td><td><span class="src">clippy.toml</span></td></tr>
+<tr><td><code>Makefile</code></td><td>Only two targets: restart / clean the outer Lima VM that hosts Firecracker on macOS</td><td><span class="src">Makefile:1-10</span></td></tr>
+<tr><td>Vitest</td><td>22 <code>*.test.ts</code> files under <code>exoharness/typescript</code>, <code>exoharness/tests</code>, <code>examples/</code>; path aliases mirror <code>tsconfig.json</code> so <code>@exo/harness</code> imports resolve</td><td><span class="src">vitest.config.ts:1-58</span></td></tr>
+<tr><td>Rust workspace</td><td>10 members; <code>fuzz</code> is excluded so nightly-only <code>libfuzzer-sys</code> never enters normal builds. Default feature set of <code>exo</code> is <code>smolvm</code>; <code>firecracker</code>, <code>aws-agentcore</code> are opt-in</td><td><span class="src">Cargo.toml:1-17</span>, <span class="src">crates/cli/Cargo.toml:9-13</span></td></tr>
+</tbody>
+</table>
+
+<div class="callout warn"><p class="callout-title">Hooks do not run Rust tests</p>
+<p>A commit runs JS lint/typecheck/vitest and rustfmt; a push runs clippy. <code>cargo test</code> only runs in CI. <span class="src">website/docs-src/development/index.md</span> is currently a stub listing just <code>pnpm check</code>, <code>cargo test --workspace --all-targets</code> and <code>pnpm prepare</code>; the README says installation docs &quot;are still being written&quot;.</p></div>
+
+<h3 id="ci">CI</h3>
+<p><span class="src">.github/workflows/ci.yml</span> has six jobs on pull requests and <code>main</code>. Every action is pinned by commit SHA, and <code>CARGO_PROFILE_DEV_DEBUG=0</code> keeps unit and integration jobs on identical build settings (<span class="src">.github/workflows/ci.yml:13-15</span>).</p>
+<table>
+<thead><tr><th>Job</th><th>Runs</th></tr></thead>
+<tbody>
+<tr><td><code>changes</code> (line 18)</td><td>Git diff against the base to set <code>worker=true/false</code> if any of executor, exoharness, managed-agents, mcp, cost, worker-runtime, TS sources, or lockfiles changed</td></tr>
+<tr><td><code>validate</code> (42)</td><td><code>pnpm format:check</code> then <code>pnpm check</code></td></tr>
+<tr><td><code>rust-tests</code> (70)</td><td>ubuntu + macOS: <code>cargo fmt --check</code>, <code>clippy -D warnings</code>, <code>cargo test --workspace --all-targets</code>, then <code>cargo test -p exoharness --features firecracker --lib</code></td></tr>
+<tr><td><code>portable-runtime</code> (120)</td><td><code>cargo check</code> of <code>exoharness</code> (<code>--no-default-features --features store</code>) and <code>executor</code> (<code>--no-default-features</code>) for <code>wasm32-unknown-unknown</code>, as separate commands &quot;to prevent workspace feature unification from masking accidental dependencies on native process, filesystem or Tokio runtime APIs&quot;</td></tr>
+<tr><td><code>cloudflare-worker</code> (137)</td><td>Only if <code>changes.worker</code>: build the Worker with a pinned <code>wasm-bindgen-cli</code>, typecheck, <code>node --test test/*.mjs</code> (includes Rust contract tests)</td></tr>
+<tr><td><code>rust-integration-tests</code> (181)</td><td>ubuntu-24.04 matrix <code>smolvm</code> / <code>firecracker</code>. Verifies <code>/dev/kvm</code> with an ioctl, installs the runtime with <code>support/ci/setup-sandbox.sh</code> (downloads pinned releases and checks SHA-256s; for Firecracker also builds the guest and initramfs from the checkout so host and guest protocol versions match), builds <code>integration_chat</code> as the runner user, and runs the test binary with <code>--ignored</code> (under <code>sudo -n env ...</code> for Firecracker because the jailer needs root)</td></tr>
+</tbody>
+</table>
+<p>A second workflow, <span class="src">.github/workflows/publish-sandbox-images.yml</span>, is manual (<code>workflow_dispatch</code>), main-only and restricted to <code>exoharness/exo</code>: it builds multi-arch (<code>amd64</code>+<code>arm64</code>) <code>codex-</code>, <code>claude-code-</code> and <code>pi-</code> <code>sandbox</code>/<code>devbox</code> images to GHCR, with an optional <code>sandbox-images-vX.Y.Z</code> tag. The images themselves are described in <a href="sandboxes.html">sandboxes</a>.</p>
+
+<h3 id="fuzz">Fuzzing</h3>
+<p>There is exactly one target, <code>firecracker_protocol</code> (<span class="src">fuzz/fuzz_targets/firecracker_protocol.rs:1-36</span>), run manually with <code>cargo +nightly fuzz run firecracker_protocol --fuzz-dir fuzz</code> (<span class="src">fuzz/README.md</span>). It feeds arbitrary bytes to the two things that parse untrusted data on the vsock between host and microVM guest: the 4-byte length-prefix decoder <code>decode_frame_length</code> (bounded by <code>MAX_REQUEST_BYTES</code> = 1 MiB and <code>MAX_RESPONSE_BYTES</code> = 16 MiB, <span class="src">crates/firecracker-protocol/src/lib.rs:14-15</span>, <span class="src">crates/firecracker-protocol/src/lib.rs:143</span>) and the typed <code>Message&lt;GuestRequest&lt;GuestProcessRequest&gt;&gt;</code> / <code>Message&lt;GuestResponse&gt;</code> JSON envelopes. The corpus is two seed files (<code>ping-request.json</code>, <code>ping-response.json</code>). It is not wired into CI.</p>
+
+<h3 id="docs-site">Docs site</h3>
+<p><code>website/</code> is two things. <code>website/index.html</code> and <code>v2.html</code> are the marketing pages built by Vite into <code>dist/</code> and served by a tiny Cloudflare Worker that only adds security headers and hides <code>/src/</code> (<span class="src">website/wrangler.jsonc</span>, <span class="src">website/vite.config.js</span>, <span class="src">website/src/worker.js:8-24</span>). <code>website/docs-src/</code> is a VitePress site (<code>pnpm docs:dev|build</code>); <code>pnpm website:dev</code> runs both behind one dev server, proxying <code>/docs</code> to VitePress on port 5180 and restarting it on config changes (<span class="src">scripts/website-dev.mjs:1-45</span>).</p>
+<p>The one piece of generated documentation: a markdown placeholder <code>&lt;!-- EXO_EVENT_KINDS --&gt;</code> in <span class="src">website/docs-src/architecture/data-model.md:113</span> is replaced at build time by a markdown-it core rule (<span class="src">website/docs-src/.vitepress/config.mts:18-22</span>). <code>eventKindsMarkdown()</code> reads <span class="src">crates/exoharness/src/types.rs</span> as text, regex-extracts the <code>pub const NAME: EventKind = EventKind(Cow::Borrowed("..."))</code> constants, then regex-walks <code>EventData::kind()</code> to list only kinds that actually have a variant (legacy aliases drop out), and throws if the function or a constant is missing (<span class="src">website/docs-src/.vitepress/event-kinds.ts:4-33</span>). This is source-scraping rather than codegen, so a refactor of that function breaks the docs build loudly. The resulting table is covered on <a href="data-model.html">data model</a>.</p>
+
+<h2 id="eval">Harbor evals (<code>eval/harbor</code>)</h2>
+
+<p>This runs Exo as a Harbor <em>external agent</em> against Harbor's benchmark catalog (Terminal-Bench 2.0 and variants, plus local datasets: a lifecycle smoke test, a four-task <code>self-evolution-smoke-test</code>, and a generated SWE-bench Lite) (<span class="src">eval/harbor/eval.py:19-40</span>, <span class="src">eval/harbor/README.md</span>). It measures the task pass rate of the Exo agent <em>including</em> its ability to change itself between tasks.</p>
+
+<h3 id="eval-flow">How Exo plugs in</h3>
+<ol class="steps">
+<li><code>eval.sh</code> creates a Python 3.12 venv, installs the <code>exo-harbor</code> package, and re-execs itself under <code>sg docker</code> if needed. <code>eval.py</code> builds <code>exo</code> with <code>cargo build -p exo</code>, runs <code>pnpm install --frozen-lockfile</code> (the TS harness runner imports <code>tsx</code>), and launches <code>harbor run --env docker --agent exo_harbor.agent:ExoAgent --plugin exo_harbor.plugin:ExoSessionPlugin</code> with <code>--ak</code> kwargs (<span class="src">eval/harbor/eval.py:270-318</span>).</li>
+<li><strong><code>ExoSessionPlugin</code></strong> runs once per job: requires Docker, a single agent, and <code>n_concurrent == 1</code> for the <code>exo</code> harness (trials share one self-evolving agent), then creates the shared agent <code>harbor-eval</code> (<span class="src">eval/harbor/src/exo_harbor/plugin.py:24-53</span>).</li>
+<li><strong><code>ExoAgent</code></strong> runs per trial: find Harbor's <code>main</code> container by Compose labels (refusing to guess if there are zero or several), optionally install Node and Pi into it for the <code>pi</code> arm, create a fresh thread <code>trial-&lt;context_id&gt;</code>, <code>exo sandbox attach</code> the container as the thread's sandbox, and <code>exo thread send</code> the task instruction as one turn. Harbor owns the container's lifetime; Exo only borrows it (<span class="src">eval/harbor/src/exo_harbor/agent.py:78-135</span>, <span class="src">eval/harbor/src/exo_harbor/exo.py:79-110</span>).</li>
+<li>Afterwards, even on timeout, <code>export_trial_trajectory</code> calls <code>thread events --type messages --type tool_requested --type tool_result</code>, validates with pydantic, and converts to Harbor's ATIF trajectory format, including per-turn usage and cost (<span class="src">eval/harbor/src/exo_harbor/trajectory.py:160-190</span>, <span class="src">eval/harbor/src/exo_harbor/agent.py:107-129</span>).</li>
+</ol>
+<p>Three arms: <code>exo</code> (default; uses <code>examples/self-improving-agent/harness.ts</code> with memory, skills and tool creation), <code>basic</code> (shell-only control), and <code>pi</code>. The self-evolution dataset checks that tools installed in trial 1 (<code>install_agent_tool</code>) are reusable in trial 2, and exercises restart and timeout handling (<span class="src">eval/harbor/datasets/self-evolution-smoke-test</span>).</p>
+
+<div class="callout warn"><p class="callout-title">The Harbor integration is stale against the current CLI</p>
+<p>It still drives an older command surface that no longer exists in <code>crates/cli</code>. <code>eval.py</code> calls <code>exo secret create ... --env</code> and <code>exo model create ...</code> (<span class="src">eval/harbor/eval.py:411-437</span>); there is no top-level <code>secret</code> or <code>model</code> command (secrets are now <code>exo vault secret create</code>, and models are plain names in the agent spec). <code>ExoClient.ensure_agent</code> runs <code>agent create "Harbor eval" --model --provider docker --sandbox-scope agent --module ... --tool-creation enabled</code> (<span class="src">eval/harbor/src/exo_harbor/exo.py:34-61</span>), but <code>agent create</code> now takes a Markdown spec file and only <code>--name</code>/<code>--slug</code> (<span class="src">crates/cli/src/main.rs:614-618</span>). <code>_argv</code> puts <code>--harness</code> before the subcommand (<span class="src">eval/harbor/src/exo_harbor/exo.py:201-209</span>) although <code>--harness</code> exists only on <code>run</code> and <code>thread send</code>; and <code>sandbox attach --provider docker</code> would be consumed by the global <code>--provider</code> <em>profile</em> flag (<span class="src">crates/cli/src/main.rs:73</span>), where the sandbox flag is <code>--sandbox</code> (<span class="src">crates/cli/src/main.rs:789</span>). The newest commit to <code>eval/harbor</code> predates the agent-definition refactor (#401). Treat it as a design reference for the plug-in shape, not a working harness.</p></div>
+
+<h2 id="ideas">Takeaways</h2>
+<div class="callout idea"><p class="callout-title">Idea worth stealing: validate remote support by exhaustive pattern, not by convention</p>
+<p><code>validate_http_command</code> lists every allowed command shape as a match arm, and for <code>thread update</code> it destructures <code>ConversationSandboxRuntimeUpdateArgs</code> <em>without</em> a trailing <code>..</code> (<span class="src">crates/cli/src/providers.rs:124-147</span>). Adding a new sandbox flag to that struct fails to compile until someone decides whether it is legal against a remote runtime.</p></div>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: progress as a tracing target</p>
+<p>Backends never import UI code. They log with <code>target: "exoharness::progress"</code>; the CLI turns that single target into spinner text (TTY) or plain lines (non-TTY) and routes <code>exoharness::egress*</code> logs to stderr only in <code>--verbosity full</code> (<span class="src">crates/cli/src/turn_display.rs:16-45</span>). The library stays headless and the UI stays decoupled.</p></div>
+
+<p>See also: <a href="architecture.html">architecture</a> for how the runtime, harness executor and store fit together, <a href="managed-agents.html">managed agents</a> for the HTTP API the CLI speaks, <a href="harnesses.html">harnesses</a> for what <code>--harness</code> selects, and <a href="sandboxes.html">sandboxes</a> for the backends behind <code>--sandbox</code>.</p>
+
+</main>
+<aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/wiki.js"></script>
+</body>
+</html>

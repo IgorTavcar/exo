@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossary &amp; file map · Exo internals</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav id="nav"></nav>
+<main>
+<header>
+  <div class="kicker">Distilled</div>
+  <h1>Glossary &amp; file map</h1>
+  <p class="lede">A lookup page: what the words mean in this codebase, and which files to open first for each subsystem.</p>
+</header>
+<h2>Glossary</h2>
+<p>Terms as the code uses them. Where two pages define the same word, the first definition is kept; the right-hand column links to the page that covers it.</p>
+<table>
+<thead><tr><th>Term</th><th>Meaning</th><th>Page</th></tr></thead>
+<tbody>
+<tr><td><code>AdapterDefinition</code></td><td>tagged enum of chat adapters (only <code>slack</code>).</td><td><a href="managed-agents.html">Managed agents</a></td></tr>
+<tr><td><code>Agent</code></td><td>top-level identity (<code>AgentRecord</code>: id, slug, name, vaults); owns threads, agent-scope artifacts and sandboxes.</td><td><a href="data-model.html">Data model</a></td></tr>
+<tr><td><code>AGENT_DEFINITION_PATH</code></td><td><code>managed-agents/agent.json</code>, the artifact path holding the definition.</td><td><a href="managed-agents.html">Managed agents</a></td></tr>
+<tr><td><code>AgentBackend</code></td><td>trait the provider implements (<code>configure_agent</code>, <code>configure_thread</code>, <code>end_session</code>); <code>lib.rs:159-223</code>.</td><td><a href="managed-agents.html">Managed agents</a></td></tr>
+<tr><td><code>AgentDefinition</code></td><td>flat struct = frontmatter fields + <code>instructions</code>; <span class="src">crates/managed-agents/src/lib.rs:42-67</span>.</td><td><a href="managed-agents.html">Managed agents</a></td></tr>
+<tr><td><code>AgentHarnessKind</code></td><td><code>Basic | Rlm | TypeScript | Exo</code>; chooses the executor; <code>Exo</code> = TypeScript runner + <code>ExoToolRuntime</code> (scheduler tools).</td><td><a href="harnesses.html">Harnesses</a></td></tr>
+<tr><td><code>Alias (pin)</code></td><td>saved agent/thread slug bound to provider, account, connection, and context.</td><td><a href="cli-and-server.html">CLI &amp; server</a></td></tr>
+<tr><td><code>allow_for_tool</code></td><td>approval response flag granting future calls to that function name for the session.</td><td><a href="tools-and-mcp.html">Tools &amp; MCP</a></td></tr>
+<tr><td><code>app-server</code></td><td><code>codex app-server --listen stdio://</code>, Codex's JSON-over-stdio server; one thread per Exo conversation.</td><td><a href="native-harnesses.html">Native harnesses</a></td></tr>
+<tr><td><code>Approval</code></td><td>event pair <code>agent_runtime.approval_requested</code> / <code>approval_response</code> identified by a UUIDv7 <code>approval_id</code>.</td><td><a href="tools-and-mcp.html">Tools &amp; MCP</a></td></tr>
+<tr><td><code>Artifact</code></td><td>path-addressed, versioned bytes (<code>artifact_id</code> stable per path, <code>version</code> increments), at agent or thread scope.</td><td><a href="data-model.html">Data model</a></td></tr>
+<tr><td><code>ATIF</code></td><td>Harbor's trajectory format that <code>exo_harbor</code> exports to.</td><td><a href="cli-and-server.html">CLI &amp; server</a></td></tr>
+<tr><td><code>Authority</code></td><td>hashed description of an adapter caller's scope; principal <code>adapter-{sha256}</code>.</td><td><a href="managed-agents.html">Managed agents</a></td></tr>
+<tr><td><code>Batch object</code></td><td><code>events/&lt;first&gt;_&lt;last&gt;.batch.json</code>, a multi-event append committed by one PUT.</td><td><a href="data-model.html">Data model</a></td></tr>
+<tr><td><code>Binding (EgressCredentialBinding)</code></td><td>name + env var + <code>CredentialNetworkPolicy</code> + <code>injection_location</code>; one per placeholder.</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a></td></tr>
+<tr><td><code>Client / frontend tool</code></td><td>tool declared by the HTTP caller and executed by the app; result arrives as <code>agent_runtime.frontend_tool_response</code>.</td><td><a href="tools-and-mcp.html">Tools &amp; MCP</a></td></tr>
+<tr><td><code>codex_warm_session</code></td><td>Custom event recording the sandbox/process/thread ids after a completed turn, used to find the native thread later.</td><td><a href="native-harnesses.html">Native harnesses</a></td></tr>
+<tr><td><code>Completion marker</code></td><td><code>exo.runtime.turn_completed</code> custom event; "answer is durable, just write TurnEnded".</td><td><a href="harnesses.html">Harnesses</a></td></tr>
+<tr><td><code>Config dir</code></td><td><code>EXO_CONFIG_DIR</code>, holds <code>providers.json</code>, <code>providers.lock</code>, auth locks.</td><td><a href="cli-and-server.html">CLI &amp; server</a></td></tr>
+<tr><td><code>Context</code></td><td>string map sent as <code>X-Exo-Context</code>; keys defined by the provider.</td><td><a href="cli-and-server.html">CLI &amp; server</a></td></tr>
+<tr><td><code>CredentialDestination</code></td><td><code>Origin{origin}</code> (scheme+host+port) or <code>Url{url}</code> (exact path+query); what a secret's policy allows.</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a></td></tr>
+<tr><td><code>CredentialNetworkPolicy</code></td><td><code>Limited{allowed_hosts}</code> or <code>Destinations{allowed_destinations}</code> limiting where a binding may substitute.</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a></td></tr>
+<tr><td><code>CredentialPolicy</code></td><td>a secret's stored policy: networking + injection location; AAD-bound in the vault.</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a></td></tr>
+<tr><td><code>cursor worker</code></td><td>Node script in the sandbox wrapping <code>@cursor/sdk</code> and speaking Exo's <code>CursorWorkerRequest/Event</code> JSONL.</td><td><a href="native-harnesses.html">Native harnesses</a></td></tr>
+<tr><td><code>Deferred runner</code></td><td><code>deferred-rebuild-and-restart</code>, detached helper that outlives the requesting turn and records the outcome.</td><td><a href="examples.html">Examples</a></td></tr>
+<tr><td><code>Deployment</code></td><td>running adapter instance, id = sha256(agent/adapter name).</td><td><a href="managed-agents.html">Managed agents</a></td></tr>
+<tr><td><code>devbox image</code></td><td>Sandbox image variant (<code>DEVBOX_TOOLS=true</code>) with git/gh/python/pnpm/tsx; the managed-agent default for codex, claude-code and pi.</td><td><a href="native-harnesses.html">Native harnesses</a></td></tr>
+<tr><td><code>developer message</code></td><td>Exo-level role for harness-injected guidance; mapped to the provider's <code>system</code> role (joined with <code>system</code> for Anthropic). <span class="src">exoharness/typescript/model-runtime/responses.ts:503-523</span>, <span class="src">exoharness/typescript/model-runtime/responses.ts:728-731</span>.</td><td><a href="prompts.html">Prompts</a></td></tr>
+<tr><td><code>Drain marker</code></td><td><code>.exo/exo-scheduler.restart</code>, claimed (deleted) by the scheduler to request graceful exit; <code>.exo/exo-control.restart</code> does the same for the REPL child.</td><td><a href="examples.html">Examples</a></td></tr>
+<tr><td><code>dynamicTools</code></td><td>Tool definitions passed to Codex at thread start; Codex calls them back via <code>item/tool/call</code> and Exo executes them.</td><td><a href="native-harnesses.html">Native harnesses</a></td></tr>
+<tr><td><code>EgressCredentialResolver</code></td><td>trait that maps (sandbox identity, binding name, destination) to a real secret value, per request.</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a></td></tr>
+<tr><td><code>EgressError</code></td><td><code>Rejected(msg)</code> (403 with message), <code>Denied</code> (policy, hidden), <code>Internal</code> (hidden).</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a></td></tr>
+<tr><td><code>EgressError::Rejected</code></td><td>resolver error carrying a sandbox-safe message, rendered as a plain-text 403. <span class="src">crates/exoharness/src/egress_credentials.rs:324-336</span>.</td><td><a href="prompts.html">Prompts</a></td></tr>
+<tr><td><code>EgressProxy</code></td><td>per-sandbox TLS-terminating HTTP proxy that rewrites credential headers and forwards to pinned public IPs.</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a></td></tr>
+<tr><td><code>EgressSession</code></td><td>persisted <code>{identity, policy, placeholders}</code> used by hosted/worker runtimes to rewrite headers.</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a></td></tr>
+<tr><td><code>EgressTransport</code></td><td>network side of the proxy (listeners, DNS, accept loop); <code>LocalEgressTransport</code> uses host sockets.</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a></td></tr>
+<tr><td><code>elicitation</code></td><td>Codex <code>mcpServer/elicitation/request</code> used to ask the client to approve an MCP tool call.</td><td><a href="native-harnesses.html">Native harnesses</a></td></tr>
+<tr><td><code>Event</code></td><td><code>Event { id, thread_id, session_id?, turn_id?, created_at, data: EventData }</code>; id is a UUIDv7.</td><td><a href="data-model.html">Data model</a></td></tr>
+<tr><td><code>EventKind</code></td><td>string tag for an <code>EventData</code> variant used for <code>EventQuery.types</code>; legacy conversation_* names canonicalise to thread_*.</td><td><a href="data-model.html">Data model</a></td></tr>
+<tr><td><code>Executor</code></td><td>layer that owns turn semantics (prompt, model calls, tools, compaction); <code>HarnessExecutor</code> trait in <code>crates/executor</code>.</td><td><a href="architecture.html">Architecture</a></td></tr>
+<tr><td><code>exo_runtime</code></td><td>Reserved name of the in-process SDK MCP server that exposes Exo tools to Claude Code.</td><td><a href="native-harnesses.html">Native harnesses</a></td></tr>
+<tr><td><code>Exoharness</code></td><td>trusted durable substrate: agents, threads, turns, events, artifacts, vaults, sandboxes (<code>crates/exoharness</code>).</td><td><a href="architecture.html">Architecture</a></td></tr>
+<tr><td><code>ExoHarnessServer</code></td><td>dispatcher from <code>protocol::Request</code> to the <code>ExoHarness</code> trait objects.</td><td><a href="architecture.html">Architecture</a></td></tr>
+<tr><td><code>ExoSessionPlugin / ExoAgent</code></td><td>Harbor job plugin (once per job) and per-trial agent driver.</td><td><a href="cli-and-server.html">CLI &amp; server</a></td></tr>
+<tr><td><code>Exposed name</code></td><td><code>exo_mcp__&lt;server&gt;__&lt;tool&gt;</code> (or truncated + SHA-256 form), the name the model sees for an MCP tool.</td><td><a href="tools-and-mcp.html">Tools &amp; MCP</a></td></tr>
+<tr><td><code>externalSandbox</code></td><td>Codex <code>sandboxPolicy</code> telling Codex the surrounding Exo sandbox is the isolation boundary.</td><td><a href="native-harnesses.html">Native harnesses</a></td></tr>
+<tr><td><code>Fixture</code></td><td>test harness spawning the real binary with a scrubbed env, wiremock model, and in-process HTTP runtime.</td><td><a href="cli-and-server.html">CLI &amp; server</a></td></tr>
+<tr><td><code>Frontmatter</code></td><td>YAML block between <code>---</code> lines; strict serde (<code>AgentFrontmatter</code>).</td><td><a href="managed-agents.html">Managed agents</a></td></tr>
+<tr><td><code>globalThis.Final / FINAL(...) / FINAL_VAR(...)</code></td><td>the RLM termination protocol. <span class="src">crates/executor/src/native/rlm.rs:275-278</span>, <span class="src">crates/executor/src/native/rlm.rs:581-611</span>.</td><td><a href="prompts.html">Prompts</a></td></tr>
+<tr><td><code>Guardian</code></td><td>host-side bash supervisor (<code>exo-service-guardian</code>) that builds Exo and restarts scheduler/adapter runners.</td><td><a href="examples.html">Examples</a></td></tr>
+<tr><td><code>Guest agent</code></td><td>static Rust PID 1 in the initramfs serving the vsock JSON protocol on port 10052.</td><td><a href="sandboxes.html">Sandboxes</a></td></tr>
+<tr><td><code>Harbor</code></td><td>external eval framework; <code>eval/harbor</code> runs Exo as a Harbor agent per trial conversation.</td><td><a href="examples.html">Examples</a></td></tr>
+<tr><td><code>Harness</code></td><td>executor + exoharness as a product; in code also the generic <code>Harness&lt;T&gt;</code> submit/emit trait and the <code>AgentHarnessKind</code> selector.</td><td><a href="architecture.html">Architecture</a></td></tr>
+<tr><td><code>Harness (exoharness trait)</code></td><td><code>Harness&lt;T&gt;</code>; submit/cancel/suspend/resume commands in, <code>HarnessEvent</code>s out; implemented by <code>ExecutorHarness</code>.</td><td><a href="harnesses.html">Harnesses</a></td></tr>
+<tr><td><code>HarnessExecutor</code></td><td>Rust trait with <code>execute_turn</code>/<code>resume_turn</code> plus capability flags; one impl per <code>AgentHarnessKind</code>.</td><td><a href="harnesses.html">Harnesses</a></td></tr>
+<tr><td><code>HarnessToolSource</code></td><td><code>built_in | library | agent</code>, recorded in each compacted result.</td><td><a href="tools-and-mcp.html">Tools &amp; MCP</a></td></tr>
+<tr><td><code>HarnessTurn / HarnessEvents</code></td><td>host wrapper over <code>TurnHandle</code> that routes every harness write through the event bus, tracks pending tools and emits stream + <code>Checkpoint</code> events.</td><td><a href="harnesses.html">Harnesses</a></td></tr>
+<tr><td><code>Head</code></td><td>the max event id in a thread, derived from <code>events/</code> keys, not from <code>record.json</code>.</td><td><a href="data-model.html">Data model</a></td></tr>
+<tr><td><code>Hook (instructions, registerTools)</code></td><td>the two per-round callbacks accepted by <code>runResponsesHarnessTurn</code>.</td><td><a href="examples.html">Examples</a></td></tr>
+<tr><td><code>Host tool</code></td><td>TS definition whose handler calls <code>context.executeTool</code> so Rust executes it.</td><td><a href="tools-and-mcp.html">Tools &amp; MCP</a></td></tr>
+<tr><td><code>hydrated_from</code></td><td>Field on turn-start events saying whether history came from a warm native thread or was replayed from Exo events.</td><td><a href="native-harnesses.html">Native harnesses</a></td></tr>
+<tr><td><code>IdentityGrant</code></td><td>resolved sender-to-private-vault grant with a revision hash.</td><td><a href="managed-agents.html">Managed agents</a></td></tr>
+<tr><td><code>idle_ttl</code></td><td><code>SandboxLifecycleConfig.idle_ttl</code>; <code>Some</code> = warm/managed lifecycle, <code>None</code> = one-shot.</td><td><a href="sandboxes.html">Sandboxes</a></td></tr>
+<tr><td><code>Inbox / Outbox / Route / Decision</code></td><td>durable adapter records under <code>adapters/v1/{deployment}/</code>.</td><td><a href="managed-agents.html">Managed agents</a></td></tr>
+<tr><td><code>Init payload</code></td><td><code>TypeScriptInitPayload</code>, the first message of each turn (configs, request, tools, MCP servers, <code>recovering</code>).</td><td><a href="harnesses.html">Harnesses</a></td></tr>
+<tr><td><code>instructions</code></td><td><code>AgentConfig.instructions</code>, a list of messages (usually one <code>system</code>) prepended to history on every model round; not part of the event log. <span class="src">crates/executor/src/executor_types.rs:27</span>.</td><td><a href="prompts.html">Prompts</a></td></tr>
+<tr><td><code>instructions hook</code></td><td>async <code>(context) =&gt; Message[]</code> passed to <code>runResponsesHarnessTurn</code>; runs once per model round. <span class="src">exoharness/typescript/model-runtime/turn-loop.ts:150-155</span>.</td><td><a href="prompts.html">Prompts</a></td></tr>
+<tr><td><code>item projection</code></td><td>Converting a Codex thread item into Exo events (<code>tool_requested</code>/<code>tool_result</code>/<code>messages</code>/custom), marked by <code>codex_item_projected</code>.</td><td><a href="native-harnesses.html">Native harnesses</a></td></tr>
+<tr><td><code>Jailer</code></td><td>Firecracker's privilege-dropping launcher (chroot, PID/net namespaces, cgroup v2, unique UID).</td><td><a href="sandboxes.html">Sandboxes</a></td></tr>
+<tr><td><code>Journal</code></td><td>informal name in the executor for a turn's slice of the event log used to decide Unstarted/Running/Finished.</td><td><a href="data-model.html">Data model</a></td></tr>
+<tr><td><code>JournalStatus</code></td><td>Unstarted/Running/Finished derived from <code>TurnStarted</code>/<code>TurnEnded</code>/<code>Error</code> events.</td><td><a href="harnesses.html">Harnesses</a></td></tr>
+<tr><td><code>Library tool</code></td><td>tool registered via <code>registerLibraryTools</code> or a module path, <code>source: "library"</code>; vs <code>built_in</code> tools.</td><td><a href="examples.html">Examples</a></td></tr>
+<tr><td><code>Lima bridge</code></td><td>root helper (<code>firecracker-bridge</code> example) inside a Lima VM, driven over stdio frames from macOS.</td><td><a href="sandboxes.html">Sandboxes</a></td></tr>
+<tr><td><code>manage_tool / inspect_tools</code></td><td>install/remove and list workspace-local tools from a manifest (<code>exo-tool.json</code>) source.</td><td><a href="examples.html">Examples</a></td></tr>
+<tr><td><code>Managed agent</code></td><td>an exoharness agent whose behavior comes from a stored <code>AgentDefinition</code> artifact.</td><td><a href="managed-agents.html">Managed agents</a></td></tr>
+<tr><td><code>ManagedExecutor</code></td><td>production router; caches one executor + MCP connection set per thread (<code>ExecutorCache</code>).</td><td><a href="harnesses.html">Harnesses</a></td></tr>
+<tr><td><code>ManagedSandboxBackend</code></td><td>per-provider factory trait (acquire, attach, restore, suspend, fork, terminate) in <code>sandbox.rs</code>.</td><td><a href="sandboxes.html">Sandboxes</a></td></tr>
+<tr><td><code>ManagedSandboxHandle</code></td><td>one live sandbox (exec, start_process, start_terminal, connect_tcp, snapshot, stop).</td><td><a href="sandboxes.html">Sandboxes</a></td></tr>
+<tr><td><code>Master key</code></td><td>32-byte AES key from Keychain or <code>master.key</code> file that encrypts all vault payloads.</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a></td></tr>
+<tr><td><code>MissedPolicy</code></td><td><code>skip | once | all</code> (cap 100); what a down scheduler owes a task.</td><td><a href="examples.html">Examples</a></td></tr>
+<tr><td><code>Native MCP</code></td><td>Codex / Claude Code connect to MCP from inside the sandbox using an <code>EXO_MCP_&lt;secret&gt;</code> placeholder env var that egress substitutes.</td><td><a href="tools-and-mcp.html">Tools &amp; MCP</a></td></tr>
+<tr><td><code>Ordered dataset</code></td><td>Harbor local dataset with <code>task_order.json</code>, run in sequence.</td><td><a href="cli-and-server.html">CLI &amp; server</a></td></tr>
+<tr><td><code>Pending fire</code></td><td>write-ahead record of a scheduler wakeup awaiting delivery confirmation.</td><td><a href="examples.html">Examples</a></td></tr>
+<tr><td><code>PermissionPolicy</code></td><td><code>always_allow | always_ask</code>; resolved by <code>for_tool</code> or <code>for_mcp_tool</code>.</td><td><a href="tools-and-mcp.html">Tools &amp; MCP</a></td></tr>
+<tr><td><code>Pi RPC mode</code></td><td><code>pi --mode rpc</code>: JSONL command/event protocol; Exo's extension uses <code>extension_ui_request</code> as a side channel.</td><td><a href="native-harnesses.html">Native harnesses</a></td></tr>
+<tr><td><code>Placeholder</code></td><td><code>exo_egress_</code> + 32 hex chars; what the guest sees in its env vars.</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a></td></tr>
+<tr><td><code>Platform</code></td><td>trait abstracting host differences for the shared HTTP route table.</td><td><a href="architecture.html">Architecture</a></td></tr>
+<tr><td><code>PreparedMcp</code></td><td>connected MCP tool set + saved vault selection for a thread.</td><td><a href="managed-agents.html">Managed agents</a></td></tr>
+<tr><td><code>PreToolUse hook</code></td><td>Agent SDK hook Exo uses to authorize every Claude Code tool call.</td><td><a href="native-harnesses.html">Native harnesses</a></td></tr>
+<tr><td><code>PreviewProxy</code></td><td>loopback Host-header router that forwards <code>&lt;port&gt;.&lt;slug&gt;-&lt;hash&gt;.&lt;domain&gt;</code> to <code>connect_sandbox_tcp</code>.</td><td><a href="sandboxes.html">Sandboxes</a></td></tr>
+<tr><td><code>Process bridge</code></td><td>long-poll <code>recv/write/close_stdin/resize</code> protocol giving streaming stdin/stdout.</td><td><a href="sandboxes.html">Sandboxes</a></td></tr>
+<tr><td><code>Profile (bootstrap/practical)</code></td><td>curated tool sets for the self-improving agent, selected by <code>EXO_PROFILE</code>.</td><td><a href="examples.html">Examples</a></td></tr>
+<tr><td><code>Progress target</code></td><td>tracing target <code>exoharness::progress</code> used as a UI status side-channel.</td><td><a href="cli-and-server.html">CLI &amp; server</a></td></tr>
+<tr><td><code>progressive disclosure (skills)</code></td><td>only skill names and descriptions go in the prompt; <code>use_skill</code> loads the body, <code>read_skill_file</code> loads bundled files. <span class="src">exoharness/typescript/harness/skill-tools.ts:507-535</span>.</td><td><a href="prompts.html">Prompts</a></td></tr>
+<tr><td><code>Provider profile</code></td><td>named place commands execute: built-in local, <code>Local{root}</code>, or <code>Http{endpoint}</code> (not a sandbox provider).</td><td><a href="cli-and-server.html">CLI &amp; server</a></td></tr>
+<tr><td><code>provider_state</code></td><td>opaque JSON a handle returns and the harness persists as a <code>sandbox_provider_state</code> event for re-acquire in another process.</td><td><a href="sandboxes.html">Sandboxes</a></td></tr>
+<tr><td><code>Provider / LocalProvider / HttpProvider</code></td><td>backend behind <code>Runtime</code>: in-process vs remote REST.</td><td><a href="architecture.html">Architecture</a></td></tr>
+<tr><td><code>ProxySession / ProxyAuthorizer</code></td><td>hosted CONNECT-proxy hooks: authenticate a CONNECT and pick the sandbox session (407/503 on failure).</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a></td></tr>
+<tr><td><code>Receipt</code></td><td>idempotency record <code>(principal, key) -&gt; TurnRecord</code>, 24h expiry unless <code>retain_receipt</code>.</td><td><a href="data-model.html">Data model</a></td></tr>
+<tr><td><code>reconcileUnresolvedToolCalls</code></td><td>TS harness flag promising <code>resumeTurn</code> can handle tool calls with no result.</td><td><a href="harnesses.html">Harnesses</a></td></tr>
+<tr><td><code>reportPrompt</code></td><td>agent-authored instructions stored with a scheduled task and echoed back in the wakeup under "Report instructions". <span class="src">crates/executor/src/native/scheduler_runtime.rs:551-572</span>.</td><td><a href="prompts.html">Prompts</a></td></tr>
+<tr><td><code>ResourceScope</code></td><td>Global / Agent / Thread scope for vaults, sandboxes, access checks.</td><td><a href="architecture.html">Architecture</a></td></tr>
+<tr><td><code>reuseKey</code></td><td>Key passed to <code>startSandboxProcess</code> so Rust can find and reattach a still-running sandbox process across runner restarts.</td><td><a href="native-harnesses.html">Native harnesses</a></td></tr>
+<tr><td><code>Revision</code></td><td>per-secret counter bumped on update/refresh; used for CAS on OAuth refresh and as the MCP credential version.</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a></td></tr>
+<tr><td><code>RLM</code></td><td>recursive language model harness; model drives a persistent JS REPL holding the transcript as <code>context</code> and calls <code>subquery</code>.</td><td><a href="harnesses.html">Harnesses</a></td></tr>
+<tr><td><code>Round marker</code></td><td><code>exo.basic.tool_round</code>; Basic's record of which model round produced the following tool requests.</td><td><a href="harnesses.html">Harnesses</a></td></tr>
+<tr><td><code>Runner</code></td><td><span class="src">exoharness/typescript/harness/runner.ts</span>, the Node entry that loads a harness module and serves turns over stdio.</td><td><a href="harnesses.html">Harnesses</a></td></tr>
+<tr><td><code>runtime_request vs exo_request</code></td><td>guest-to-host messages; the first runs tools/sandbox processes with host policy, the second is the raw ExoHarness protocol.</td><td><a href="harnesses.html">Harnesses</a></td></tr>
+<tr><td><code>Runtime</code></td><td>executor facade clients call (<code>start_turn</code>, <code>watch_turn</code>, <code>reconnect_turn</code>, <code>cancel_turn</code>).</td><td><a href="architecture.html">Architecture</a></td></tr>
+<tr><td><code>RuntimeHost</code></td><td><code>spawn</code> + <code>sleep</code> abstraction so logic runs on Tokio or in a Worker.</td><td><a href="architecture.html">Architecture</a></td></tr>
+<tr><td><code>SandboxSpec / spec hash</code></td><td>image, resources, mounts, durable FS, egress policy, workdir, tcp ports; its hash keys warm instances and detects drift.</td><td><a href="sandboxes.html">Sandboxes</a></td></tr>
+<tr><td><code>Secret</code></td><td><code>Key</code>, <code>Oauth{refresh...}</code>, or <code>GithubCli</code> (re-read from <code>gh auth token</code>).</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a></td></tr>
+<tr><td><code>SecretReference</code></td><td><code>{vault_id, secret_id}</code> pinned in the stored sandbox for each binding.</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a></td></tr>
+<tr><td><code>Selection</code></td><td>resolved profile + context: alias &gt; <code>--provider</code> &gt; nearest directory default &gt; global default.</td><td><a href="cli-and-server.html">CLI &amp; server</a></td></tr>
+<tr><td><code>Self map</code></td><td><code>SELF.md</code>, the navigation file the harness tells the agent to read before self-edits.</td><td><a href="examples.html">Examples</a></td></tr>
+<tr><td><code>service.lock</code></td><td>file lock in the root held by <code>exo run --serve</code>.</td><td><a href="cli-and-server.html">CLI &amp; server</a></td></tr>
+<tr><td><code>Session</code></td><td>a live span of interactions within a thread; groups turns.</td><td><a href="architecture.html">Architecture</a></td></tr>
+<tr><td><code>Sidecar</code></td><td>external process (e.g. PyBoy emulator server) the harness talks to over localhost HTTP.</td><td><a href="examples.html">Examples</a></td></tr>
+<tr><td><code>Skill</code></td><td>SKILL.md (agentskills.io) stored as agent artifact <code>skills/&lt;name&gt;.json</code>, disclosed progressively.</td><td><a href="tools-and-mcp.html">Tools &amp; MCP</a></td></tr>
+<tr><td><code>Slug</code></td><td>unique human-readable agent/thread handle; derived from name by <code>slugify</code> unless <code>--slug</code>.</td><td><a href="managed-agents.html">Managed agents</a></td></tr>
+<tr><td><code>SnapshotFormat</code></td><td>open string naming who can restore a payload (e.g. <code>firecracker-filesystem-ref-v1</code>, <code>docker-image-tar</code>).</td><td><a href="sandboxes.html">Sandboxes</a></td></tr>
+<tr><td><code>SnapshotKind</code></td><td><code>Filesystem</code> (cold-boot restore) or <code>Full</code> (filesystem + memory + exec state) sandbox snapshot; logged as <code>SandboxSnapshotted</code>.</td><td><a href="data-model.html">Data model</a></td></tr>
+<tr><td><code>SpawnedProcess</code></td><td>Agent SDK interface Exo implements (<code>SandboxClaudeCodeProcess</code>) to run the Claude CLI in the sandbox.</td><td><a href="native-harnesses.html">Native harnesses</a></td></tr>
+<tr><td><code>State root</code></td><td><code>EXO_HOME</code>/<code>--root</code>, default <code>~/.exo</code>; harness data in <code>&lt;root&gt;/exoharness</code>.</td><td><a href="cli-and-server.html">CLI &amp; server</a></td></tr>
+<tr><td><code>Suspension boundary</code></td><td>guard held when no tool call is in flight, so execution can be dropped safely.</td><td><a href="harnesses.html">Harnesses</a></td></tr>
+<tr><td><code>Teleport</code></td><td>restoring a snapshot under a different provider (Docker tarball into Daytona) via <code>StartSandboxRequest.provider</code>.</td><td><a href="sandboxes.html">Sandboxes</a></td></tr>
+<tr><td><code>Template / fork</code></td><td>single-use Firecracker snapshot (<code>SnapshotTemplateLifecycle::Machine</code>) used to clone a running VM into another sandbox id.</td><td><a href="sandboxes.html">Sandboxes</a></td></tr>
+<tr><td><code>Thread (aka Conversation)</code></td><td>durable event log plus <code>ThreadRecord</code>; "conversation" is a legacy alias kept in serde aliases and type aliases.</td><td><a href="data-model.html">Data model</a></td></tr>
+<tr><td><code>Thread / Conversation</code></td><td>durable event log scope; <code>ThreadHandle</code> is primary, <code>ConversationHandle</code> the alias.</td><td><a href="architecture.html">Architecture</a></td></tr>
+<tr><td><code>tool failure envelope</code></td><td><code>{ok:false, error}</code> JSON returned to the model for any tool error, including denials and interrupted calls. <span class="src">crates/executor/src/basic.rs:289-304</span>, <span class="src">crates/executor/src/message_history.rs:130-151</span>.</td><td><a href="prompts.html">Prompts</a></td></tr>
+<tr><td><code>Tool registry (.exo/tools)</code></td><td>lockfile + managed store of manifest-installed TS tools (<code>exo-tool.json</code>, <code>tools.lock.json</code>).</td><td><a href="tools-and-mcp.html">Tools &amp; MCP</a></td></tr>
+<tr><td><code>ToolDefinition</code></td><td><code>{name, description, parameters (JSON schema)}</code> shown to the model; Rust copy adds <code>strict: Option&lt;bool&gt;</code>.</td><td><a href="tools-and-mcp.html">Tools &amp; MCP</a></td></tr>
+<tr><td><code>ToolInstance / Tool</code></td><td>TS runtime object (definition + source + handler + optional <code>authorization:"runtime"</code>) vs. the module-level contract with <code>initialize()</code>.</td><td><a href="tools-and-mcp.html">Tools &amp; MCP</a></td></tr>
+<tr><td><code>ToolRuntime</code></td><td>Rust trait for host-executed tools (<code>definitions</code>, <code>execute</code>, <code>permission_policy</code>, <code>mcp_servers</code>); decorated by <code>McpToolRuntime</code>.</td><td><a href="tools-and-mcp.html">Tools &amp; MCP</a></td></tr>
+<tr><td><code>TranscriptFold</code></td><td>pre-scan that folds tool results onto their call line in compact mode.</td><td><a href="cli-and-server.html">CLI &amp; server</a></td></tr>
+<tr><td><code>Turn</code></td><td>one user input and everything it triggers; identified by caller-allocated <code>TurnRecord{id, session_id}</code>.</td><td><a href="architecture.html">Architecture</a></td></tr>
+<tr><td><code>turn/start intent</code></td><td><code>codex_turn_start_intent</code> event written before <code>turn/start</code> so recovery can detect an ambiguous start.</td><td><a href="native-harnesses.html">Native harnesses</a></td></tr>
+<tr><td><code>turn_vaults / use_sender_vault</code></td><td>shared vaults for turns / add sender's private vault.</td><td><a href="managed-agents.html">Managed agents</a></td></tr>
+<tr><td><code>TurnQueue / TurnLease</code></td><td>per-thread FIFO of <code>QueuedTurn</code>s with <code>TurnControl</code> (Run/Cancel/Suspend); the lease grants the right to drain it.</td><td><a href="data-model.html">Data model</a></td></tr>
+<tr><td><code>TurnQueue / TurnCoordinator</code></td><td>per-thread FIFO with claim/lease, start/ack, cancel/suspend control watch.</td><td><a href="architecture.html">Architecture</a></td></tr>
+<tr><td><code>TurnWork</code></td><td>serialized, resumable description of a turn (configs + request) stored as a custom event.</td><td><a href="architecture.html">Architecture</a></td></tr>
+<tr><td><code>TypeScriptHarnessPreset</code></td><td>Codex / ClaudeCode / Cursor / Pi bundled TS modules with pinned sandbox images.</td><td><a href="architecture.html">Architecture</a></td></tr>
+<tr><td><code>Unresolved tool call</code></td><td><code>tool_requested</code> without a <code>tool_result</code> at recovery time.</td><td><a href="tools-and-mcp.html">Tools &amp; MCP</a></td></tr>
+<tr><td><code>Update record</code></td><td><code>.exo/guardian-updates/&lt;id&gt;.json</code>, queued then finalized; mirrored as a <code>rebuild_and_restart_exo</code> custom conversation event.</td><td><a href="examples.html">Examples</a></td></tr>
+<tr><td><code>VaultContext / find_secret</code></td><td>ordered vault list; last match wins (global &lt; personal &lt; agent &lt; thread).</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a></td></tr>
+<tr><td><code>VaultSelection</code></td><td>per-thread pinned list of vaults and per-MCP-server credential bindings.</td><td><a href="tools-and-mcp.html">Tools &amp; MCP</a></td></tr>
+<tr><td><code>Verbosity</code></td><td>minimal/compact/full tool-output levels for transcripts.</td><td><a href="cli-and-server.html">CLI &amp; server</a></td></tr>
+<tr><td><code>Wakeup</code></td><td>a machine-sent user turn (<code>send_conversation_wakeup</code>), used by the scheduler to report task results.</td><td><a href="harnesses.html">Harnesses</a></td></tr>
+<tr><td><code>Warm sandbox</code></td><td>named container/VM kept across commands, keyed by <code>(sandbox_id, spec_hash)</code>; adopted by labels (Docker) or manifests (Firecracker).</td><td><a href="sandboxes.html">Sandboxes</a></td></tr>
+<tr><td><code>warm session</code></td><td>A cached <code>CodexWarmSession</code> (server + sandbox process + thread id), keyed by agent/conversation/model/instructions/MCP/sandbox shape.</td><td><a href="native-harnesses.html">Native harnesses</a></td></tr>
+<tr><td><code>WorkerRuntime</code></td><td>wasm-bindgen export of the Rust runtime for Cloudflare Workers/Durable Objects.</td><td><a href="architecture.html">Architecture</a></td></tr>
+</tbody>
+</table>
+<h2>File map</h2>
+<p>The most important files, grouped by the wiki page that explains them. Paths link to the pinned commit on GitHub.</p>
+<h3>Architecture</h3>
+<table>
+<thead><tr><th>File</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><span class="src">exoharness/docs/spec.md</span></td><td>the exoharness/executor/harness thesis and data-model sketch</td></tr>
+<tr><td><span class="src">exoharness/docs/design/architecture.md</span></td><td>API walkthrough (partly stale names)</td></tr>
+<tr><td><span class="src">exoharness/docs/http.md</span></td><td>unary store RPC transport doc</td></tr>
+<tr><td><span class="src">crates/exoharness/src/types.rs</span></td><td>core traits (<code>ExoHarness</code>, <code>ThreadHandle</code>, <code>TurnHandle</code>), <code>EventData</code>, sandbox request types</td></tr>
+<tr><td><span class="src">crates/exoharness/src/harness.rs</span></td><td><code>Harness&lt;T&gt;</code> command/event plug-in trait</td></tr>
+<tr><td><span class="src">crates/exoharness/src/access.rs</span></td><td><code>Caller</code>, <code>AccessPolicy</code></td></tr>
+<tr><td><span class="src">crates/exoharness/src/runtime_host.rs</span></td><td><code>RuntimeHost</code>, <code>TaskGroup</code></td></tr>
+<tr><td><span class="src">crates/exoharness/src/turn_coordinator.rs</span></td><td><code>TurnAdmission</code>/<code>TurnQueue</code> contract, <code>TurnOptions</code></td></tr>
+<tr><td><span class="src">crates/exoharness/src/turn_coordinator/stored.rs</span></td><td><code>StoredTurnCoordinator</code>, queue state</td></tr>
+<tr><td><span class="src">crates/exoharness/src/protocol.rs</span></td><td><code>ClientMessage</code>/<code>ServerMessage</code>/<code>Request</code>/<code>Response</code></td></tr>
+<tr><td><span class="src">crates/exoharness/src/server.rs</span></td><td><code>ExoHarnessServer</code></td></tr>
+<tr><td><span class="src">crates/exoharness/src/http/server.rs</span></td><td>actix <code>/request</code> + <code>/health</code></td></tr>
+<tr><td><span class="src">crates/exoharness/src/http/client.rs</span></td><td><code>HttpExoHarness</code>, <code>ExoHttpTransport</code>, <code>RpcTransport</code></td></tr>
+<tr><td><span class="src">crates/exoharness/src/http_client.rs</span></td><td>shared <code>HttpClient</code> (bearer, redirects off, <code>x-exo-context</code>)</td></tr>
+<tr><td><span class="src">crates/exoharness/src/storage.rs</span></td><td><code>Storage</code> byte-KV seam</td></tr>
+<tr><td><span class="src">crates/exoharness/src/basic.rs</span></td><td><code>BasicExoHarness</code> (event log, watch, hosted ctor)</td></tr>
+<tr><td><span class="src">crates/executor/src/harness_executor.rs</span></td><td><code>HarnessExecutor</code>, <code>Runtime</code>, <code>start_turn</code>, <code>start_local_turn</code>, <code>watch_turn</code></td></tr>
+<tr><td><span class="src">crates/executor/src/provider.rs</span></td><td><code>Provider</code>, <code>LocalProvider</code>, <code>ProviderTurn</code></td></tr>
+<tr><td><span class="src">crates/executor/src/turn_queue.rs</span></td><td><code>accept_local_turn</code>, <code>run_queue</code></td></tr>
+<tr><td><span class="src">crates/executor/src/harness_adapter.rs</span></td><td><code>ExecutorHarness</code> running a <code>HarnessExecutor</code> with cancel/suspend</td></tr>
+<tr><td><span class="src">crates/executor/src/harness_events.rs</span></td><td><code>HarnessTurn</code>, <code>HarnessEvents</code>, <code>turn_stream</code></td></tr>
+<tr><td><span class="src">crates/executor/src/basic.rs</span></td><td><code>BasicExecutor</code> model/tool loop</td></tr>
+<tr><td><span class="src">crates/executor/src/native/managed_executor.rs</span></td><td><code>AgentHarnessKind</code> dispatch</td></tr>
+<tr><td><span class="src">crates/executor/src/native/typescript.rs</span></td><td>Node runner host, JSONL protocol</td></tr>
+<tr><td><span class="src">crates/executor/src/native/http_service.rs</span></td><td>actix runtime HTTP service, auth, SSE</td></tr>
+<tr><td><span class="src">crates/executor/src/native/http_provider.rs</span></td><td><code>HttpProvider</code>, <code>RuntimeTransport</code></td></tr>
+<tr><td><span class="src">crates/executor/src/managed_agents/http.rs</span></td><td>shared route table and <code>Platform</code></td></tr>
+<tr><td><span class="src">crates/executor/src/managed_agents/service.rs</span></td><td>handlers, <code>watch_events</code>, <code>forward_progress</code></td></tr>
+<tr><td><code>crates/managed-agents/src/http/{protocol,client,sse}.rs</code></td><td>wire types, <code>RuntimeClient</code>, SSE codec</td></tr>
+<tr><td><code>crates/worker-runtime/src/{lib,host,operations,execution}.rs</code></td><td>wasm runtime, host-call protocol</td></tr>
+<tr><td><span class="src">crates/cli/src/providers.rs</span></td><td>chooses <code>LocalProvider</code> vs <code>HttpProvider</code></td></tr>
+<tr><td><code>exoharness/cloudflare/src/{index,provider,runtime}.ts</code></td><td>Worker front door, DO classes, wasm driver</td></tr>
+<tr><td><code>exoharness/typescript/harness/{index,runner,wire}.ts</code></td><td>TS harness API and guest side of host protocol</td></tr>
+</tbody>
+</table>
+<h3>Data model</h3>
+<table>
+<thead><tr><th>File</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><span class="src">crates/exoharness/src/types.rs</span></td><td>all public types: handle traits, ids, <code>Event</code>/<code>EventData</code>/<code>EventKind</code>, queries, artifacts, sandbox records.</td></tr>
+<tr><td><span class="src">crates/exoharness/src/uuid7.rs</span></td><td><code>Uuid7</code> newtype and <code>HasUuid7Id</code>.</td></tr>
+<tr><td><span class="src">crates/exoharness/src/basic.rs</span></td><td><code>BasicExoHarness</code>: agent/thread/turn handles, append, head, get_events, watch, fork, artifacts.</td></tr>
+<tr><td><span class="src">crates/exoharness/src/basic/sessions.rs</span></td><td>per-thread flock leases and crash recovery of owned sandboxes.</td></tr>
+<tr><td><span class="src">crates/exoharness/src/basic/turn_queue.rs</span></td><td>file-backed <code>TurnQueueStore</code> (<code>turn_queue.json</code>).</td></tr>
+<tr><td><span class="src">crates/exoharness/src/basic/sandboxes.rs</span></td><td>sandbox records and the event sinks (None/Conversation/Turn) that log lifecycle events.</td></tr>
+<tr><td><span class="src">crates/exoharness/src/basic/access.rs</span></td><td><code>check</code>/<code>claim</code> against the <code>AccessPolicy</code>, caller-scoped bindings.</td></tr>
+<tr><td><span class="src">crates/exoharness/src/basic/migration.rs</span></td><td>legacy secrets/bindings migration into vaults.</td></tr>
+<tr><td><span class="src">crates/exoharness/src/basic/native.rs</span></td><td>native config/wiring (root dir, storage, resource store), <code>check_resource_fork</code>.</td></tr>
+<tr><td><span class="src">crates/exoharness/src/storage.rs</span></td><td><code>Storage</code> trait and <code>BasicObjectStore</code> JSON helpers.</td></tr>
+<tr><td><span class="src">crates/exoharness/src/storage/native.rs</span></td><td><code>object_store</code> LocalFileSystem / InMemory backends.</td></tr>
+<tr><td><span class="src">crates/exoharness/src/turn_coordinator.rs</span></td><td><code>TurnAdmission</code>/<code>TurnQueue</code> traits, <code>TurnControl</code>, <code>TurnOptions</code>.</td></tr>
+<tr><td><span class="src">crates/exoharness/src/turn_coordinator/stored.rs</span></td><td><code>StoredTurnCoordinator</code>, <code>TurnQueueState</code>, receipts, per-thread locks.</td></tr>
+<tr><td><span class="src">crates/exoharness/src/contract_tests.rs</span></td><td>backend-agnostic invariants (begin/finish, pagination, admission contract).</td></tr>
+<tr><td><span class="src">crates/exoharness/src/basic_tests.rs</span></td><td>watch lag test, head derivation, artifacts, interleaving tests.</td></tr>
+<tr><td><span class="src">crates/exoharness/src/environment.rs</span></td><td><code>EnvironmentDefinition</code> and validation.</td></tr>
+<tr><td><span class="src">crates/exoharness/src/resources.rs</span></td><td><code>ResourceDefinition</code>/<code>PreparedResource</code> schema.</td></tr>
+<tr><td><span class="src">crates/exoharness/src/resources/local.rs</span></td><td><code>ResourceStore</code>: snapshots, per-thread CoW clones, locks.</td></tr>
+<tr><td><span class="src">crates/exoharness/src/access.rs</span></td><td><code>Caller</code> and <code>AccessPolicy</code>.</td></tr>
+<tr><td><span class="src">crates/executor/src/turn_queue.rs</span></td><td>queue runtime: accept, drain, recover, journal status, failure persistence.</td></tr>
+<tr><td><span class="src">crates/executor/src/harness_executor.rs</span></td><td><code>TurnWork</code>, runtime custom event names, <code>recovery_query</code>, turn start/finalise.</td></tr>
+<tr><td><span class="src">crates/executor/src/shared.rs</span></td><td><code>finalize_turn</code> (Error + TurnEnded).</td></tr>
+<tr><td><span class="src">crates/executor/src/message_history.rs</span></td><td>events -&gt; <code>Vec&lt;Message&gt;</code> fold, dangling tool-call repair.</td></tr>
+<tr><td><span class="src">crates/executor/src/basic.rs</span></td><td><code>materialize_prompt_history</code> and the per-thread history cache.</td></tr>
+<tr><td><span class="src">crates/executor/src/model_events.rs</span></td><td>model response -&gt; <code>Messages</code>/<code>ToolRequested</code> events + <code>UsageRecord</code>.</td></tr>
+<tr><td><span class="src">crates/executor/src/native/conversation_events.rs</span></td><td>host events and the <code>list_conversation_events</code> tool.</td></tr>
+<tr><td><span class="src">crates/worker-runtime/src/host.rs</span></td><td><code>HostStorage</code> (Storage over host RPC).</td></tr>
+<tr><td><span class="src">crates/worker-runtime/src/turn_queue.rs</span></td><td>host-backed <code>TurnQueueStore</code> with alarm flag.</td></tr>
+<tr><td><span class="src">crates/cost/src/table.rs</span></td><td><code>PricingTable</code>, per-provider cost math, model lookup.</td></tr>
+<tr><td><span class="src">crates/cost/src/loader.rs</span></td><td>LiteLLM price loader with cache/stale fallback.</td></tr>
+<tr><td><span class="src">exoharness/docs/design/cost-tracking.md</span></td><td>design rationale for usage-as-data, cost-as-policy.</td></tr>
+<tr><td><span class="src">docs/resources.md</span></td><td>filesystem resources doc (fork with resources unsupported).</td></tr>
+</tbody>
+</table>
+<h3>Harnesses</h3>
+<table>
+<thead><tr><th>File</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><span class="src">crates/exoharness/src/harness.rs</span></td><td><code>Harness&lt;T&gt;</code> trait, <code>HarnessCommand</code>, <code>HarnessEvent</code>, <code>HarnessTurnOutcome</code></td></tr>
+<tr><td><span class="src">crates/exoharness/src/turn_coordinator.rs</span></td><td><code>TurnQueue</code>/<code>TurnAdmission</code> contract: enqueue, claim, start, suspend, acknowledge</td></tr>
+<tr><td><span class="src">crates/exoharness/src/basic/turn_queue.rs</span></td><td>storage-backed <code>StoredTurnCoordinator</code> wiring</td></tr>
+<tr><td><span class="src">crates/executor/src/harness_executor.rs</span></td><td><code>HarnessExecutor</code> trait, <code>Runtime</code>, <code>TurnWork</code>, <code>start_local_turn</code>, finalizer, watch/reconnect</td></tr>
+<tr><td><span class="src">crates/executor/src/harness_adapter.rs</span></td><td><code>ExecutorHarness</code>: runs executors, cancel/suspend select loop, <code>restore_recovery_tools</code></td></tr>
+<tr><td><span class="src">crates/executor/src/harness_events.rs</span></td><td><code>HarnessTurn</code>, <code>HarnessEvents</code>, stream relay, <code>turn_stream</code></td></tr>
+<tr><td><span class="src">crates/executor/src/turn_queue.rs</span></td><td><code>accept_local_turn</code>, <code>spawn_queue</code>, <code>run_queue</code>, <code>open_queue_head</code>, journal status</td></tr>
+<tr><td><span class="src">crates/executor/src/provider.rs</span></td><td><code>Provider</code> trait, <code>LocalProvider</code>, in-memory default queue</td></tr>
+<tr><td><span class="src">crates/executor/src/executor_types.rs</span></td><td><code>AgentConfig</code>, <code>AgentHarnessKind</code>, <code>ModelClient</code>, <code>ToolRuntime</code>, <code>ExecutionStreamEvent</code></td></tr>
+<tr><td><span class="src">crates/executor/src/harness_config.rs</span></td><td>config stored as <code>config/executor.json</code> artifacts on agent and thread</td></tr>
+<tr><td><span class="src">crates/executor/src/executor_cache.rs</span></td><td>per-thread executor cache with busy-thread guard</td></tr>
+<tr><td><span class="src">crates/executor/src/basic.rs</span></td><td>Rust reference loop, round marker, recovery replay</td></tr>
+<tr><td><span class="src">crates/executor/src/native/rlm.rs</span></td><td>RLM executor, tools, FINAL parsing, prompts</td></tr>
+<tr><td><span class="src">crates/executor/src/native/harness_js_repl.rs</span></td><td>Boa-based JSON-state REPL</td></tr>
+<tr><td><span class="src">crates/executor/src/native/typescript.rs</span></td><td><code>TypeScriptExecutor</code>, runner spawn, wire enums, select loop</td></tr>
+<tr><td><span class="src">crates/executor/src/typescript_runtime.rs</span></td><td>transport-free request handler, init payload, sandbox-process reuse</td></tr>
+<tr><td><span class="src">crates/executor/src/native/managed_executor.rs</span></td><td>kind-to-executor router and capability routing</td></tr>
+<tr><td><span class="src">crates/executor/src/managed_agents/config.rs</span></td><td>harness string resolution, presets (codex/claude-code/cursor/pi)</td></tr>
+<tr><td><span class="src">crates/executor/src/native/scheduler_runtime.rs</span></td><td><code>run_due_tasks</code>, fire/wakeup, redelivery</td></tr>
+<tr><td><span class="src">crates/executor/src/native/scheduler_types.rs</span></td><td>task records, schedule grammar, missed-fire policy</td></tr>
+<tr><td><span class="src">crates/executor/src/native/scheduler_store.rs</span></td><td>JSON-file task/run/pending-fire store</td></tr>
+<tr><td><span class="src">crates/executor/src/native/conversation_wakeup.rs</span></td><td><code>send_conversation_wakeup</code> with temp-dir lock</td></tr>
+<tr><td><span class="src">crates/executor/src/native/conversation_events.rs</span></td><td>host-event writer / reader for the conversation log</td></tr>
+<tr><td><span class="src">crates/executor/src/native/agent_sandbox.rs</span></td><td>durable agent-scoped sandbox record</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/index.ts</span></td><td>TS harness API: <code>TurnContext</code>, <code>TypeScriptHarness</code>, event helpers, history materialization</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/runner.ts</span></td><td>Node runner: module load, turn loop, recovery gate</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/client.ts</span></td><td>wire types, <code>HarnessClient</code>, <code>createTurnContext</code></td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/wire.ts</span></td><td>raw-to-camelCase config conversion</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/sandbox-process.ts</span></td><td>guest-side sandbox process streams</td></tr>
+<tr><td><span class="src">exoharness/typescript/model-runtime/turn-loop.ts</span></td><td>stock Responses-API turn loop (<code>runResponsesHarnessTurn</code>)</td></tr>
+<tr><td><span class="src">exoharness/examples/typescript/rlm-harness.ts</span></td><td>TS RLM with <code>node:vm</code></td></tr>
+<tr><td><span class="src">examples/self-improving-agent/scheduler-runner/src/main.rs</span></td><td>the only driver of <code>run_due_tasks</code></td></tr>
+</tbody>
+</table>
+<h3>Native harnesses</h3>
+<table>
+<thead><tr><th>File</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><span class="src">exoharness/typescript/codex/harness.ts</span></td><td>the Codex harness: session cache, thread config, turn loop, item projection, approvals, recovery orchestration</td></tr>
+<tr><td><span class="src">exoharness/typescript/codex/app-server.ts</span></td><td>JSON-RPC-style client for <code>codex app-server</code> over a sandbox process (or host process)</td></tr>
+<tr><td><span class="src">exoharness/typescript/codex/replay.ts</span></td><td>converts Exo messages to Responses items, chunks them, injects and compacts via <code>thread/inject_items</code></td></tr>
+<tr><td><span class="src">exoharness/typescript/codex/recovery.ts</span></td><td>native turn snapshot parsing and <code>assertNativeToolSafety</code></td></tr>
+<tr><td><span class="src">exoharness/typescript/codex/mcp-approval.ts</span></td><td>matches MCP elicitations to pending calls and authorizes them</td></tr>
+<tr><td><span class="src">exoharness/typescript/codex/usage.ts</span></td><td><code>CodexUsageAccumulator</code> and usage event construction</td></tr>
+<tr><td><span class="src">exoharness/typescript/codex/fixtures/fake-app-server.ts</span></td><td>in-memory fake app-server for recovery tests</td></tr>
+<tr><td><span class="src">exoharness/examples/typescript/codex-harness.ts</span></td><td>preset entry point binding the Codex harness to the pinned CLI version</td></tr>
+<tr><td><span class="src">exoharness/examples/typescript/codex-harness.recovery.test.ts</span></td><td>recovery matrix tests (reattach, resume, replay, ambiguous start, lost approval)</td></tr>
+<tr><td><span class="src">exoharness/examples/typescript/claude-code-harness.ts</span></td><td>Claude Agent SDK harness incl. <code>SandboxClaudeCodeProcess</code>, hooks, usage</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/claude-runtime-tools.ts</span></td><td>in-process <code>exo_runtime</code> MCP server exposing Exo tools to Claude</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/native-mcp.ts</span></td><td>maps native tool names (<code>mcp__server__tool</code>, Codex MCP items) to Exo tool names</td></tr>
+<tr><td><span class="src">exoharness/examples/typescript/pi-harness.ts</span></td><td>Pi RPC harness and generated tool-bridge extension</td></tr>
+<tr><td><span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts</span></td><td>Cursor harness: transcript prompt, worker cache, event projection</td></tr>
+<tr><td><span class="src">exoharness/typescript/cursor/sandbox-worker.ts</span></td><td>in-sandbox JSONL worker around <code>@cursor/sdk</code></td></tr>
+<tr><td><span class="src">exoharness/typescript/cursor/sdk.ts</span></td><td>Cursor SDK session wrapper (agent reuse, sandbox disabled)</td></tr>
+<tr><td><span class="src">exoharness/typescript/cursor/protocol.ts</span></td><td>Cursor worker request/event types and model id mapping</td></tr>
+<tr><td><span class="src">exoharness/typescript/model-runtime/turn-loop.ts</span></td><td>Exo-owned model loop used by basic-style TS harnesses</td></tr>
+<tr><td><span class="src">exoharness/typescript/model-runtime/responses.ts</span></td><td>Responses/Chat/Anthropic runtimes, Lingua conversion, Braintrust tracing</td></tr>
+<tr><td><span class="src">exoharness/typescript/model-runtime/shared.ts</span></td><td>warm resource cache, JSONL worker, model/credential resolution, event helpers</td></tr>
+<tr><td><span class="src">exoharness/typescript/model-runtime/cost.ts</span></td><td>LiteLLM price table loader and cost math</td></tr>
+<tr><td><span class="src">exoharness/typescript/model-runtime/usage.ts</span></td><td><code>modelUsageRecord</code> (explicit cost or table-computed)</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/runner.ts</span></td><td>runner loop; gates <code>resumeTurn</code> and tool-policy validation per harness</td></tr>
+<tr><td><span class="src">crates/executor/src/typescript_runtime.rs</span></td><td>sandbox process start/reuse/event streaming for TS harnesses</td></tr>
+<tr><td><span class="src">crates/executor/src/harness_adapter.rs</span></td><td>bridges executors to the turn lifecycle (cancel, suspend, recovery tool restore)</td></tr>
+<tr><td><span class="src">crates/executor/src/native/typescript.rs</span></td><td>TypeScript executor (runner cache, <code>can_reconcile_unresolved_tool_call</code>)</td></tr>
+<tr><td><span class="src">crates/executor/src/managed_agents/config.rs</span></td><td>harness presets, default image pins, model credential env var mapping</td></tr>
+<tr><td><span class="src">crates/executor/src/sandbox_policy.rs</span></td><td>egress credential bindings for model keys and native MCP servers</td></tr>
+<tr><td><span class="src">exoharness/containers/README.md</span></td><td>how sandbox images are published and digest-pinned</td></tr>
+<tr><td><span class="src">exoharness/containers/update-default-image-digests.py</span></td><td>rewrites image digests in <code>config.rs</code> after a publish</td></tr>
+<tr><td><span class="src">exoharness/docs/coding-agent-harnesses.md</span></td><td>user-facing setup doc for the four harnesses</td></tr>
+</tbody>
+</table>
+<h3>Tools &amp; MCP</h3>
+<table>
+<thead><tr><th>File</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><span class="src">exoharness/typescript/harness/tools.ts</span></td><td>Tool/ToolInstance contract, HarnessToolRegistry dispatch, result compaction, strict-schema validation</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/tool.ts</span></td><td>public re-exports for tool authors (<code>@exo/harness/tool</code>)</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/tool-modules.ts</span></td><td>module loading, library/agent registration, env-ref expansion</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/tool-registry.ts</span></td><td><code>.exo/tools</code> manifest, lockfile, staging, locking, git/local sources</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/built-in-tools.ts</span></td><td>shell, inspect_tools, manage_tool, install/uninstall_agent_tool</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/skill-tools.ts</span></td><td>skills tools, index, <code>skillsInstruction</code></td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/client-tools.ts</span></td><td>client-tool model_input lookup and failure detection</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/native-mcp.ts</span></td><td>Codex/Claude MCP and native tool name mapping</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/claude-runtime-tools.ts</span></td><td><code>exo_runtime</code> in-process MCP server for Claude</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/sandbox-process.ts</span></td><td>sandbox process handle (web streams over runtime events)</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/client.ts</span></td><td>TurnContext construction; authorizeTool/executeTool runtime requests</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/runner.ts</span></td><td>policy validation and recovery gate for TS harnesses</td></tr>
+<tr><td><span class="src">exoharness/typescript/model-runtime/turn-loop.ts</span></td><td>default registry assembly and Responses tool loop</td></tr>
+<tr><td><span class="src">exoharness/typescript/codex/mcp-approval.ts</span></td><td>Codex MCP elicitation to <code>authorizeTool</code></td></tr>
+<tr><td><span class="src">crates/executor/src/permissions.rs</span></td><td>approval request/response events, <code>authorize</code>, <code>respond</code></td></tr>
+<tr><td><span class="src">crates/executor/src/frontend_tools.rs</span></td><td>client tool definitions, wait/respond rendezvous</td></tr>
+<tr><td><span class="src">crates/executor/src/mcp.rs</span></td><td><code>McpToolRuntime</code> decorator, native MCP server list</td></tr>
+<tr><td><span class="src">crates/executor/src/managed_mcp.rs</span></td><td><code>connect_mcp</code>, thread MCP validation, <code>mcp_tools</code> inventory event</td></tr>
+<tr><td><span class="src">crates/executor/src/shell_tool.rs</span></td><td>Rust shell execution in sandbox</td></tr>
+<tr><td><span class="src">crates/executor/src/native/harness_tool.rs</span></td><td>BasicToolRuntime / ExoToolRuntime tool dispatch</td></tr>
+<tr><td><span class="src">crates/executor/src/native/harness_js_repl.rs</span></td><td>Boa JS REPL for RLM</td></tr>
+<tr><td><span class="src">crates/executor/src/native/rlm.rs</span></td><td>RLM tool definitions and loop</td></tr>
+<tr><td><span class="src">crates/executor/src/basic.rs</span></td><td>Basic loop, tool round, resume progress</td></tr>
+<tr><td><span class="src">crates/executor/src/harness_adapter.rs</span></td><td>recovery tool safety check, suspend semantics</td></tr>
+<tr><td><span class="src">crates/executor/src/typescript_runtime.rs</span></td><td><code>handle_request</code> for AuthorizeTool/ExecuteTool from TS</td></tr>
+<tr><td><span class="src">crates/executor/src/sandbox_policy.rs</span></td><td>egress bindings for native MCP servers</td></tr>
+<tr><td><span class="src">crates/mcp/src/client.rs</span></td><td>McpToolSet, exposed-name scheme, retry-on-401</td></tr>
+<tr><td><span class="src">crates/mcp/src/native.rs</span></td><td>rmcp streamable-HTTP connector, timeouts, auth probe</td></tr>
+<tr><td><span class="src">crates/mcp/src/auth.rs</span></td><td>credential-injecting HTTP client</td></tr>
+<tr><td><span class="src">crates/managed-agents/src/mcp.rs</span></td><td><code>McpServerDefinition</code> (url/provider)</td></tr>
+<tr><td><span class="src">crates/managed-agents/src/permissions.rs</span></td><td>PermissionPolicy and resolution rules</td></tr>
+<tr><td><span class="src">crates/managed-agents/src/vaults.rs</span></td><td>VaultSelection, VaultMcpCredentials</td></tr>
+<tr><td><span class="src">crates/cli/src/vaults/login.rs</span></td><td>MCP OAuth discovery and login</td></tr>
+</tbody>
+</table>
+<h3>Sandboxes</h3>
+<table>
+<thead><tr><th>File</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><span class="src">crates/exoharness/src/sandbox.rs</span></td><td>provider traits, <code>SandboxSpec</code>, <code>SnapshotFormat</code>, spec hash</td></tr>
+<tr><td><span class="src">crates/exoharness/src/types.rs</span></td><td><code>SnapshotKind</code>, <code>SandboxProvider</code>, <code>SandboxProviderConfig</code>, <code>EgressPolicy</code>, process/terminal types</td></tr>
+<tr><td><span class="src">crates/exoharness/src/basic/sandboxes.rs</span></td><td>harness lifecycle, snapshot publish/restore, process event log, registry</td></tr>
+<tr><td><span class="src">crates/exoharness/src/basic/native.rs</span></td><td>provider registrations and resource materialization entry</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox/native.rs</span></td><td>Docker/Apple container warm sandboxes, <code>local_process</code></td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_process.rs</span></td><td><code>with_process_management</code> adapter and process registry</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_provider/mod.rs</span></td><td>provider module wiring, Firecracker/Lima backend selection</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs</span></td><td>Firecracker backend: jailer, VM config, network, snapshots, fork, leases</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_provider/firecracker_image.rs</span></td><td>OCI pull to cached immutable ext4</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_provider/firecracker_filesystem.rs</span></td><td>filesystem-kind captures, import/GC</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_provider/firecracker_lima.rs</span></td><td>macOS backend, Lima VM bring-up, egress relay</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_provider/firecracker_bridge.rs</span></td><td>bridge frame protocol and in-VM server</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_provider/process_bridge.rs</span></td><td>long-poll process protocol and Python bridge script</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_provider/smolvm.rs</span></td><td>smolvm backend (libkrun), idle lease, filesystem snapshots</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_provider/capture_store.rs</span></td><td>shared staged/atomic capture publishing with leases</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_provider/daytona.rs</span></td><td>Daytona REST backend, teleport restore</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_provider/e2b.rs</span></td><td>E2B backend (Full snapshots only)</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_provider/sprites.rs</span></td><td>Sprites backend (checkpoints, WebSocket exec)</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_provider/vercel.rs</span></td><td>Vercel backend (native network policy)</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_provider/aws_agentcore.rs</span></td><td>AgentCore backend (session storage, bridge)</td></tr>
+<tr><td><span class="src">crates/exoharness/src/local_volume.rs</span></td><td>APFS sparse image / reflink resource volumes</td></tr>
+<tr><td><span class="src">crates/firecracker-protocol/src/lib.rs</span></td><td>host/guest JSON protocol v4, framing limits</td></tr>
+<tr><td><span class="src">crates/firecracker-guest/src/linux.rs</span></td><td>guest PID 1: overlay root, vsock server, exec/processes/PTY</td></tr>
+<tr><td><span class="src">support/firecracker/README.md</span></td><td>bundle, security model, Lima dev setup</td></tr>
+<tr><td><span class="src">exoharness/cloudflare/src/sandbox.ts</span></td><td>Cloudflare Durable Object + Container sandbox</td></tr>
+<tr><td><span class="src">crates/executor/src/conversation_sandbox.rs</span></td><td>thread sandbox spec, find-or-create</td></tr>
+<tr><td><span class="src">crates/executor/src/sandbox_policy.rs</span></td><td>egress policy assembly (git, model, MCP bindings)</td></tr>
+<tr><td><span class="src">crates/executor/src/sandbox_resources.rs</span></td><td>in-sandbox Git workspaces for remote providers</td></tr>
+<tr><td><span class="src">crates/executor/src/native/local_sandbox.rs</span></td><td>route sandbox ops to a local harness over a remote one</td></tr>
+<tr><td><span class="src">crates/executor/src/previews.rs</span></td><td>Host-header preview proxy</td></tr>
+</tbody>
+</table>
+<h3>Egress &amp; vaults</h3>
+<table>
+<thead><tr><th>File</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><span class="src">crates/exoharness/src/egress/mod.rs</span></td><td>proxy core: State, forward(), destination checks, TLS config, public_ipv4, transparent HTTPS handling</td></tr>
+<tr><td><span class="src">crates/exoharness/src/egress/transport.rs</span></td><td>LocalEgressTransport, source-IP binding, DNS service (NXDOMAIN/synthetic/real answers)</td></tr>
+<tr><td><span class="src">crates/exoharness/src/egress/sandbox.rs</span></td><td>EgressRuntime: proxy lifecycle per sandbox, trust install, env injection</td></tr>
+<tr><td><span class="src">crates/exoharness/src/egress/explicit.rs</span></td><td>ExplicitProxy and hosted CONNECT proxy (ProxyAuthorizer/ProxySession)</td></tr>
+<tr><td><span class="src">crates/exoharness/src/egress/external.rs</span></td><td>ExternalProxyConfig: CONNECT through an authenticated remote proxy</td></tr>
+<tr><td><span class="src">crates/exoharness/src/egress/tests.rs</span></td><td>2.8k-line behavioural spec of the proxy</td></tr>
+<tr><td><span class="src">crates/exoharness/src/egress/git_tests.rs</span></td><td>Git smart-HTTP and GitHub API credential behaviour</td></tr>
+<tr><td><span class="src">crates/exoharness/src/egress_credentials.rs</span></td><td>placeholders, Binding, validate/substitute headers, EgressError, NetworkPolicy, resolver trait</td></tr>
+<tr><td><span class="src">crates/exoharness/src/egress_credentials/session.rs</span></td><td>persisted EgressSession for hosted runtimes (fingerprints, refresh)</td></tr>
+<tr><td><span class="src">crates/exoharness/src/egress_credentials/vault.rs</span></td><td>resolve_credential / resolve_with_rejection over a VaultHandle</td></tr>
+<tr><td><span class="src">crates/exoharness/src/basic/egress.rs</span></td><td>LocalEgressResolver (sandbox record -&gt; SecretReference -&gt; vault)</td></tr>
+<tr><td><span class="src">crates/exoharness/src/credential_policy.rs</span></td><td>CredentialDestination (Origin/Url), CredentialPolicy, permits()</td></tr>
+<tr><td><span class="src">crates/exoharness/src/types.rs</span></td><td>SandboxNetworkPolicy, EgressPolicy, EgressCredentialBinding, Secret, SecretMetadata</td></tr>
+<tr><td><span class="src">crates/exoharness/src/secrets.rs</span></td><td>SecretCipher (AES-256-GCM, AAD-bound), EncryptedSecret</td></tr>
+<tr><td><span class="src">crates/exoharness/src/secrets/native.rs</span></td><td>file / Apple Keychain master-key providers, secret file locking</td></tr>
+<tr><td><span class="src">crates/exoharness/src/vault.rs</span></td><td>VaultContext/VaultHandle traits, find_secret, compose_vaults, model_endpoint, validate_secret</td></tr>
+<tr><td><span class="src">crates/exoharness/src/vault/local.rs</span></td><td>BasicVaultStore: catalog, put/update/resolve, refresh CAS</td></tr>
+<tr><td><span class="src">crates/exoharness/src/vault/local/oauth.rs</span></td><td>OAuth refresh-token exchange via oauth2 crate (no redirects)</td></tr>
+<tr><td><span class="src">crates/exoharness/src/vault/local/native.rs</span></td><td>file catalog IO, oauth.lock, GitHub CLI cache</td></tr>
+<tr><td><span class="src">crates/exoharness/src/vault/github.rs</span></td><td><code>gh auth token</code> / status wrappers</td></tr>
+<tr><td><span class="src">crates/exoharness/src/basic/access.rs</span></td><td>vault precedence per agent/thread (VaultContext impls)</td></tr>
+<tr><td><span class="src">crates/exoharness/src/basic/sandboxes.rs</span></td><td>pins SecretReference per binding at sandbox creation</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs</span></td><td>nftables DNAT/reject rules, FirecrackerDns</td></tr>
+<tr><td><span class="src">crates/exoharness/src/sandbox_provider/smolvm/egress.rs</span></td><td>SmolVM interceptor handshake (token + original destination)</td></tr>
+<tr><td><span class="src">crates/executor/src/sandbox_policy.rs</span></td><td>turns model/Git/MCP vault credentials into narrowed egress bindings</td></tr>
+<tr><td><span class="src">crates/executor/src/harness_helpers.rs</span></td><td>model_credential / resolve_model (host-side key resolution)</td></tr>
+<tr><td><span class="src">crates/cli/src/vaults.rs</span></td><td><code>exo vault</code> commands, --allow-origin/--allow-url/--policy</td></tr>
+<tr><td><span class="src">crates/cli/src/vaults/login.rs</span></td><td>presets, token import, OAuth discovery, device flow, gh linking</td></tr>
+<tr><td><span class="src">crates/cli/src/oauth.rs</span></td><td>loopback browser OAuth callback server</td></tr>
+<tr><td><span class="src">crates/managed-agents/src/vaults.rs</span></td><td>per-thread MCP VaultSelection and VaultMcpCredentials</td></tr>
+<tr><td><span class="src">crates/mcp/src/auth.rs</span></td><td>MCP streamable-HTTP client wrapper that resolves/refreshes credentials per request</td></tr>
+<tr><td><span class="src">crates/worker-runtime/src/policy.rs</span></td><td>hosted (Cloudflare) header-rewrite entry using EgressSession</td></tr>
+<tr><td><span class="src">crates/cli/tests/vault_oauth.rs</span></td><td>OAuth/refresh/revocation integration tests</td></tr>
+<tr><td><span class="src">docs/egress.md</span></td><td>operator-facing egress reference</td></tr>
+<tr><td><span class="src">website/docs-src/architecture/vaults.md</span></td><td>user-facing vault docs</td></tr>
+</tbody>
+</table>
+<h3>Managed agents</h3>
+<table>
+<thead><tr><th>File</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><span class="src">crates/managed-agents/src/lib.rs</span></td><td>AgentDefinition, parse/validate/to_json/from_json, AgentBackend, create/open thread helpers</td></tr>
+<tr><td><span class="src">crates/managed-agents/src/frontmatter.rs</span></td><td>AgentFrontmatter, ResourceInput, diagnostics</td></tr>
+<tr><td><span class="src">crates/managed-agents/src/adapters.rs</span></td><td>AdapterDefinition::Slack, SlackAdapter schema and validation</td></tr>
+<tr><td><span class="src">crates/managed-agents/src/permissions.rs</span></td><td>PermissionPolicy and resolution order</td></tr>
+<tr><td><span class="src">crates/managed-agents/src/mcp.rs</span></td><td>McpServerDefinition (url|provider), resolver trait</td></tr>
+<tr><td><span class="src">crates/managed-agents/src/vaults.rs</span></td><td>VaultSelection, credential binding per MCP server</td></tr>
+<tr><td><span class="src">crates/managed-agents/src/identity.rs</span></td><td>IdentityRecord/IdentityCommand (person to vault)</td></tr>
+<tr><td><span class="src">crates/managed-agents/src/http/protocol.rs</span></td><td>request/response bodies for the API</td></tr>
+<tr><td><span class="src">crates/managed-agents/src/http/client.rs</span></td><td>RuntimeClient</td></tr>
+<tr><td><span class="src">crates/managed-agents/src/http/sse.rs</span></td><td>SSE framing and heartbeats</td></tr>
+<tr><td><span class="src">crates/managed-agents/src/tests.rs</span></td><td>parse, diagnostics, resource, MCP, flat/nested JSON tests</td></tr>
+<tr><td><span class="src">crates/executor/src/managed_agents.rs</span></td><td>AgentBackend for LocalProvider (configure_agent/thread)</td></tr>
+<tr><td><span class="src">crates/executor/src/managed_agents/config.rs</span></td><td>harness resolution, definition to AgentConfig</td></tr>
+<tr><td><span class="src">crates/executor/src/managed_agents/http.rs</span></td><td>shared route table and Platform trait</td></tr>
+<tr><td><span class="src">crates/executor/src/managed_agents/service.rs</span></td><td>transport-independent handlers, error mapping, SSE merge</td></tr>
+<tr><td><span class="src">crates/executor/src/managed_agents/adapters/mod.rs</span></td><td>AdapterService (reconcile, accept, submit, drain, deliver, approvals)</td></tr>
+<tr><td><span class="src">crates/executor/src/managed_agents/adapters/slack.rs</span></td><td>Slack connection, admission filters, Block Kit send</td></tr>
+<tr><td><span class="src">crates/executor/src/managed_agents/adapters/store.rs</span></td><td>durable inbox/outbox/route types and pending index</td></tr>
+<tr><td><span class="src">crates/executor/src/managed_agents/adapters/access.rs</span></td><td>AdapterPolicy, principal derivation</td></tr>
+<tr><td><span class="src">crates/executor/src/managed_agents/adapters/progress.rs</span></td><td>events to Slack stream chunks</td></tr>
+<tr><td><span class="src">crates/executor/src/managed_agents/adapters/definitions.rs</span></td><td>version-keyed definition cache</td></tr>
+<tr><td><span class="src">crates/executor/src/native/managed_executor.rs</span></td><td>ManagedExecutor per-thread cache</td></tr>
+<tr><td><span class="src">crates/executor/src/managed_mcp.rs</span></td><td>connect_mcp, PreparedMcp, mcp_tools inventory event</td></tr>
+<tr><td><span class="src">crates/executor/src/permissions.rs</span></td><td>authorize(), approval events, respond()</td></tr>
+<tr><td><span class="src">crates/executor/src/harness_executor.rs</span></td><td>update_managed_agent, per-turn permission refresh</td></tr>
+<tr><td><span class="src">crates/executor/src/native/http_service.rs</span></td><td>Actix wiring, Slack webhook routes, identity/manage</td></tr>
+<tr><td><span class="src">crates/executor/src/native/remote/identity.rs</span></td><td>IdentityRegistry, resolve_slack, grant validation</td></tr>
+<tr><td><span class="src">crates/cli/src/managed_agents.rs</span></td><td>file vs saved-agent, upsert on run, credential preflight</td></tr>
+<tr><td><span class="src">crates/cli/src/serve.rs</span></td><td>--serve wiring of HTTP service and AdapterService</td></tr>
+<tr><td><span class="src">crates/worker-runtime/src/execution.rs</span></td><td>hosted WorkerExecutor and its restrictions</td></tr>
+<tr><td><span class="src">website/docs-src/agent-definition.md</span></td><td>user docs for the schema (contains planned items)</td></tr>
+<tr><td><span class="src">docs/managed-adapters.md</span></td><td>adapter design notes (best source for intent)</td></tr>
+</tbody>
+</table>
+<h3>CLI &amp; server</h3>
+<table>
+<thead><tr><th>File</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><span class="src">crates/cli/src/main.rs</span></td><td>clap tree, run/run_selected dispatch, mounts, doctor, slug/env helpers</td></tr>
+<tr><td><span class="src">crates/cli/src/providers.rs</span></td><td>profile store, selection, alias pinning, <code>runtime()</code> local/HTTP fork</td></tr>
+<tr><td><span class="src">crates/cli/src/providers/oauth.rs</span></td><td>keychain-backed OAuth login/refresh for HTTP providers</td></tr>
+<tr><td><span class="src">crates/cli/src/providers/tests.rs</span></td><td>store/alias/stale-write unit tests</td></tr>
+<tr><td><span class="src">crates/cli/src/managed_agents.rs</span></td><td>ThreadArgs, open_agent/open_thread, model credential pre-flight</td></tr>
+<tr><td><span class="src">crates/cli/src/managed_agents/tests.rs</span></td><td>agent-file/thread unit tests</td></tr>
+<tr><td><span class="src">crates/cli/src/serve.rs</span></td><td><code>run --serve</code>: HTTP service, adapters, previews, lock, shutdown</td></tr>
+<tr><td><span class="src">crates/cli/src/tui.rs</span></td><td>line REPL, --prompt, shared slash helpers, remote history</td></tr>
+<tr><td><span class="src">crates/cli/src/tui_app.rs</span></td><td>ratatui full-screen UI, clap slash-command tree</td></tr>
+<tr><td><span class="src">crates/cli/src/render.rs</span></td><td>transcript rendering, verbosity, result folding</td></tr>
+<tr><td><span class="src">crates/cli/src/turn_display.rs</span></td><td>spinner, progress layer, usage/cost tracker</td></tr>
+<tr><td><span class="src">crates/cli/src/environment.rs</span></td><td><code>exo environment</code> YAML CRUD and sandbox backend bindings</td></tr>
+<tr><td><span class="src">crates/cli/src/env.rs</span></td><td><code>--env-file</code> parser</td></tr>
+<tr><td><span class="src">crates/cli/src/identity.rs</span></td><td><code>exo identity</code> (Slack sender pinning), service.lock check</td></tr>
+<tr><td><span class="src">crates/cli/src/port_forward.rs</span></td><td><code>sandbox forward</code> TCP bridge</td></tr>
+<tr><td><span class="src">crates/cli/src/previews.rs</span></td><td>preview URL printing</td></tr>
+<tr><td><span class="src">crates/cli/src/bin/provider_contract.rs</span></td><td>conformance test binary for HTTP providers</td></tr>
+<tr><td><span class="src">crates/cli/tests/support/mod.rs</span></td><td>Fixture (scrubbed-env binary + wiremock model + in-process server)</td></tr>
+<tr><td><span class="src">crates/cli/tests/provider_workflow.rs</span></td><td>local/HTTP parity workflow test</td></tr>
+<tr><td><span class="src">crates/cli/tests/permissions.rs</span></td><td>approval prompt tests over local/HTTP, shell + MCP</td></tr>
+<tr><td><span class="src">crates/cli/tests/integration_chat.rs</span></td><td>CI e2e against real microVM + mocked model</td></tr>
+<tr><td><span class="src">crates/cli/tests/http_usage.rs</span></td><td>fake <code>ModelClient</code> usage/cost reporting test</td></tr>
+<tr><td><span class="src">crates/cli/tests/daytona_backend.rs</span></td><td>wiremock wire-contract test for a hosted backend</td></tr>
+<tr><td><span class="src">.github/workflows/ci.yml</span></td><td>six CI jobs incl. wasm portability and microVM integration</td></tr>
+<tr><td><span class="src">support/ci/setup-sandbox.sh</span></td><td>pinned, checksummed smolvm/Firecracker install for CI</td></tr>
+<tr><td><span class="src">scripts/precommit.mjs</span></td><td>staged-file format/lint + <code>pnpm check</code></td></tr>
+<tr><td><span class="src">.githooks/pre-push</span></td><td>clippy gate</td></tr>
+<tr><td><span class="src">fuzz/fuzz_targets/firecracker_protocol.rs</span></td><td>only fuzz target (vsock frame + JSON decoding)</td></tr>
+<tr><td><span class="src">website/docs-src/.vitepress/event-kinds.ts</span></td><td>EXO_EVENT_KINDS table generator</td></tr>
+<tr><td><span class="src">eval/harbor/src/exo_harbor/agent.py</span></td><td>Harbor per-trial agent (attach container, send, export)</td></tr>
+<tr><td><span class="src">eval/harbor/eval.py</span></td><td>Harbor eval launcher (stale CLI calls)</td></tr>
+</tbody>
+</table>
+<h3>Prompts</h3>
+<table>
+<thead><tr><th>File</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><span class="src">crates/executor/src/native/rlm.rs</span></td><td>RLM system prompt, mounts addendum, root user prompt, subquery system prompt, three tool descriptions</td></tr>
+<tr><td><span class="src">crates/executor/src/native/harness_js_repl.rs</span></td><td>JS wrapper defining <code>context</code>, <code>getMessages</code>, <code>print</code>, <code>Final</code> (behavior the RLM prompt describes)</td></tr>
+<tr><td><span class="src">exoharness/examples/typescript/rlm-harness.ts</span></td><td>TypeScript port of the RLM prompts and tools</td></tr>
+<tr><td><span class="src">crates/executor/src/managed_agents/config.rs</span></td><td>turns agent definition body into the single system message</td></tr>
+<tr><td><span class="src">crates/executor/src/harness_executor.rs</span></td><td>filesystem-resources and preview system messages</td></tr>
+<tr><td><span class="src">crates/executor/src/previews.rs</span></td><td>preview URL notice text</td></tr>
+<tr><td><span class="src">crates/executor/src/managed_agents/adapters/mod.rs</span></td><td>Slack <code>[slack user &lt;id&gt;]</code> input preamble</td></tr>
+<tr><td><span class="src">crates/executor/src/native/scheduler_runtime.rs</span></td><td>scheduled-task success/failure wakeup prompts</td></tr>
+<tr><td><span class="src">crates/executor/src/basic.rs</span></td><td><code>shell</code> tool description, tool failure envelope</td></tr>
+<tr><td><span class="src">crates/executor/src/permissions.rs</span></td><td>"tool call denied by the user" text</td></tr>
+<tr><td><span class="src">crates/executor/src/message_history.rs</span></td><td>"tool execution did not complete before the previous turn ended"</td></tr>
+<tr><td><span class="src">crates/exoharness/src/egress/mod.rs</span></td><td>403/502 egress response bodies</td></tr>
+<tr><td><span class="src">exoharness/typescript/model-runtime/turn-loop.ts</span></td><td>agent-tool-creation developer instruction</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/built-in-tools.ts</span></td><td><code>shell</code>, <code>inspect_tools</code>, <code>manage_tool</code>, <code>install_agent_tool</code>, <code>uninstall_agent_tool</code> descriptions</td></tr>
+<tr><td><span class="src">exoharness/typescript/harness/skill-tools.ts</span></td><td>skill tool descriptions, skills index message, corrupt-index notice</td></tr>
+<tr><td><span class="src">exoharness/examples/typescript/coding-agent-harness.ts</span></td><td>coding agent system prompt, env block, todowrite description, live todo injection</td></tr>
+<tr><td><span class="src">exoharness/examples/gameboy-agent/agent/harness.ts</span></td><td>Pokemon system prompt and per-round screenshot message</td></tr>
+<tr><td><span class="src">exoharness/examples/gameboy-agent/agent/game-tools.ts</span></td><td>game tool descriptions</td></tr>
+<tr><td><span class="src">exoharness/examples/typescript/sysmon-harness.ts</span></td><td>per-round host memory line</td></tr>
+<tr><td><span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts</span></td><td>Cursor SDK framing preamble</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/prompts/me.md</span></td><td>committed identity and operating rules</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/harness.ts</span></td><td>name message, harness manual developer message, repo pointer, local profile loading</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/tools/memory-tools.ts</span></td><td>remember/forget descriptions, memory block, corrupt-store notice</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/tools/todo-tools.ts</span></td><td>todowrite description and todo block</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/SELF.md</span></td><td>self map and maintenance rules the agent is told to read</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/docs/prompts.md</span></td><td>the repo's own guide to prompt surfaces (partly stale)</td></tr>
+<tr><td><code>eval/harbor/datasets/**/instruction.md</code></td><td>Harbor eval task prompts</td></tr>
+</tbody>
+</table>
+<h3>Examples</h3>
+<table>
+<thead><tr><th>File</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><span class="src">examples/self-improving-agent/harness.ts</span></td><td>default harness; exports <code>registerExoTools</code> / <code>exoInstructions</code> for composition.</td></tr>
+<tr><td><code>examples/self-improving-agent/profiles/{bootstrap,practical,index,types}.ts</code></td><td>tool-set profiles and <code>EXO_PROFILE</code> resolution.</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/prompts/me.md</span></td><td>identity prompt (text covered on prompts page).</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/SELF.md</span></td><td>self map and maintenance rules.</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/tools/memory-tools.ts</span></td><td>remember/forget + memory prompt injection.</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/tools/todo-tools.ts</span></td><td>conversation-scoped todowrite.</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/tools/guardian-tools.ts</span></td><td><code>rebuild_and_restart_exo</code> facade.</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/tools/host-tools.ts</span></td><td>TS-to-Rust tool bridge.</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/tools/sandbox-tools.ts</span></td><td>snapshot/rewind/status tool definitions.</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/tools/scheduler-tools.ts</span></td><td>scheduler tool definitions.</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/tools/introspection-tools.ts</span></td><td><code>list_conversation_events</code> definition.</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/tools/web-tools.ts</span></td><td>host-side web_search/web_fetch with SSRF/DNS-rebinding guard.</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/scripts/exo-service-guardian</span></td><td>build + service start/stop/drain supervisor.</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/scripts/deferred-rebuild-and-restart</span></td><td>detached restart runner and outcome recorder.</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/scheduler-runner/src/main.rs</span></td><td>scheduler host binary (lock, redeliver, poll, drain).</td></tr>
+<tr><td><span class="src">examples/self-improving-agent/exo.sh</span></td><td>startup, control-REPL wrapper, sandbox/image setup.</td></tr>
+<tr><td><code>examples/self-improving-agent/docs/{RSI,SELF-CONTROL,EXO-BASICS,tools-and-adapters}.md</code></td><td>design rationale (partly stale on adapters).</td></tr>
+<tr><td><span class="src">crates/executor/src/native/scheduler_runtime.rs</span></td><td>run_due_tasks, wakeup write-ahead, redelivery.</td></tr>
+<tr><td><span class="src">crates/executor/src/native/scheduler_types.rs</span></td><td>MissedPolicy, sandbox modes, lease/timeout constants.</td></tr>
+<tr><td><span class="src">crates/executor/src/native/conversation_events.rs</span></td><td>rebuild update record, host event, default event kinds.</td></tr>
+<tr><td><span class="src">crates/executor/src/native/harness_tool.rs</span></td><td>Rust execution arms for host tools.</td></tr>
+<tr><td><code>exoharness/examples/typescript/{basic,sysmon,coding-agent}-harness.ts</code></td><td>minimal harness progression.</td></tr>
+<tr><td><span class="src">exoharness/examples/typescript/rlm-harness.ts</span></td><td>TS RLM harness (node:vm).</td></tr>
+<tr><td><span class="src">exoharness/typescript/model-runtime/turn-loop.ts</span></td><td>stock turn loop the examples hook into.</td></tr>
+<tr><td><code>exoharness/examples/gameboy-agent/agent/{harness,game-tools}.ts</code></td><td>sidecar integration harness and tools.</td></tr>
+<tr><td><code>eval/harbor/src/exo_harbor/{plugin,agent,conventions}.py</code></td><td>Harbor wrapper.</td></tr>
+</tbody>
+</table>
+</main>
+<aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/wiki.js"></script>
+</body>
+</html>

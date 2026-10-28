@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex, Claude Code, Pi &amp; Cursor · Exo internals</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav id="nav"></nav>
+<main>
+<header>
+  <div class="kicker">Runtime internals</div>
+  <h1>Codex, Claude Code, Pi &amp; Cursor</h1>
+  <p class="lede">How the labs' own agent runtimes are driven from inside Exo's sandboxes while Exo's event log stays the canonical transcript: a JSON-RPC bridge to <code>codex app-server</code>, an Agent SDK whose child process lives in the sandbox, Pi's RPC mode with a tool-bridge extension, and a Cursor SDK worker. Also covers the plain Responses-API turn loop in <code>model-runtime</code>.</p>
+</header>
+
+<h2 id="shape">The common shape</h2>
+
+<p>All four "native" harnesses are ordinary TypeScript harnesses (see <a href="harnesses.html">Harnesses</a> for the generic contract): a module that default-exports <code>defineHarness({ runTurn, resumeTurn? })</code>. The Rust executor starts a Node runner for the thread, hands it a <code>TurnContext</code>, and the harness module does the rest. What makes these four special is that the model loop is <em>not</em> in the harness: it is a vendor runtime, and the harness's job is to (1) start that runtime inside the conversation's sandbox, (2) feed it history from Exo events, (3) translate whatever it emits back into canonical Exo events, and (4) route its approvals and tool calls through Exo's permission and tool machinery.</p>
+
+<p>The presets <code>codex</code>, <code>claude-code</code>, <code>pi</code> and <code>cursor</code> (alias <code>cursor-sdk</code>) resolve to these modules and pin a default sandbox image per preset.</p>
+
+<table>
+<thead><tr><th>Preset</th><th>Harness module</th><th>Default sandbox image</th></tr></thead>
+<tbody>
+<tr><td><code>codex</code></td><td><span class="src">exoharness/examples/typescript/codex-harness.ts</span> (a 9-line wrapper around <span class="src">exoharness/typescript/codex/harness.ts</span>)</td><td><code>ghcr.io/exoharness/codex-devbox@sha256:…</code></td></tr>
+<tr><td><code>claude-code</code></td><td><span class="src">exoharness/examples/typescript/claude-code-harness.ts</span></td><td><code>ghcr.io/exoharness/claude-code-devbox@sha256:…</code></td></tr>
+<tr><td><code>pi</code></td><td><span class="src">exoharness/examples/typescript/pi-harness.ts</span></td><td><code>ghcr.io/exoharness/pi-devbox@sha256:…</code></td></tr>
+<tr><td><code>cursor</code></td><td><span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts</span> + <span class="src">exoharness/typescript/cursor/</span></td><td><code>exo-cursor-sdk-sandbox:latest</code> (local build, not published)</td></tr>
+</tbody>
+</table>
+<p>Presets, module paths and image pins: <span class="src">crates/executor/src/managed_agents/config.rs:10-52</span>. The preset also gates model settings: <code>model.reasoning_effort</code> is rejected for anything but Codex (<span class="src">crates/executor/src/managed_agents/config.rs:256-258</span>).</p>
+
+<h3 id="comparison">Comparison table</h3>
+
+<table>
+<thead><tr><th></th><th>Codex</th><th>Claude Code</th><th>Pi</th><th>Cursor</th></tr></thead>
+<tbody>
+<tr><th>Runtime location</th>
+  <td><code>codex app-server --listen stdio://</code> as a long-lived <em>sandbox process</em>; reused across turns and runner restarts via a <code>reuseKey</code></td>
+  <td>Agent SDK <code>query()</code> runs in the harness (runner) process; the SDK's <code>claude-code</code> child process is spawned <em>in the sandbox</em> through a custom <code>spawnClaudeCodeProcess</code>; new process per turn</td>
+  <td><code>pi --mode rpc --no-session</code> in the sandbox; new process per turn</td>
+  <td><code>@cursor/sdk</code> inside a Node worker (<code>sandbox-worker.ts</code>) run in the sandbox; worker cached in runner memory</td></tr>
+<tr><th>Protocol</th>
+  <td>Newline-delimited JSON requests/notifications/server-requests over the process's stdio (<code>CodexAppServer</code>)</td>
+  <td>The Agent SDK's own stdio protocol (opaque to Exo; Exo only supplies the transport)</td>
+  <td>Pi RPC mode: JSONL <code>prompt</code> command, <code>message_update</code> / <code>tool_execution_*</code> / <code>agent_settled</code> events, <code>extension_ui_request</code> for the tool bridge</td>
+  <td>Exo-defined JSONL (<code>CursorWorkerRequest</code> in, <code>CursorWorkerEvent</code> out)</td></tr>
+<tr><th>History source of truth</th>
+  <td>Exo events. Codex's own thread (persisted in <code>CODEX_HOME</code>) is a warm cache; on a cold thread, Exo history is replayed with <code>thread/inject_items</code></td>
+  <td>Exo events, flattened to one transcript string per turn; <code>persistSession: false</code></td>
+  <td>Exo events, flattened to a transcript string per turn; <code>--no-session</code></td>
+  <td>Exo events, flattened to a transcript embedded in the prompt every turn</td></tr>
+<tr><th>Recovery of an interrupted turn</th>
+  <td><code>resumeTurn</code>: reattach to a live native turn, resume the saved native thread, or replay into a fresh thread; refuses ambiguous states</td>
+  <td>None. Turn fails; user starts a new one</td>
+  <td>None. Same</td>
+  <td>None. Same</td></tr>
+<tr><th>Tools / MCP bridging</th>
+  <td>Exo MCP servers handed to Codex as native <code>mcp_servers</code>; remaining Exo tools as <code>dynamicTools</code> answered via <code>item/tool/call</code></td>
+  <td>Exo MCP servers as native HTTP <code>mcpServers</code>; remaining Exo tools via an in-process SDK MCP server <code>exo_runtime</code>; <code>PreToolUse</code> hook for approvals</td>
+  <td>Exo tools registered by a generated Pi extension; calls tunnel to the harness through Pi's <code>ctx.ui.input</code> dialog; no native MCP</td>
+  <td>None. Cursor's own tools are only <em>observed</em> (<code>cursor.&lt;name&gt;</code>)</td></tr>
+<tr><th>Approvals</th>
+  <td>Server requests (<code>item/commandExecution/requestApproval</code>, <code>mcpServer/elicitation/request</code>) answered through <code>context.authorizeTool</code>. <code>nativeToolApprovals: false</code></td>
+  <td><code>PreToolUse</code> hook, all tools. <code>nativeToolApprovals: true</code></td>
+  <td><code>tool_call</code> extension hook, all tools. <code>nativeToolApprovals: true</code></td>
+  <td>None (<code>nativeToolApprovals: false</code>, no tools exposed)</td></tr>
+<tr><th>Cost capture</th>
+  <td>Token deltas from <code>thread/tokenUsage/updated</code>; USD computed from a LiteLLM price table</td>
+  <td>Tokens and <code>total_cost_usd</code> from the SDK's <code>result</code> message</td>
+  <td>Per assistant message: tokens and Pi's own <code>usage.cost.total</code></td>
+  <td>None (only duration and time-to-first-token in traces)</td></tr>
+<tr><th>Model credential</th>
+  <td>Vault secret bound to <code>OPENAI_API_KEY</code> at the egress proxy; harness never sees the key</td>
+  <td>Same, <code>ANTHROPIC_API_KEY</code></td>
+  <td>Same, env var chosen by model provider prefix (<code>OPENAI_/ANTHROPIC_/GEMINI_API_KEY</code>)</td>
+  <td>Raw key resolved in the harness and put in the sandbox env as <code>CURSOR_API_KEY</code></td></tr>
+</tbody>
+</table>
+<p>Sources: <span class="src">exoharness/typescript/codex/harness.ts:349-396</span>, <span class="src">exoharness/examples/typescript/claude-code-harness.ts:78-86</span>, <span class="src">exoharness/examples/typescript/pi-harness.ts:106-112</span>, <span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts:63-72</span>. Egress binding of the model key: <span class="src">crates/executor/src/sandbox_policy.rs:34-50</span> and <span class="src">crates/executor/src/managed_agents/config.rs:71-99</span>; see <a href="egress-and-vaults.html">Egress &amp; vaults</a> for how the proxy substitutes the credential.</p>
+
+<h2 id="codex">Codex</h2>
+
+<h3 id="codex-topology">Where it runs and how it is driven</h3>
+
+<p>Codex is the only harness whose vendor runtime is a long-lived server with a real protocol. The harness never spawns <code>codex</code> on the host: it asks the Rust runtime for a sandbox process (<code>context.startSandboxProcess</code>) and talks JSON to that process's stdin/stdout. Model traffic therefore originates <em>inside</em> the sandbox, goes through the egress proxy, and needs networking: <code>requireCodexSandboxNetworking</code> aborts the turn with a <code>codex_networking_required</code> event otherwise (<span class="src">exoharness/typescript/codex/harness.ts:1459-1483</span>).</p>
+
+<pre class="diagram">
+  Rust executor              TS runner (Node, host)                    Sandbox
+  -------------              ----------------------                    -------
+  start_process  &lt;---------  ctx.startSandboxProcess(reuseKey)
+  (sandbox proc API)         CodexAppServer  (JSON lines)
+        |  stdout events -&gt;   readLoop -&gt; notifications queue
+        |  &lt;- stdin writes     write(request | server-request reply)
+        v
+  sandbox process  ----------------------------------------------&gt;  codex app-server
+                                                                      |  model calls --&gt; egress proxy (key substituted)
+  event log: codex_*  &lt;--  projectCompletedItem / appendCustomEvent    |  MCP servers (HTTP, bearer from env)
+                                                                      |  thread state in $CODEX_HOME
+</pre>
+
+<p>Process lifecycle, step by step:</p>
+<ol class="steps">
+<li><b>Command.</b> <code>codexSandboxCommand</code> runs <code>$SHELL -lc</code> with a guard that <code>codex --version</code> equals <code>codex-cli &lt;version&gt;</code> before <code>exec codex app-server --listen stdio://</code>. The expected version comes from <span class="src">exoharness/containers/codex-sandbox/version</span>, which is also what the Dockerfile installs, so a stale image fails fast with "rebuild the Codex sandbox image" (<span class="src">exoharness/typescript/codex/harness.ts:1489-1498</span>, <span class="src">exoharness/examples/typescript/codex-harness.ts:4-9</span>).</li>
+<li><b>Warm cache.</b> Within one runner, <code>WarmResourceCache&lt;CodexWarmSession&gt;</code> keeps the session keyed by a JSON blob of agent id, conversation id, model, reasoning effort, base URL, instructions, MCP servers and the whole sandbox runtime shape (image, mounts, cwd, command) (<span class="src">exoharness/typescript/codex/harness.ts:1567-1582</span>). Change any of those and you get a fresh app-server.</li>
+<li><b>Cross-restart reuse.</b> The key is also passed as <code>reuseKey</code> to the Rust side. Rust records a <code>typescript_sandbox_process_reuse</code> custom event on the conversation the first time it starts a process for a key, and later looks up the newest such event; if that sandbox process is still running it returns <code>reused: true</code> plus the cursor of the last process event so stdout is not replayed from the beginning (<span class="src">crates/executor/src/typescript_runtime.rs:306-396</span>, <span class="src">crates/executor/src/typescript_runtime.rs:397-467</span>).</li>
+<li><b>Attach vs. start.</b> A fresh process goes through <code>CodexAppServer.startInSandbox</code> (sends <code>initialize</code> then <code>initialized</code>, declaring <code>experimentalApi: true</code>); a reused one goes through <code>attachToSandbox</code>, which skips the handshake because it already happened (<span class="src">exoharness/typescript/codex/app-server.ts:125-137</span>, <span class="src">exoharness/typescript/codex/app-server.ts:171-183</span>).</li>
+<li><b>Which thread.</b> The newest completed <code>codex_warm_session</code> event for the same key and sandbox id tells the harness the native thread id. If the process was reused the thread is still loaded; otherwise the id becomes <code>resumeThreadId</code> and <code>thread/resume</code> is tried (<span class="src">exoharness/typescript/codex/harness.ts:937-988</span>).</li>
+</ol>
+
+<h3 id="codex-protocol">The protocol client</h3>
+
+<p><code>CodexAppServer</code> is a small JSON-RPC-style client (no <code>jsonrpc</code> field; <code>{method, id, params}</code> per line). It exposes <code>request()</code> with a pending-promise map, <code>notify()</code>, and <code>events()</code>, an async generator over an <code>AsyncQueue</code> of notifications. Notable details:</p>
+<ul>
+<li><b>Server requests are answered inline.</b> A message with both <code>id</code> and <code>method</code> is a server-to-client request (an approval prompt, a dynamic tool call). It is pushed to the notification queue (so it is visible in the event stream) <em>and</em> answered by the registered <code>onServerRequest</code> handler. If the handler returns <code>undefined</code> the client falls back to a deny-everything default (<span class="src">exoharness/typescript/codex/app-server.ts:273-296</span>, <span class="src">exoharness/typescript/codex/app-server.ts:469-484</span>).</li>
+<li><b>Partial JSON lines.</b> The reader accumulates a line and retries parsing when <code>JSON.parse</code> fails with "Unterminated string" / "Unexpected end of JSON input", since sandbox process output can split a message mid-line (<span class="src">exoharness/typescript/codex/app-server.ts:223-243</span>, <span class="src">exoharness/typescript/codex/app-server.ts:438-457</span>).</li>
+<li><b>Echo suppression.</b> Any inbound message with an <code>id</code> and <code>method</code> equal to a still-pending client request is dropped as an echo of our own write (<span class="src">exoharness/typescript/codex/app-server.ts:298-304</span>).</li>
+<li><b>Full protocol log.</b> Every message in both directions is numbered and buffered into <code>codex_protocol_message</code> custom events, except <code>*/delta</code> notifications, flushed at the end of the turn and in <code>finally</code> (<span class="src">exoharness/typescript/codex/harness.ts:1685-1725</span>).</li>
+</ul>
+
+<p>The thread is created with Exo supplying everything Codex would normally load from its own config: a custom model provider named <code>exo</code> pointing at the agent's base URL with <code>wire_api: "responses"</code>, the Exo MCP servers, Exo tools as <code>dynamicTools</code>, and the agent instructions as <code>developerInstructions</code>.</p>
+
+<figure class="code">
+  <figcaption><strong>thread/start (or thread/resume): Exo configures Codex entirely from the request</strong> <span class="src">exoharness/typescript/codex/harness.ts:884-920</span></figcaption>
+  <pre><code class="language-ts">  const request: JsonObject = {
+    model: modelBinding.model,
+    modelProvider: "exo",
+    config: {
+      features: { tool_call_mcp_elicitation: true },
+      mcp_servers: Object.fromEntries(
+        context.mcpServers.map((server) =&gt; [
+          server.name,
+          {
+            url: server.url,
+            ...(server.environmentVariable
+              ? { bearer_token_env_var: server.environmentVariable }
+              : {}),
+            enabled_tools: server.tools.map((tool) =&gt; tool.name),
+            required: true,
+            default_tools_approval_mode: "prompt",
+          },
+        ]),
+      ),
+      model_providers: {
+        exo: {
+          name: "Exo",
+          base_url: modelBinding.baseUrl ?? "https://api.openai.com/v1",
+          env_key: "OPENAI_API_KEY",
+          wire_api: "responses",
+          supports_websockets: false,
+        },
+      },
+    },
+    cwd: codexAppServerCwd(context),
+    approvalPolicy: "on-request",
+    sandbox: "read-only",
+    dynamicTools: buildCodexDynamicTools(context),
+    ...(resumeThreadId ? { threadId: resumeThreadId } : { ephemeral: false }),
+    experimentalRawEvents: true,
+    persistFullHistory: true,
+  };</code></pre>
+</figure>
+
+<p>Two things to notice. <code>default_tools_approval_mode: "prompt"</code> is what makes Codex route every MCP call through an elicitation that Exo can intercept (see <a href="#codex-approvals">Approvals</a>). And Codex's own sandboxing is switched off in favour of Exo's: the per-turn <code>sandboxPolicy</code> is <code>{ type: "externalSandbox", networkAccess: "restricted" }</code>.</p>
+
+<h3 id="codex-turn">One turn</h3>
+
+<figure class="code">
+  <figcaption><strong>turn/start declares the sandbox external; the log records intent before, and the native turn id after</strong> <span class="src">exoharness/typescript/codex/harness.ts:584-633</span></figcaption>
+  <pre><code class="language-ts">    if (!attachingLiveTurn) {
+      await appendCustomEvent(turn, "codex_turn_start_intent", {
+        codex_thread_id: threadId,
+      });
+    }
+    await context.stream.status("Waiting for model");
+    const turnStart = attachingLiveTurn
+      ? null
+      : await traceCodexTask(
+          turnParent,
+          "codex_turn_start",
+          { /* ... */ },
+          () =&gt;
+            session.server.request&lt;JsonObject&gt;("turn/start", {
+              threadId,
+              input: turnInput,
+              model: modelBinding.model,
+              ...(context.agentConfig.reasoningEffort
+                ? { effort: context.agentConfig.reasoningEffort }
+                : {}),
+              approvalPolicy: "on-request",
+              sandboxPolicy: {
+                type: "externalSandbox",
+                networkAccess: "restricted",
+              },
+            }),
+        );
+    // ...
+    if (turnStart) {
+      await appendCustomEvent(turn, "codex_turn_started", {
+        metadata: turnMetadata(context),
+        codex_thread_id: threadId,
+        codex_turn_id: nativeTurnId,
+        codex_turn: turnStart.turn ?? null,
+        hydrated_from: threadReused ? "warm_codex_thread" : "exoharness_events",
+        injected_response_items: priorItems.length,
+        warm_app_server_reused: appServerReused,
+        warm_thread_reused: threadReused,
+      });
+    }</code></pre>
+</figure>
+
+<p>The sequence in <code>runCodexTurn</code> (<span class="src">exoharness/typescript/codex/harness.ts:398-740</span>):</p>
+<ol class="steps">
+<li>Require networking; if recovering, fold the unfinished turn's events into a <code>SavedCodexRecovery</code> (below).</li>
+<li>Get or start the warm session; set the turn <em>scope</em> (context, protocol buffer, pending MCP calls) on it so the long-lived server's callbacks always talk to the current turn.</li>
+<li>Find a thread: reuse the warm one, <code>thread/resume</code> a saved one, or <code>thread/start</code> a new one. A failed resume appends a <code>codex_resume_failed</code> event and falls back to a new thread.</li>
+<li>If the thread is new, <code>replayCodexHistory</code> injects the prior Exo conversation (<a href="#codex-replay">next section</a>). A reused thread skips replay: Codex already holds that state.</li>
+<li>Append <code>codex_turn_start_intent</code>, call <code>turn/start</code>, append <code>codex_turn_started</code> carrying the native turn id.</li>
+<li>Loop over <code>session.server.events()</code>, drop notifications that do not belong to this thread and turn (<code>notificationBelongsToTurn</code>), and handle each until <code>turn/completed</code>.</li>
+<li>Always, in <code>finally</code>: append one usage event if any usage was seen, and flush the protocol log. After success, append <code>codex_warm_session</code>; on error, evict and close the cached session so the next turn starts clean.</li>
+</ol>
+
+<h3 id="codex-mapping">Codex items to Exo events</h3>
+
+<p>Notifications are folded into the canonical stream in <code>handleCodexNotification</code>, and completed <em>items</em> are projected by <code>projectCompletedItem</code> (<span class="src">exoharness/typescript/codex/harness.ts:1109-1205</span>, <span class="src">exoharness/typescript/codex/harness.ts:1322-1358</span>). Each projected item is followed by a <code>codex_item_projected</code> marker keyed <code>turnId:itemId</code>, which is the idempotency token used on recovery.</p>
+
+<table>
+<thead><tr><th>Codex input</th><th>Exo event(s)</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>item/agentMessage/delta</code></td><td>(stream only) <code>context.stream.text</code></td><td>First delta records TTFT; deltas are not persisted</td></tr>
+<tr><td>item <code>agentMessage</code> completed</td><td><code>messages</code> with one assistant text message</td><td>Persisted at item granularity</td></tr>
+<tr><td>item <code>commandExecution</code> started / completed</td><td><code>tool_requested</code> / <code>tool_result</code> for function <code>codex.shell</code></td><td>Args <code>{command, cwd}</code>; result <code>{status, exit_code, output, duration_ms}</code></td></tr>
+<tr><td>item <code>mcpToolCall</code></td><td><code>tool_requested</code> / <code>tool_result</code> with the tool's Exo <code>exposedName</code></td><td>Name mapped by <code>codexMcpToolName</code>; unknown tool throws</td></tr>
+<tr><td>item <code>webSearch</code></td><td><code>tool_requested</code> / <code>tool_result</code> for <code>codex.web_search</code></td><td></td></tr>
+<tr><td>item <code>fileChange</code>, <code>reasoning</code>, <code>todoList</code></td><td>custom <code>codex_file_change</code>, <code>codex_reasoning</code>, <code>codex_todo_list</code></td><td>Not part of the model-visible transcript</td></tr>
+<tr><td>any other item</td><td>custom <code>codex_item_completed</code></td><td></td></tr>
+<tr><td><code>turn/plan/updated</code>, <code>turn/diff/updated</code></td><td>custom <code>codex_plan_updated</code>, <code>codex_diff_updated</code></td><td></td></tr>
+<tr><td><code>thread/tokenUsage/updated</code></td><td>custom <code>codex_token_usage</code> + accumulator</td><td>See <a href="#cost">Cost</a></td></tr>
+<tr><td><code>turn/completed</code></td><td>custom <code>codex_turn_completed</code>; non-<code>completed</code> status throws</td><td>Final items carried on the notification are projected first</td></tr>
+<tr><td><code>error</code></td><td><code>codex_retrying</code> (if <code>willRetry</code>) or <code>codex_error</code></td><td>A retry while networking is off becomes a hard error</td></tr>
+<tr><td><code>item/tool/call</code> (server request)</td><td><code>tool_requested</code>, <code>executeTool</code>, <code>tool_result</code></td><td>Exo dynamic tools; see below</td></tr>
+</tbody>
+</table>
+
+<p>Only <code>tool_requested</code>, <code>tool_result</code> and <code>messages</code> feed the next turn's transcript. Everything <code>codex_*</code> is an observability side-channel on the same durable log (see <a href="data-model.html">Data model</a> for event kinds).</p>
+
+<div class="callout idea">
+<p class="callout-title">Idea worth stealing: a write-ahead "intent" event around a non-idempotent RPC</p>
+<p><code>turn/start</code> cannot be retried blindly: if it ran but the response was lost, a second call would make Codex act twice. The harness appends <code>codex_turn_start_intent</code> <em>before</em> the call and <code>codex_turn_started</code> (with the native turn id) <em>after</em>. On recovery, an intent with no matching start is an unresolvable ambiguity, so the harness fails with "cannot safely resume Codex turn after turn/start was attempted without a saved native turn ID" instead of guessing (<span class="src">exoharness/typescript/codex/harness.ts:223-227</span>; tested at <span class="src">exoharness/examples/typescript/codex-harness.recovery.test.ts:303-312</span>).</p>
+</div>
+
+<h3 id="codex-replay">Replaying Exo history into a Codex thread</h3>
+
+<p>When the harness has to build a thread from scratch (cold start, resume failed, or a changed warm key), the Exo transcript is converted to OpenAI Responses input items with <code>linguaMessagesToResponsesInput</code> (the Lingua message format is the common currency across providers) and injected with the Codex-specific <code>thread/inject_items</code> request. System and developer messages are dropped (instructions are given separately as <code>developerInstructions</code>), and function-call names are sanitised to <code>[a-zA-Z0-9_-]</code>, so a dotted Exo name like <code>codex.shell</code> becomes <code>codex_shell</code> in replayed history (<span class="src">exoharness/typescript/codex/replay.ts:20-52</span>).</p>
+
+<p>Large histories are chunked so no single request is huge, but the chunks must not separate a function call from its output. Between chunks the thread is compacted via <code>thread/compact/start</code> and the harness waits for the resulting <code>turn/completed</code>, with a 600 s timeout.</p>
+
+<figure class="code">
+  <figcaption><strong>Chunking never splits a tool call from its result; parallel calls stay together</strong> <span class="src">exoharness/typescript/codex/replay.ts:54-87</span></figcaption>
+  <pre><code class="language-ts">export function codexReplayChunks(
+  items: CodexReplayItem[],
+  maxChars = 256_000,
+): CodexReplayItem[][] {
+  const units: CodexReplayItem[][] = [];
+  let unit: CodexReplayItem[] = [];
+  const pendingCalls = new Set&lt;string&gt;();
+  for (const item of items) {
+    if (item.type === "function_call") pendingCalls.add(item.call_id);
+    if (item.type === "function_call_output") pendingCalls.delete(item.call_id);
+    unit.push(item);
+    if (pendingCalls.size === 0) {
+      units.push(unit);
+      unit = [];
+    }
+  }
+  if (unit.length &gt; 0) units.push(unit);
+
+  const chunks: CodexReplayItem[][] = [];
+  let chunk: CodexReplayItem[] = [];
+  let size = 0;
+  for (const unit of units) {
+    const unitSize = JSON.stringify(unit).length;
+    if (chunk.length &gt; 0 &amp;&amp; size + unitSize &gt; maxChars) {
+      chunks.push(chunk);
+      chunk = [];
+      size = 0;
+    }
+    chunk.push(...unit);
+    size += unitSize;
+  }
+  if (chunk.length &gt; 0) chunks.push(chunk);
+  return chunks;
+}</code></pre>
+</figure>
+
+<div class="callout surprise">
+<p class="callout-title">Reasoning items do not survive a replay</p>
+<p>The Responses requests Exo builds use <code>store: false</code>, so server-side item ids (<code>rs_</code>, <code>fc_</code>, <code>msg_</code>) would 404 on replay. <code>linguaMessagesToResponsesInput</code> therefore drops <code>reasoning</code> items entirely and strips ids from the rest (<span class="src">exoharness/typescript/model-runtime/responses.ts:996-1013</span>). A Codex thread rebuilt from Exo events has the conversation but not the prior chain of thought; only a warm or resumed native thread keeps it.</p>
+</div>
+
+<h3 id="codex-recovery">Crash recovery and reconnect</h3>
+
+<p>Codex is the only harness that exports <code>resumeTurn</code>, and it declares <code>reconcileUnresolvedToolCalls: true</code>. Two layers cooperate:</p>
+<ul>
+<li><b>Rust adapter.</b> For a TypeScript harness the executor reports <code>can_reconcile_unresolved_tool_call</code> as true, so on <code>recovering</code> turns it does <em>not</em> run its own check that unresolved tool calls are safe to resume (<span class="src">crates/executor/src/native/typescript.rs:72-74</span>, <span class="src">crates/executor/src/harness_adapter.rs:189-196</span>). It delegates the judgment to the harness.</li>
+<li><b>Runner.</b> <code>init.recovering</code> routes to <code>harness.resumeTurn</code>, or fails if there is none (<a href="#why-fail">below</a>).</li>
+</ul>
+
+<p><code>savedCodexRecovery</code> rebuilds the state by paging <em>backwards</em> through only the unfinished turn's events (page size 1000, stopping at <code>turn_started</code>), then folding them chronologically into: the last native thread/turn id, the set of already-projected items, tool calls with no result yet, and whether an approval request lacks a response (<span class="src">exoharness/typescript/codex/harness.ts:118-233</span>).</p>
+
+<table>
+<thead><tr><th>State found on recovery</th><th>What the harness does</th></tr></thead>
+<tbody>
+<tr><td>Native turn already <code>completed</code> in the Exo log</td><td>Return; nothing to do</td></tr>
+<tr><td>Saved native turn <code>failed</code>/<code>interrupted</code> in the log</td><td>Throw ("saved Codex turn ended with status …")</td></tr>
+<tr><td><code>codex_turn_start_intent</code> without a later <code>codex_turn_started</code></td><td>Throw: cannot know if <code>turn/start</code> ran</td></tr>
+<tr><td>No native turn saved, no unresolved tools</td><td>Run normally with the original input</td></tr>
+<tr><td>No native turn saved but unresolved tool calls</td><td>Throw</td></tr>
+<tr><td>Warm process still alive (<code>process.reused</code>)</td><td><code>thread/read</code> with <code>includeTurns</code>; project the snapshot; if still <code>inProgress</code>, <em>attach</em> to the live turn without issuing <code>turn/start</code>; if <code>completed</code>, record and finish</td></tr>
+<tr><td>Process gone, thread persisted</td><td><code>thread/resume</code>, <code>thread/read</code> the saved turn, project its completed items, then <code>turn/start</code> with <em>empty input</em> to let Codex continue</td></tr>
+<tr><td>Process gone, thread gone</td><td><code>thread/start</code>, replay Exo history (including the interrupted turn so far), <code>turn/start</code> with empty input; throws instead if tool calls are unresolved, since there is no snapshot to check them against</td></tr>
+<tr><td>Live turn <code>inProgress</code> and an Exo approval is unanswered</td><td>Throw: the native request was lost with the old connection</td></tr>
+<tr><td>Any in-progress native <code>commandExecution</code>, <code>mcpToolCall</code>, <code>dynamicToolCall</code>, <code>webSearch</code> or <code>fileChange</code></td><td>Throw: its approval request may have been missed</td></tr>
+</tbody>
+</table>
+<p>The last row is the heart of the safety logic. The snapshot is only trusted if its item history is complete (<code>itemsView === "full"</code>), and tool safety is a pure function:</p>
+
+<figure class="code">
+  <figcaption><strong>Refuse to reattach to anything that might be blocked on an approval nobody will answer</strong> <span class="src">exoharness/typescript/codex/recovery.ts:46-79</span></figcaption>
+  <pre><code class="language-ts">export function assertNativeToolSafety(
+  snapshot: NativeTurnSnapshot | null,
+  unresolvedToolIds: Set&lt;string&gt;,
+): void {
+  if (!snapshot) {
+    if (unresolvedToolIds.size &gt; 0) {
+      throw new Error("cannot safely replay unresolved native Codex tool call");
+    }
+    return;
+  }
+  for (const id of unresolvedToolIds) {
+    const item = snapshot.items.find((candidate) =&gt; candidate.id === id);
+    if (!item || !nativeItemComplete(item)) {
+      throw new Error(
+        `cannot safely resume unresolved native Codex tool call ${id}`,
+      );
+    }
+  }
+  if (
+    snapshot.items.some(
+      (item) =&gt;
+        !nativeItemComplete(item) &amp;&amp;
+        (item.type === "commandExecution" ||
+          item.type === "mcpToolCall" ||
+          item.type === "dynamicToolCall" ||
+          item.type === "webSearch" ||
+          item.type === "fileChange"),
+    )
+  ) {
+    throw new Error(
+      "cannot safely reattach an in-progress native Codex tool call; its approval request may have been missed",
+    );
+  }
+}</code></pre>
+</figure>
+
+<div class="callout surprise">
+<p class="callout-title">"Reconnect" means the old approval is gone, not the old turn</p>
+<p>A live Codex turn blocked on an approval holds its server request open on the connection that is now dead. A new connection will never receive it, and waiting would hang forever. So the design is: reattach only when the native turn is between tool calls (or finished), and fail loudly otherwise (<span class="src">exoharness/examples/typescript/codex-harness.recovery.test.ts:314-336</span>). Separately, <code>codex_item_projected</code> markers make projection idempotent: a snapshot read after a crash re-emits only items not already in the log (<span class="src">exoharness/typescript/codex/harness.ts:1223-1269</span>).</p>
+</div>
+
+<p>On the Rust side, a suspended or interrupted turn for a TypeScript harness just tears down the cached runner (<code>cancel_turn</code> removes it and shuts it down). That does not touch the sandbox process: only an explicit <code>CloseSandboxProcess</code> request from the harness cancels it, and the Codex harness sends that only on its error path (<code>codexSessions.delete(..., close)</code>). So after a clean runner restart the app-server is still running and <code>reusable_sandbox_process</code> finds it again (<span class="src">crates/executor/src/native/typescript.rs:80-92</span>, <span class="src">crates/executor/src/harness_adapter.rs:268-290</span>, <span class="src">crates/executor/src/typescript_runtime.rs:270-291</span>). The same Codex harness also runs unmodified on Cloudflare Workers, where <code>runtime-io.ts</code> calls <code>resumeTurn</code> when the payload says <code>recovering</code> (<span class="src">exoharness/cloudflare/src/runtime-io.ts:449-458</span>).</p>
+
+<h3 id="codex-approvals">Approvals and tool bridging</h3>
+
+<p>With <code>approvalPolicy: "on-request"</code> and an external sandbox, Codex asks the client whenever it wants to do something that needs permission. The registered <code>onServerRequest</code> handler (<span class="src">exoharness/typescript/codex/harness.ts:1019-1048</span>) maps each request type:</p>
+
+<table>
+<thead><tr><th>Codex server request</th><th>Exo handling</th></tr></thead>
+<tbody>
+<tr><td><code>item/commandExecution/requestApproval</code></td><td><code>context.authorizeTool({functionName: "codex.shell", arguments: {command, cwd}})</code>; success &rarr; <code>accept</code>, any throw &rarr; <code>decline</code></td></tr>
+<tr><td><code>mcpServer/elicitation/request</code></td><td><code>authorizeMcpElicitation</code> (below)</td></tr>
+<tr><td><code>item/tool/call</code></td><td>Exo dynamic tool: append <code>tool_requested</code>, run <code>context.executeTool</code>, append <code>tool_result</code>, answer with <code>contentItems</code> (text, or images when a client tool supplies model input)</td></tr>
+<tr><td><code>item/fileChange/requestApproval</code>, <code>item/permissions/requestApproval</code>, <code>item/tool/requestUserInput</code>, anything else</td><td>Handler returns <code>undefined</code>, so the client default applies: decline / empty permissions / cancel</td></tr>
+</tbody>
+</table>
+
+<p>Which Exo tools become <code>dynamicTools</code>? <code>buildCodexDynamicTools</code> filters out any Exo tool already exposed through an MCP server (those go to Codex natively), leaving built-ins and client tools (<span class="src">exoharness/typescript/codex/harness.ts:1444-1457</span>). Native MCP servers get their credentials the same way the model does: the Rust side adds an egress credential binding for each MCP secret, but only for the <code>codex</code> and <code>claude-code</code> modules (<span class="src">crates/executor/src/sandbox_policy.rs:47-49</span>, <span class="src">crates/executor/src/sandbox_policy.rs:188-242</span>). The tool registry itself is covered in <a href="tools-and-mcp.html">Tools &amp; MCP</a>.</p>
+
+<p>The interesting problem is MCP approvals. Codex's elicitation request identifies the call only by a human-readable message and its parameters, not by item id. The harness reconstructs the pairing: it tracks every <code>mcpToolCall</code> from <code>item/started</code> into a per-turn map, and matches the elicitation against that map by server name, the exact message string, and deep equality of the arguments.</p>
+
+<figure class="code">
+  <figcaption><strong>Matching an anonymous elicitation to a concrete pending MCP call</strong> <span class="src">exoharness/typescript/codex/mcp-approval.ts:9-35</span></figcaption>
+  <pre><code class="language-ts">export async function authorizeMcpElicitation(
+  context: Pick&lt;TurnContext, "mcpServers" | "authorizeTool"&gt;,
+  params: Record&lt;string, unknown&gt;,
+  calls: Map&lt;string, PendingToolCall&gt;,
+): Promise&lt;JsonValue | undefined&gt; {
+  const meta = asRecord(params._meta);
+  if (params.mode !== "form" || meta.codex_approval_kind !== "mcp_tool_call")
+    return undefined;
+  const server = context.mcpServers.find(
+    (server) =&gt; server.name === params.serverName,
+  );
+  if (!server) return undefined;
+  for (const [id, call] of calls) {
+    const tool = server.tools.find(
+      (tool) =&gt; tool.exposedName === call.request.functionName,
+    );
+    if (
+      !tool ||
+      params.message !==
+        `Allow the ${server.name} MCP server to run tool "${tool.name}"?` ||
+      !isDeepStrictEqual(meta.tool_params ?? {}, call.request.arguments)
+    )
+      continue;
+    calls.delete(id);
+    try {
+      await context.authorizeTool(call.request);
+      return { action: "accept", content: {} };
+    } catch {
+      return { action: "decline", content: null };
+    }
+  }
+  return { action: "decline", content: null };
+}</code></pre>
+</figure>
+
+<p>Because matched calls are deleted from the map, two identical calls approved or denied out of order stay independent (<span class="src">exoharness/typescript/codex/mcp-approval.test.ts:43-127</span>). An unmatched elicitation is declined, so the failure mode is "tool does not run", never "tool runs unapproved". Note the string-match on Codex's prompt wording: it couples Exo to a specific <code>codex</code> release, which is another reason the CLI version is pinned.</p>
+
+<p>Finally, <code>nativeToolApprovals: false</code> is how the Codex harness tells the runner it cannot enforce a blanket <code>always_ask</code> policy over every native Codex tool (file changes, web search). <code>validateToolPolicies(…, false)</code> then rejects an <code>always_ask</code> default with an explanatory error, leaving the user to set per-tool policies explicitly (<span class="src">exoharness/typescript/harness/index.ts:450-467</span>, <span class="src">exoharness/typescript/harness/runner.ts:302-311</span>).</p>
+
+<h3 id="cost">Usage and cost capture</h3>
+
+<p>Codex reports tokens but not dollars. For each <code>thread/tokenUsage/updated</code> notification already filtered to the active turn, <code>CodexUsageAccumulator</code> adds the <code>last</code> (single model call) numbers and uses <code>total</code> (thread-lifetime) only as a monotonic de-duplication key.</p>
+
+<figure class="code">
+  <figcaption><strong>Sum per-call usage; use the thread total only to ignore replays</strong> <span class="src">exoharness/typescript/codex/usage.ts:20-43</span></figcaption>
+  <pre><code class="language-ts">// Record only notifications already filtered to the active native turn. `last`
+// is one model call; `total` includes earlier turns and also identifies repeated
+// notifications. Raw response events are not emitted by resumed app-servers.
+export class CodexUsageAccumulator {
+  value: CodexTokenUsage | null = null;
+  private lastThreadTotal: number | undefined;
+
+  record(params: CodexTokenUsageUpdate | null): void {
+    const { last, total } = params?.tokenUsage ?? {};
+    if (!last || !total) return;
+    const input = tokenCount(last.inputTokens);
+    const output = tokenCount(last.outputTokens);
+    const tokens = tokenCount(last.totalTokens);
+    const threadTotal = tokenCount(total.totalTokens);
+    if (
+      input === undefined ||
+      output === undefined ||
+      tokens === undefined ||
+      threadTotal === undefined ||
+      (this.lastThreadTotal !== undefined &amp;&amp;
+        threadTotal &lt;= this.lastThreadTotal)
+    )
+      return;
+    this.lastThreadTotal = threadTotal;</code></pre>
+</figure>
+
+<p>At the end of the turn (in <code>finally</code>, so a failed turn is still billed) the harness appends one empty-messages event whose <code>usage</code> is built by <code>codexUsageEvent</code> &rarr; <code>modelUsageRecord</code> (<span class="src">exoharness/typescript/codex/usage.ts:78-98</span>, <span class="src">exoharness/typescript/codex/harness.ts:726-735</span>). <code>modelUsageRecord</code> takes an explicit <code>cost_usd</code> if the runtime supplied one; otherwise it computes cost from a LiteLLM price table (<span class="src">exoharness/typescript/model-runtime/usage.ts:1-26</span>).</p>
+
+<p><span class="src">exoharness/typescript/model-runtime/cost.ts</span> is a self-contained port of the Rust <code>cost</code> crate: lookup is an exact match, else the longest key that is a prefix of the model name at a <code>-</code> or <code>:</code> boundary; Anthropic-family and <code>azure_ai</code> entries treat <code>prompt_tokens</code> as <em>excluding</em> cache reads (additive), all others as including them. The table is loaded once from <code>$EXO_LITELLM_PRICES_PATH</code>, else a 24-hour on-disk cache under <code>$EXO_HOME/cache</code>, else a 5-second fetch of LiteLLM's JSON, else a stale cache, else <code>null</code> (cost omitted) (<span class="src">exoharness/typescript/model-runtime/cost.ts:38-96</span>, <span class="src">exoharness/typescript/model-runtime/cost.ts:98-135</span>).</p>
+
+<div class="callout warn">
+<p class="callout-title">Doc and code disagree on what Codex usage counts</p>
+<p><span class="src">exoharness/docs/coding-agent-harnesses.md:48-50</span> says usage "counts upstream <code>rawResponse/completed</code> records, including local replay compaction". The code counts <code>thread/tokenUsage/updated</code> deltas for the active turn only, and its comment explains why: resumed app-servers do not emit raw response events. <code>rawResponseItem/completed</code> is used only to reconstruct the prompt for the trace span. Compaction during replay runs in <code>waitForCompaction</code>, which consumes its own notifications and never feeds the accumulator, so replay-compaction tokens appear not to be counted. The <code>rawResponse/completed</code> JSON fixture survives only as test data for the field names (<span class="src">exoharness/typescript/codex/usage.test.ts:2</span>).</p>
+</div>
+
+<h2 id="claude-code">Claude Code</h2>
+
+<p>The Claude Code harness uses the <a href="https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk">Claude Agent SDK</a> in a split arrangement. The SDK <code>query()</code> call, the hooks and the tool bridge all run in the harness (runner) process on the host. Only the Claude Code CLI itself runs in the sandbox. The seam is the SDK's <code>spawnClaudeCodeProcess</code> option: <code>SandboxClaudeCodeProcess</code> implements the SDK's <code>SpawnedProcess</code> interface by calling <code>context.startSandboxProcess</code> and pumping stdin/stdout between the SDK's streams and the sandbox process (<span class="src">exoharness/examples/typescript/claude-code-harness.ts:617-750</span>). The binary path is hard-coded to <code>/usr/local/bin/claude-code</code>, the symlink the Dockerfile creates to the native binary shipped by the matching SDK platform package (<span class="src">exoharness/containers/claude-code-sandbox/Dockerfile:19-34</span>).</p>
+
+<pre class="diagram">
+  TS runner (host)                                    Sandbox
+  ----------------                                    -------
+  query({prompt: transcript, options})
+    |  hooks.PreToolUse  ----&gt; context.authorizeTool
+    |  mcpServers.exo_runtime (in-process) ----&gt; context.executeTool
+    |  spawnClaudeCodeProcess ------------------&gt;  /usr/local/bin/claude-code  (new process per turn)
+    |  &lt;---------- SDK messages -----------------   model calls -&gt; egress proxy (ANTHROPIC_API_KEY bound)
+    v                                               Exo MCP servers: direct HTTP, Bearer ${ENV}
+  Exo events: tool_requested/tool_result (observed), messages (once), claude_sdk_messages
+</pre>
+
+<h3 id="claude-history">History and options</h3>
+<ul>
+<li><b>History.</b> There is no native session (<code>persistSession: false</code>). Each turn the whole Exo conversation, minus system/developer messages, is flattened by <code>messagesToTranscript</code> into a single user message of the form <code>ROLE:\ncontent</code> blocks and sent as the prompt; agent instructions go in <code>systemPrompt</code> (<span class="src">exoharness/examples/typescript/claude-code-harness.ts:152-163</span>, <span class="src">exoharness/examples/typescript/claude-code-harness.ts:515-544</span>, <span class="src">exoharness/typescript/harness/index.ts:774-778</span>).</li>
+<li><b>MCP.</b> Exo MCP servers are passed as <code>type: "http"</code> servers with an <code>Authorization: Bearer ${ENV}</code> header whose variable is bound at the egress proxy; <code>strictMcpConfig: true</code> stops Claude from loading any other config; per-server <code>disabledTools</code> become <code>disallowedTools</code> (<span class="src">exoharness/examples/typescript/claude-code-harness.ts:265-298</span>).</li>
+<li><b>Exo tools.</b> Tools that are not already MCP-exposed are served by <code>exo_runtime</code>, an <em>in-process</em> SDK MCP server built with <code>createSdkMcpServer</code>. Its <code>CallTool</code> handler mints an id <code>claude-runtime-&lt;uuid&gt;</code> (MCP transport ids are not canonical), appends <code>tool_requested</code>, calls <code>context.executeTool</code>, appends <code>tool_result</code>, and returns MCP content; the name <code>exo_runtime</code> is reserved (<span class="src">exoharness/typescript/harness/claude-runtime-tools.ts:22-101</span>). Because the harness also observes Claude's own <code>tool_use</code> blocks, <code>observedClaudeToolEvents</code> filters out the duplicate events for these runtime tools (<span class="src">exoharness/examples/typescript/claude-code-harness.ts:414-442</span>).</li>
+<li><b>Names.</b> <code>claudeToolName</code> maps <code>mcp__&lt;server&gt;__&lt;tool&gt;</code> to the MCP tool's Exo <code>exposedName</code> and everything else to <code>claude.&lt;Name&gt;</code> (<span class="src">exoharness/typescript/harness/native-mcp.ts:22-32</span>).</li>
+</ul>
+
+<h3 id="claude-approvals">Approvals</h3>
+
+<p>A <code>PreToolUse</code> hook covers <em>every</em> tool Claude is about to run. It denies if the SDK's <code>init</code> message has not yet reported the tool inventory (which is also when <code>validateToolPolicies</code> runs against the real tool names), allows <code>exo_runtime</code> tools unconditionally (the runtime authorises them itself before dispatch), and otherwise calls <code>context.authorizeTool</code> with the mapped name; any throw becomes <code>permissionDecision: "deny"</code> with the error as the reason (<span class="src">exoharness/examples/typescript/claude-code-harness.ts:299-352</span>). That total coverage is why this harness can say <code>nativeToolApprovals: true</code>, which Codex cannot.</p>
+
+<h3 id="claude-cost">Events, cost and guard rails</h3>
+<ul>
+<li><b>Tool events</b> are projected as they stream (<code>projectAnthropicMessageToolEvents</code>) and traced as "observed" tool spans.</li>
+<li><b>Assistant text is stored once.</b> Each <code>assistant</code> message overwrites <code>state.finalText</code>; a single <code>messages</code> event with the last text and the usage is appended after the query ends (<span class="src">exoharness/examples/typescript/claude-code-harness.ts:379-391</span>, <span class="src">exoharness/examples/typescript/claude-code-harness.ts:444-470</span>). Every non-stream SDK message is saved in one <code>claude_sdk_messages</code> custom event.</li>
+<li><b>Cost</b> comes from the SDK's final <code>result</code>: <code>usage.input_tokens</code>, <code>output_tokens</code>, cache read/creation counts, and <code>cost_usd: result.total_cost_usd</code>, so no price table is consulted.</li>
+<li><b>Guard rails:</b> a 60 s startup timeout if the SDK emits nothing (<code>CLAUDE_STARTUP_TIMEOUT_MS</code>), abort when <code>api_retry</code> reaches attempt 2 (<code>CLAUDE_MAX_API_RETRIES</code>) rather than sit through the SDK's backoff, and the first three stderr chunks of the CLI saved as <code>claude_process_stderr</code> events (<span class="src">exoharness/examples/typescript/claude-code-harness.ts:58-61</span>, <span class="src">exoharness/examples/typescript/claude-code-harness.ts:472-487</span>, <span class="src">exoharness/examples/typescript/claude-code-harness.ts:774-803</span>).</li>
+</ul>
+
+<div class="callout surprise">
+<p class="callout-title">Claude Code's SDK is on the host, its CLI is in the sandbox</p>
+<p>It is easy to assume "Claude Code runs in the sandbox" the way Codex does. Only the CLI does; the SDK, its in-process <code>exo_runtime</code> MCP server and its hooks live in the runner. Practical consequence: the host-side dependency is a semver range (<code>"@anthropic-ai/claude-agent-sdk": "^0.2.126"</code>, <span class="src">package.json:25</span>) while the image installs the exact version in <span class="src">exoharness/containers/claude-code-sandbox/version</span> (<code>0.2.126</code>), so host SDK and in-sandbox binary can drift apart if the range resolves higher.</p>
+</div>
+
+<h2 id="pi">Pi</h2>
+
+<p>Pi (<code>@earendil-works/pi-coding-agent</code>, pinned in its Dockerfile) is launched in its RPC mode, <code>pi --mode rpc --no-session --no-extensions --provider P --model M</code>, plus a generated extension via <code>--extension</code>. The model name's prefix selects the provider (<code>google/gemini-…</code>); a bare name means OpenAI (<span class="src">exoharness/examples/typescript/pi-harness.ts:122-144</span>). The Rust side maps the same prefix to the env var the egress proxy binds: <code>openai</code>, <code>anthropic</code> or <code>google</code>; any other provider is an error at policy time (<span class="src">crates/executor/src/managed_agents/config.rs:82-96</span>).</p>
+
+<p>The launch command is a <code>sh -c</code> one-liner that reads <em>one line</em> from stdin (the JSON tool list) into <code>$HOME/.pi/exo-&lt;conversation&gt;/tools.json</code>, writes the extension source to <code>exo.mjs</code>, and then <code>exec</code>s Pi, which inherits the rest of stdin for RPC (<span class="src">exoharness/examples/typescript/pi-harness.ts:145-157</span>). The harness writes the tool list as that first line, then sends <code>{type: "prompt", message: transcript}</code>.</p>
+
+<h3 id="pi-bridge">The tool bridge: RPC over a UI dialog</h3>
+
+<p>Pi extensions can register tools and hook <code>tool_call</code>, but have no channel back to Exo. The extension uses the one request/response primitive RPC mode offers, <code>ctx.ui.input(title, placeholder)</code>, as a side-channel: the title carries the method and the placeholder carries a JSON payload. Pi emits an <code>extension_ui_request</code> event; the harness reads it, performs the Exo call, and writes an <code>extension_ui_response</code> whose <code>value</code> is the JSON reply.</p>
+
+<figure class="code">
+  <figcaption><strong>The injected Pi extension: Exo calls tunnelled through <code>ctx.ui.input</code></strong> <span class="src">exoharness/examples/typescript/pi-harness.ts:28-63</span></figcaption>
+  <pre><code class="language-ts">export default function (pi) {
+  const tools = JSON.parse(readFileSync(new URL("./tools.json", import.meta.url), "utf8"));
+  if (process.env.EXO_PI_BASE_URL) {
+    pi.registerProvider(process.env.EXO_PI_PROVIDER, { baseUrl: process.env.EXO_PI_BASE_URL });
+  }
+  async function request(ctx, method, tool) {
+    const value = await ctx.ui.input(method, JSON.stringify(tool));
+    if (value === undefined) throw new Error("Exo tool request cancelled");
+    const response = JSON.parse(value);
+    if (!response.ok) throw new Error(response.error);
+    return response.result;
+  }
+  pi.on("tool_call", async (event, ctx) =&gt; {
+    if (tools.some(tool =&gt; tool.name === event.toolName)) return;
+    try {
+      await request(ctx, "exo.authorize_tool", { functionName: "pi." + event.toolName, arguments: event.input });
+    } catch (error) {
+      return { block: true, reason: String(error) };
+    }
+  });
+  for (const tool of tools) {
+    pi.registerTool({
+      name: tool.name, label: tool.name, description: tool.description, parameters: tool.parameters,
+      async execute(id, args, _signal, _onUpdate, ctx) {
+        const response = await request(ctx, "exo.execute_tool", { functionName: tool.name, arguments: args, toolCallId: id });
+        const result = response.output;
+        if (result &amp;&amp; (result.is_error === true || result.ok === false)) throw new Error(JSON.stringify(result));
+        return { content: response.content ?? [{ type: "text", text: JSON.stringify(result) }], details: result };
+      },
+    });
+  }
+}</code></pre>
+</figure>
+
+<p>Pi's built-in tools (<code>read bash edit write grep find ls</code>) are authorised via <code>exo.authorize_tool</code> under the name <code>pi.&lt;tool&gt;</code>; Exo tools registered by the extension are authorised and executed by Exo in one <code>exo.execute_tool</code> hop, which is why the hook skips them. Any other <code>extension_ui_request</code> (select/confirm/editor) is auto-cancelled so Pi never blocks on a UI that does not exist (<span class="src">exoharness/examples/typescript/pi-harness.ts:173-189</span>). As with Claude, <code>nativeToolApprovals: true</code> is valid because every tool passes through a hook.</p>
+
+<h3 id="pi-events">Events, cost</h3>
+<ul>
+<li><code>tool_execution_start</code>/<code>_end</code> become <code>tool_requested</code>/<code>tool_result</code> (<code>pi.&lt;name&gt;</code> for built-ins). <code>message_update</code> text deltas stream. Each assistant <code>message_end</code> appends a <code>messages</code> event immediately, with usage; <code>stopReason</code> of <code>error</code>/<code>aborted</code> fails the turn at <code>agent_settled</code> (<span class="src">exoharness/examples/typescript/pi-harness.ts:234-298</span>).</li>
+<li><b>Cost:</b> Pi computes dollars itself; <code>usageRecord</code> forwards <code>usage.cost.total</code> as <code>cost_usd</code>. It also normalises token semantics: for non-Anthropic providers <code>prompt_tokens = input + cacheRead + cacheWrite</code>, for Anthropic just <code>input</code>, matching the additive/inclusive split in <code>cost.ts</code> (<span class="src">exoharness/examples/typescript/pi-harness.ts:77-103</span>).</li>
+<li>Pi gets no native MCP bindings: <code>add_native_mcp_bindings</code> is only applied to the codex and claude-code modules.</li>
+</ul>
+
+<div class="callout surprise">
+<p class="callout-title">The "Warm" worker is not warm for Pi</p>
+<p>Pi reuses <code>WarmJsonlSandboxWorker</code> from <code>shared.ts</code>, but starts a fresh sandbox process per turn (no <code>reuseKey</code>) and closes the worker in <code>finally</code> (<span class="src">exoharness/examples/typescript/pi-harness.ts:146-157</span>, <span class="src">exoharness/examples/typescript/pi-harness.ts:301-303</span>). Only Cursor keeps its worker across turns, and then only in runner memory.</p>
+</div>
+
+<h2 id="cursor">Cursor</h2>
+
+<p>Cursor is the thinnest integration and the only one that does not use a vendor binary. The harness starts <code>node --import tsx exoharness/typescript/cursor/sandbox-worker.ts</code> in the sandbox; that worker wraps <code>@cursor/sdk</code> and speaks a trivial Exo-defined JSONL protocol: one <code>CursorWorkerRequest</code> line in (<code>prompt, model, cwd, name</code>), a stream of <code>run_started</code> / <code>delta</code> / <code>message</code> events and a final <code>completed</code> or <code>error</code> out (<span class="src">exoharness/typescript/cursor/protocol.ts:3-43</span>, <span class="src">exoharness/typescript/cursor/sandbox-worker.ts:14-74</span>). This is why the Cursor image is different: its Containerfile copies the repository's <code>typescript/</code> tree and runs <code>pnpm install</code> into <code>/opt/exo</code> so the worker has its dependencies (<span class="src">exoharness/containers/cursor-sdk-sandbox/Containerfile</span>).</p>
+
+<ul>
+<li><b>Session.</b> The in-sandbox <code>CursorSdkSession</code> caches one SDK <code>Agent</code> per (api-key-present, cwd, model, name) and reuses it across requests, with Cursor's own sandbox and setting sources disabled (<code>sandboxOptions: {enabled: false}</code>, <code>settingSources: []</code>) so Exo's sandbox is the only boundary (<span class="src">exoharness/typescript/cursor/sdk.ts:31-80</span>, <span class="src">exoharness/typescript/cursor/sdk.ts:112-134</span>). On the host the worker handle is cached in module-level memory, keyed by agent/conversation/model/cwd/command (<span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts:61</span>, <span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts:594-605</span>).</li>
+<li><b>Prompt.</b> Even with a warm SDK agent, each prompt is rebuilt from scratch: a fixed preamble, the full prior transcript from Exo events and the current input (<span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts:459-473</span>).</li>
+<li><b>Events.</b> Only SDK <code>tool_call</code> messages are projected into <code>tool_requested</code>/<code>tool_result</code> (named <code>cursor.&lt;name&gt;</code>); the final assistant text becomes one <code>messages</code> event; raw SDK messages (minus <code>assistant</code>/<code>thinking</code>) go to one <code>cursor_sdk_messages</code> event (<span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts:318-358</span>, <span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts:405-447</span>).</li>
+<li><b>No Exo tools, no MCP, no approvals, no cost.</b> <code>validateToolPolicies(context, [], false)</code> declares an empty tool set, and the trace metrics only carry time-to-first-token and duration (<span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts:65-71</span>, <span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts:549-561</span>).</li>
+</ul>
+
+<div class="callout warn">
+<p class="callout-title">Cursor bypasses the credential-substitution proxy</p>
+<p>For Codex, Claude Code and Pi the Rust side binds a vault secret to an env var (<code>sandbox_model_credential_variable</code>) and the sandbox never holds the real key. Cursor has no entry there. Its harness calls <code>resolveModel</code>, which resolves the secret in the runner, then copies the plaintext into the sandbox env: <code>env.CURSOR_API_KEY = modelBinding.apiKey</code> (<span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts:67</span>, <span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts:571-592</span>, <span class="src">exoharness/typescript/model-runtime/shared.ts:243-284</span>, <span class="src">crates/executor/src/managed_agents/config.rs:71-99</span>). Its image is also the only one not built by the publish workflow or pinned by digest. See <a href="egress-and-vaults.html">Egress &amp; vaults</a> for what the other three get.</p>
+</div>
+
+<h2 id="why-fail">Why Claude Code, Pi and Cursor fail interrupted turns</h2>
+
+<p>The runner enforces resumability per harness. On a turn marked <code>recovering</code> it requires <code>resumeTurn</code>, and, unless the harness declares <code>reconcileUnresolvedToolCalls</code>, it also refuses to resume while any tool call lacks a result:</p>
+
+<figure class="code">
+  <figcaption><strong>The gate that turns "no resumeTurn" into a failed turn</strong> <span class="src">exoharness/typescript/harness/runner.ts:312-329</span></figcaption>
+  <pre><code class="language-ts">      if (init.recovering) {
+        if (!harness.resumeTurn) {
+          throw new Error(
+            "this TypeScript harness cannot safely resume an unfinished turn",
+          );
+        }
+        if (
+          harness.reconcileUnresolvedToolCalls !== true &amp;&amp;
+          (await hasUnresolvedToolCalls(context))
+        ) {
+          throw new Error(
+            "this TypeScript harness cannot safely resume an unresolved tool call",
+          );
+        }
+        await harness.resumeTurn(context);
+      } else {
+        await harness.runTurn(context);
+      }</code></pre>
+</figure>
+
+<p>The reasons the other three do not implement it are structural, not an oversight in the gate:</p>
+<ul>
+<li><b>No durable native state to reattach to.</b> Claude runs with <code>persistSession: false</code> and a fresh child per turn; Pi with <code>--no-session</code> and a fresh process per turn (no <code>reuseKey</code>); Cursor's agent and worker live in runner/sandbox memory only. Nothing like Codex's persisted thread plus reusable process exists to be found after a restart.</li>
+<li><b>The vendor loop owns tool execution and its outcome.</b> After a crash, a Claude or Pi tool call in flight may or may not have run (shell, file writes). Exo has the <code>tool_requested</code> event but no way to ask the vendor runtime what happened, whereas Codex exposes <code>thread/read</code> with per-item status.</li>
+<li><b>Single-shot persistence.</b> Claude stores its assistant text only after the query finishes, and the transport is the SDK's private stdio protocol, so even the partial transcript of an interrupted turn is mostly absent from the log.</li>
+</ul>
+<p>The failure is a TypeScript-layer decision, not a Rust one: <code>TypeScriptExecutor::can_reconcile_unresolved_tool_call</code> returns true for <em>every</em> TypeScript harness (<span class="src">crates/executor/src/native/typescript.rs:72-74</span>), so the Rust adapter happily delegates and the runner is what says no. The product docs list safe recovery for Claude Code and Pi as an open TODO (<span class="src">website/docs-src/agent-definition.md:530-531</span>); Cursor is not mentioned there but behaves the same.</p>
+
+<div class="callout surprise">
+<p class="callout-title">Rust says "yes, I can reconcile", TypeScript says "no, I can't"</p>
+<p>The capability flag on the Rust executor is per executor kind (any <code>config.typescript.is_some()</code>), not per harness module. The real per-harness truth is the presence of <code>resumeTurn</code> in the module, discovered only when the runner is already running the recovering turn. Adding recovery to Claude/Pi means writing a <code>resumeTurn</code>; no Rust change is required.</p>
+</div>
+
+<h2 id="model-runtime">The model-runtime turn loop</h2>
+
+<p>Everything above wraps a vendor agent. The <code>basic</code>-style TypeScript harnesses (for example the tutorial <span class="src">exoharness/examples/typescript/coding-agent-harness.ts</span>) instead use <span class="src">exoharness/typescript/model-runtime/turn-loop.ts</span>, where <em>Exo</em> owns the model loop. <code>runResponsesHarnessTurn</code> loads the price table, resolves the model credential, picks a runtime, and delegates to <code>runResponsesTurnLoop</code> (<span class="src">exoharness/typescript/model-runtime/turn-loop.ts:36-52</span>).</p>
+
+<h3 id="runtime-selection">Choosing an API</h3>
+<table>
+<thead><tr><th>Condition</th><th>Runtime</th><th>Wire API</th></tr></thead>
+<tbody>
+<tr><td>model name starts with <code>claude</code></td><td><code>AnthropicRuntime</code></td><td>Anthropic Messages (<code>max_tokens</code> defaults to 4096 when unset)</td></tr>
+<tr><td>base URL contains <code>openrouter.ai</code></td><td><code>ChatCompletionsRuntime</code></td><td>Chat Completions</td></tr>
+<tr><td><code>o1-pro</code>, <code>o3-pro</code>, <code>gpt-5-pro</code>, <code>gpt-5.N</code> with N&ge;3, <code>gpt-5…-codex</code></td><td><code>ResponsesRuntime</code></td><td>OpenAI Responses (<code>store: false</code>)</td></tr>
+<tr><td>everything else</td><td><code>ChatCompletionsRuntime</code></td><td>Chat Completions</td></tr>
+</tbody>
+</table>
+<p>(<span class="src">exoharness/typescript/model-runtime/responses.ts:300-343</span>, <span class="src">exoharness/typescript/model-runtime/responses.ts:419-486</span>.) All three normalise their output to the OpenAI <code>Response</code> shape, so the loop and <code>responseToLinguaEvents</code> are provider-agnostic; the Anthropic and Chat paths convert their native message and usage objects into that shape (<span class="src">exoharness/typescript/model-runtime/responses.ts:536-586</span>, <span class="src">exoharness/typescript/model-runtime/responses.ts:765-787</span>). This mirrors Rust's <code>is_anthropic_model</code> (<span class="src">crates/executor/src/model_config.rs</span>), so Bedrock/Vertex-prefixed Anthropic ids intentionally fall through to Chat Completions.</p>
+
+<h3 id="loop">The loop</h3>
+<ol class="steps">
+<li>Per round, rebuild the tool registry (built-ins, configured tool modules, installed agent tools, then every <code>context.tools</code> definition registered with <code>authorization: "runtime"</code> so execution goes through <code>context.executeTool</code>) and re-validate tool policies. Rebuilding every round is what lets a tool installed via <code>install_agent_tool</code> appear in the next round of the same turn (<span class="src">exoharness/typescript/model-runtime/turn-loop.ts:113-149</span>).</li>
+<li><code>materializePromptMessages</code> turns the event log plus instructions into Lingua messages; the request is sent streaming or not depending on <code>context.streaming</code>, forwarding first-chunk latency and text deltas to <code>context.stream</code>.</li>
+<li><code>responseToLinguaEvents</code> turns the response into one <code>messages</code> event (carrying <code>modelUsageRecord</code> usage) plus a <code>tool_requested</code> per function call, or a synthetic <code>tool_result</code> error for arguments that are not valid JSON; these are appended to the turn.</li>
+<li>No tool calls &rarr; return, unless a synthetic result was produced, in which case loop once more so the model sees its own malformed call. Otherwise execute each call under a tool span and append results.</li>
+<li>Stop when <code>round &gt; maxToolRoundTrips</code> (if configured) or the model stops calling tools (<span class="src">exoharness/typescript/model-runtime/turn-loop.ts:102-210</span>).</li>
+</ol>
+
+<div class="callout idea">
+<p class="callout-title">Idea worth stealing: stateless Responses replay as the default</p>
+<p>The loop never uses <code>previous_response_id</code> or server-side conversation storage. Every round re-renders the whole transcript from the durable event log and sends <code>store: false</code>; reasoning items and item ids are dropped so the replay works on reasoning models (<span class="src">exoharness/typescript/model-runtime/responses.ts:661-691</span>, <span class="src">exoharness/typescript/model-runtime/responses.ts:996-1013</span>). The cost is re-sent tokens (partly recovered by provider prompt caching); the benefit is that a turn can resume on any machine, any provider, with nothing but the event log. The Codex replay path reuses the very same conversion.</p>
+</div>
+
+<p>Tracing wraps all of this: <code>traceExecutorTurn</code> opens an <code>executor_session</code> / <code>executor_turn</code> Braintrust span pair (or attaches to <code>context.braintrustParent</code> if the Rust side passed one), and <code>wrapOpenAI</code> / <code>wrapAnthropic</code> auto-instrument the provider SDK calls (<span class="src">exoharness/typescript/model-runtime/responses.ts:588-660</span>). Codex, Claude Code and Cursor reuse <code>traceExecutorTurn</code> too, hanging <code>codex:&lt;model&gt;</code>, <code>claude-code:&lt;model&gt;</code> and <code>cursor-sdk:&lt;model&gt;</code> LLM spans and "observed tool" spans under it.</p>
+
+<h2 id="images">Sandbox images and pinning</h2>
+
+<table>
+<thead><tr><th>Image</th><th>Contents</th><th>Version pin</th></tr></thead>
+<tbody>
+<tr><td><code>codex-sandbox</code> / <code>codex-devbox</code></td><td><code>node:22-bookworm-slim</code>, <code>@openai/codex@&lt;version&gt;</code>, a non-root <code>exo</code> user (uid 10001) with passwordless sudo, <code>CODEX_HOME=/home/exo/.codex</code></td><td><span class="src">exoharness/containers/codex-sandbox/version</span> (<code>0.153.4</code>); the same file is read by the harness (startup check) and by the Cloudflare runtime</td></tr>
+<tr><td><code>claude-code-sandbox</code> / devbox</td><td>Node 22, <code>@anthropic-ai/claude-agent-sdk</code> plus its arch-specific native package; <code>claude</code> binary symlinked as <code>/usr/local/bin/claude-code</code></td><td><span class="src">exoharness/containers/claude-code-sandbox/version</span> (<code>0.2.126</code>)</td></tr>
+<tr><td><code>pi-sandbox</code> / devbox</td><td>Node 22 (Pi's bundle needs <code>globSync</code> from <code>node:fs</code>), <code>@earendil-works/pi-coding-agent</code> installed with <code>--ignore-scripts</code></td><td><code>ARG PI_PACKAGE=…@0.85.1</code> in the Dockerfile</td></tr>
+<tr><td><code>exo-cursor-sdk-sandbox</code></td><td>Node 22 (full bookworm), build tools, a copy of the repo's TypeScript tree + <code>pnpm install</code> into <code>/opt/exo</code></td><td>Whatever the lockfile resolves; local build only</td></tr>
+</tbody>
+</table>
+<p>All Dockerfiles share an optional <code>DEVBOX_TOOLS=true</code> build arg that adds <code>gh jq python3 pip venv pnpm typescript tsx</code>; the three devbox variants are the managed-agent defaults. A manually dispatched, environment-approved GitHub workflow builds the six images for amd64 and arm64, pushes <code>latest</code> and <code>sha-&lt;commit&gt;</code> tags to <code>ghcr.io/exoharness</code>, and opens a PR that rewrites the <code>image@sha256:…</code> pins in <code>config.rs</code> via <span class="src">exoharness/containers/update-default-image-digests.py</span> (the script asserts an exact expected reference count per file, and the PR needs review before new defaults land) (<span class="src">exoharness/containers/README.md</span>, <span class="src">.github/workflows/publish-sandbox-images.yml</span>). Threads created before the pin mechanism stored the preset image as an override; <code>apply_thread_harness</code> and the thread config code let those follow a newly chosen harness's preset while preserving custom images (<span class="src">crates/executor/src/managed_agents/config.rs:261-271</span>, <span class="src">crates/executor/src/managed_agents.rs:112-122</span>). Sandbox mechanics are in <a href="sandboxes.html">Sandboxes</a>.</p>
+
+<h2 id="doc-gaps">Docs versus code</h2>
+<table>
+<thead><tr><th>Statement</th><th>Reality</th></tr></thead>
+<tbody>
+<tr><td><span class="src">exoharness/docs/coding-agent-harnesses.md:3-5</span>: "The Codex, Claude Code, and Cursor examples treat exoharness events as canonical"</td><td>Pi does the same (and is documented further down); all four rebuild their prompt from the log.</td></tr>
+<tr><td><span class="src">exoharness/docs/coding-agent-harnesses.md:48-50</span>: Codex usage counts <code>rawResponse/completed</code> incl. replay compaction</td><td>Code counts <code>thread/tokenUsage/updated</code> deltas for the active turn; replay compaction is not accumulated. See the warning above.</td></tr>
+<tr><td><span class="src">website/docs-src/architecture/harnesses.md:97-100</span>: "Claude Code and Pi currently end an interrupted turn as failed"</td><td>Correct, and so does Cursor (no <code>resumeTurn</code>).</td></tr>
+<tr><td><span class="src">website/docs-src/agent-definition.md:528-529</span>: <code>model.max_output_tokens</code> is not honoured by Codex, Claude Code, Pi</td><td>Cursor does not use it either; only the model-runtime loop forwards it (<span class="src">exoharness/typescript/model-runtime/turn-loop.ts:156-162</span>).</td></tr>
+</tbody>
+</table>
+
+</main>
+<aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/wiki.js"></script>
+</body>
+</html>

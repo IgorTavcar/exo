@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture &amp; crate map · Exo internals</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav id="nav"></nav>
+<main>
+<header>
+  <div class="kicker">Start</div>
+  <h1>Architecture &amp; crate map</h1>
+  <p class="lede">How Exo splits a durable substrate (the <em>exoharness</em>) from the code that runs turns (the <em>executor</em> and the <em>harness</em>), how the Rust crates and TypeScript packages map onto that split, what one request does end to end, and where the trust boundaries sit.</p>
+</header>
+
+<h2 id="split">The core split: exoharness, executor, harness</h2>
+
+<p>The design doc states the thesis in one paragraph: a harness conflates <em>infrastructure</em> (message history, secure access to privileged resources, sandboxes) with <em>semantics</em> (compaction, memory, which tools exist). Exo separates them. The <strong>exoharness</strong> keeps only what must be trusted and durable; the <strong>executor</strong> owns the turn loop; a <strong>harness</strong> is the pair. <span class="src">exoharness/docs/spec.md:3-11</span></p>
+
+<table>
+  <thead><tr><th>Layer</th><th>Owns</th><th>Rust surface</th><th>Lives in</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Exoharness</strong> (substrate)</td><td>agents, threads, sessions, turns, the append-only event log, artifacts, bindings/secrets/vaults, sandboxes, the turn queue contract</td><td><code>ExoHarness</code> &rarr; <code>AgentHandle</code> &rarr; <code>ThreadHandle</code> &rarr; <code>TurnHandle</code> traits; <code>protocol::Request/Response</code>; <code>TurnQueue</code></td><td><code>crates/exoharness</code></td></tr>
+    <tr><td><strong>Executor</strong> (semantics + orchestration)</td><td>prompt assembly, model calls, tool dispatch, approvals, compaction policy, turn admission/queueing, recovery, streaming to clients</td><td><code>Runtime</code>, <code>Provider</code>/<code>LocalProvider</code>, <code>HarnessExecutor</code> (<code>BasicExecutor</code>, <code>RlmExecutor</code>, <code>TypeScriptExecutor</code>, <code>ManagedExecutor</code>)</td><td><code>crates/executor</code>, <code>exoharness/typescript/*</code></td></tr>
+    <tr><td><strong>Harness</strong> (what users pick)</td><td>Codex / Claude Code / Pi / Cursor presets, or a custom TypeScript module that exports <code>runTurn(context)</code></td><td><code>AgentHarnessKind</code>, <code>TypeScriptHarnessPreset</code></td><td><code>exoharness/examples/typescript/*.ts</code>, <code>exoharness/typescript/harness</code></td></tr>
+  </tbody>
+</table>
+
+<h3 id="split-handles">The substrate API is four nested handles</h3>
+<p>Everything the substrate does is reachable from a root <code>ExoHarness</code> handle, which hands out agent handles, which hand out thread handles, which begin a turn and hand out a <code>TurnHandle</code>. A <code>TurnHandle</code> is deliberately tiny: <code>add_events</code>, <code>write_artifact</code>, <code>finish</code>. Writes through it are stamped with the turn's session and turn id, so the log records who wrote what. <span class="src">crates/exoharness/src/types.rs:47-74</span> <span class="src">crates/exoharness/src/types.rs:247-306</span></p>
+
+<figure class="code">
+  <figcaption><strong>The conversation vocabulary in the docs is a compat alias for "thread" in the code</strong> <span class="src">crates/exoharness/src/types.rs:296-306</span></figcaption>
+  <pre><code class="language-rust">/// Compatibility name for [`ThreadHandle`].
+pub use ThreadHandle as ConversationHandle;
+
+#[async_trait]
+pub trait TurnHandle: SnapshotHandle {
+    fn record(&amp;self) -&gt; &amp;TurnRecord;
+
+    async fn add_events(&amp;self, data: Vec&lt;EventData&gt;) -&gt; Result&lt;AddEventsResult&gt;;
+    async fn write_artifact(&amp;self, request: WriteArtifactRequest) -&gt; Result&lt;ArtifactVersion&gt;;
+    async fn finish(&amp;self) -&gt; Result&lt;EventId&gt;;
+}</code></pre>
+</figure>
+
+<div class="callout surprise"><p class="callout-title">Docs say "conversation", code says "thread"</p>
+<p><code>exoharness/docs/design/architecture.md</code> and the website still talk about <code>ConversationHandle</code>, <code>conversation_forked</code> and <code>HarnessConversation::send()</code>. The code's primary name is <code>ThreadHandle</code>/<code>ThreadId</code>; <code>ConversationHandle</code> is a re-export alias and event variants are <code>ThreadCreated</code>, <code>ThreadForked</code>… with <code>#[serde(alias = "conversation_created")]</code> for old logs. <span class="src">crates/exoharness/src/types.rs:566-583</span> Several types named in that doc (<code>ExecutorHarnessRuntime</code>, <code>HarnessConversation</code>) no longer exist, and <code>runtime_host.rs</code> lives in <code>crates/exoharness</code>, not <code>crates/executor</code> (the executor merely re-exports it). <span class="src">crates/executor/src/lib.rs:33</span> Use the code names when grepping.</p></div>
+
+<h3 id="split-state-backends">Two seams make the substrate portable</h3>
+<p>The substrate is not tied to a filesystem or to Tokio. Two small traits are the seams:</p>
+<ul>
+  <li><code>Storage</code> &mdash; a byte KV (<code>put/get/list_after/delete/copy</code>). Keys and all metadata formats are owned by Rust; the host only places bytes. <code>BasicObjectStore</code> wraps it. Native uses <code>object_store</code> (local FS, memory); Cloudflare supplies Durable Object SQLite + R2. <span class="src">crates/exoharness/src/storage.rs:10-46</span> <span class="src">crates/exoharness/src/storage/native.rs:1-20</span> <span class="src">exoharness/cloudflare/src/storage.ts</span></li>
+  <li><code>RuntimeHost</code> &mdash; <code>spawn</code> + <code>sleep</code>. All provider logic is written against it so it runs on Tokio natively and under <code>waitUntil</code> in a Worker. <span class="src">crates/exoharness/src/runtime_host.rs:1-16</span></li>
+</ul>
+<p>The concrete substrate, <code>BasicExoHarness</code>, takes either path: <code>new(config)</code>/<code>in_memory</code> natively, or <code>BasicExoHarness::hosted(storage, master_key, backends, host, oauth)</code> for Workers, a constructor that is compiled only when <code>basic-backend</code> is <em>off</em> (<code>#[cfg(not(feature = "basic-backend"))]</code>). <span class="src">crates/exoharness/src/basic.rs:188-200</span> <span class="src">crates/exoharness/src/basic.rs:253-261</span> Multi-tenant callers are modeled by <code>Caller { principal, policy: Arc&lt;dyn AccessPolicy&gt; }</code> and <code>ExoHarness::with_caller</code>; every handle re-checks <code>ResourceScope</code> (Global / Agent / Thread) against it. <span class="src">crates/exoharness/src/access.rs:8-33</span> <span class="src">crates/exoharness/src/types.rs:24-37</span></p>
+
+<h3 id="split-harness-trait">The in-process "Harness" trait is the executor's plug point</h3>
+<p>Do not confuse the product word "harness" with the Rust trait <code>exoharness::harness::Harness&lt;T&gt;</code>. The trait is a tiny command/event interface: you <code>submit(HarnessCommand::StartTurn(..))</code> and the implementation reports back through a <code>HarnessEventSink</code> with <code>TurnEvents</code>, <code>TurnFinished</code> and <code>ExecutionStopped</code>. It is generic in the work payload <code>T</code>, so the runtime can stack two of them: <code>LocalProvider</code> implements <code>Harness&lt;ProviderTurn&gt;</code> (accept a turn, enqueue it) and the inner <code>ExecutorHarness</code> implements <code>Harness&lt;ExecutorTurn&gt;</code> (actually run it). <span class="src">crates/exoharness/src/harness.rs:87-100</span> <span class="src">crates/executor/src/provider.rs:375-430</span> <span class="src">crates/executor/src/harness_adapter.rs:102-127</span></p>
+
+<figure class="code">
+  <figcaption><strong>The whole executor-facing contract: submit commands, emit events</strong> <span class="src">crates/exoharness/src/harness.rs:86-100</span></figcaption>
+  <pre><code class="language-rust">#[async_trait]
+pub trait Harness&lt;T: Send&gt;: Send + Sync {
+    fn name(&amp;self) -&gt; &amp;'static str;
+
+    async fn init(&amp;self, _events: HarnessEventSink) -&gt; Result&lt;()&gt; {
+        Ok(())
+    }
+
+    async fn shutdown(&amp;self) -&gt; Result&lt;()&gt; {
+        Ok(())
+    }
+
+    async fn submit(&amp;self, command: HarnessCommand&lt;T&gt;) -&gt; Result&lt;()&gt;
+    where
+        T: 'async_trait;
+}</code></pre>
+</figure>
+
+<h3 id="split-executors">Where the semantics plug in: <code>HarnessExecutor</code></h3>
+<p><code>HarnessExecutor::execute_turn</code> is the actual turn loop; <code>resume_turn</code> defaults to <em>bail</em> ("cannot safely resume an unfinished turn") and must be opted into by each harness once it can avoid repeating side effects. <span class="src">crates/executor/src/harness_executor.rs:81-190</span> Which implementation a thread gets is decided by the agent config's <code>AgentHarnessKind</code>:</p>
+
+<table>
+  <thead><tr><th><code>AgentHarnessKind</code></th><th>Executor</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>Basic</code> (default)</td><td><code>BasicExecutor</code></td><td>Rust loop: build prompt &rarr; <code>ModelClient</code> &rarr; tool round trips. <span class="src">crates/executor/src/basic.rs:135-235</span></td></tr>
+    <tr><td><code>Rlm</code></td><td><code>RlmExecutor</code></td><td>Recursive-LM loop; internal tools are custom events outside replay. <span class="src">crates/executor/src/native/rlm.rs</span></td></tr>
+    <tr><td><code>TypeScript</code></td><td><code>TypeScriptExecutor</code></td><td>Spawns <code>node --import tsx runner.ts &lt;module&gt;</code>; Codex / Claude Code / Pi / Cursor are presets of this. <span class="src">crates/executor/src/native/typescript.rs:297-318</span></td></tr>
+    <tr><td><code>Exo</code></td><td><code>TypeScriptExecutor</code> + <code>ExoToolRuntime</code></td><td>The self-improving-agent flavor with extra Rust-side tools.</td></tr>
+  </tbody>
+</table>
+<p>The dispatch is a single <code>match</code> in <code>ManagedExecutor</code>, cached per thread together with its MCP connections. <span class="src">crates/executor/src/native/managed_executor.rs:62-100</span> <span class="src">crates/executor/src/executor_types.rs:45-54</span> The named bundled harnesses are just module paths and pinned images:</p>
+
+<figure class="code">
+  <figcaption><strong>"Codex", "Claude Code", "Pi", "Cursor" are TypeScript modules plus a pinned sandbox image</strong> <span class="src">crates/executor/src/managed_agents/config.rs:11-35</span></figcaption>
+  <pre><code class="language-rust">pub enum TypeScriptHarnessPreset {
+    Codex,
+    ClaudeCode,
+    Cursor,
+    Pi,
+}
+// ...
+    pub fn module_path(self) -&gt; &amp;'static Path {
+        match self {
+            Self::Codex =&gt; Path::new("exoharness/examples/typescript/codex-harness.ts"),
+            Self::ClaudeCode =&gt; Path::new("exoharness/examples/typescript/claude-code-harness.ts"),
+            Self::Cursor =&gt; Path::new("exoharness/examples/typescript/cursor-sdk-harness.ts"),
+            Self::Pi =&gt; Path::new("exoharness/examples/typescript/pi-harness.ts"),
+        }
+    }</code></pre>
+</figure>
+<p>See <a href="harnesses.html">Harnesses</a> and <a href="native-harnesses.html">Native harnesses</a> for what those modules do inside.</p>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: commit the work order with the turn-start event</p>
+<p>When a turn is admitted, the runtime serializes everything needed to re-run it (<code>TurnWork</code>: streaming flag, resolved <code>AgentConfig</code>, <code>ConversationConfig</code>, the <code>SendRequest</code>) and passes it as <code>initial_events</code> in <code>begin_turn</code>, so it lands in the same atomic write as <code>TurnStarted</code> and the user input. Crash recovery reads the work back out of the log (<code>TurnWork::from_events</code>) instead of consulting a side table. <span class="src">crates/executor/src/harness_executor.rs:44-72</span> <span class="src">crates/executor/src/harness_executor.rs:750-761</span> <span class="src">crates/exoharness/src/types.rs:397-406</span></p></div>
+
+<h2 id="crates">Crate-by-crate map</h2>
+
+<p>Nine Rust crates in one workspace, about 139k lines (tests included), plus TypeScript packages that are part of the runtime rather than add-ons. <span class="src">Cargo.toml:1-13</span></p>
+
+<svg class="diagram" viewBox="0 0 860 500" role="img" aria-label="Cargo dependency graph between Exo crates">
+  <defs><marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z"/></marker></defs>
+  <rect class="box-accent" x="140" y="20" width="190" height="50" rx="8"/>
+  <text x="235" y="42" text-anchor="middle" class="b">cli</text>
+  <text x="235" y="59" text-anchor="middle" class="muted">`exo` binary, TUI, serve</text>
+  <rect class="box-warn" x="500" y="20" width="230" height="50" rx="8"/>
+  <text x="615" y="42" text-anchor="middle" class="b">worker-runtime</text>
+  <text x="615" y="59" text-anchor="middle" class="muted">wasm32 only; Cloudflare</text>
+  <rect class="box-blue" x="320" y="120" width="220" height="56" rx="8"/>
+  <text x="430" y="144" text-anchor="middle" class="b">executor</text>
+  <text x="430" y="162" text-anchor="middle" class="muted">Runtime, turn queue, harnesses, HTTP</text>
+  <rect class="box" x="320" y="225" width="220" height="50" rx="8"/>
+  <text x="430" y="247" text-anchor="middle" class="b">managed-agents</text>
+  <text x="430" y="264" text-anchor="middle" class="muted">agent files, wire types, RuntimeClient</text>
+  <rect class="box-teal" x="130" y="330" width="260" height="56" rx="8"/>
+  <text x="260" y="354" text-anchor="middle" class="b">exoharness</text>
+  <text x="260" y="372" text-anchor="middle" class="muted">durable substrate, sandboxes, egress, vaults</text>
+  <rect class="box" x="440" y="330" width="110" height="46" rx="8"/>
+  <text x="495" y="358" text-anchor="middle" class="b">mcp</text>
+  <rect class="box" x="640" y="140" width="110" height="40" rx="8"/>
+  <text x="695" y="165" text-anchor="middle" class="b">cost</text>
+  <rect class="box" x="130" y="430" width="260" height="44" rx="8"/>
+  <text x="260" y="450" text-anchor="middle" class="b">firecracker-protocol</text>
+  <text x="260" y="466" text-anchor="middle" class="muted">vsock message types (optional dep)</text>
+  <rect class="box" x="470" y="430" width="200" height="44" rx="8"/>
+  <text x="570" y="450" text-anchor="middle" class="b">firecracker-guest</text>
+  <text x="570" y="466" text-anchor="middle" class="muted">static PID 1 inside the microVM</text>
+  <path class="arrow" d="M255,70 L365,120"/>
+  <path class="arrow" d="M590,70 L500,120"/>
+  <path class="arrow" d="M430,176 L430,225"/>
+  <path class="arrow" d="M385,275 L305,330"/>
+  <path class="arrow" d="M480,275 L492,330"/>
+  <path class="arrow" d="M540,148 L640,160"/>
+  <path class="arrow-dash" d="M260,386 L260,430"/>
+  <path class="arrow" d="M470,452 L390,452"/>
+  <text x="600" y="215" class="muted">Every crate above exoharness also names it directly;</text>
+  <text x="600" y="232" class="muted">cli / executor / worker-runtime also use mcp and cost.</text>
+  <text x="600" y="249" class="muted">Dashed edge: optional (feature "firecracker").</text>
+</svg>
+
+<table>
+  <thead><tr><th>Crate</th><th>Role</th><th>Rust LOC*</th><th>Key files</th></tr></thead>
+  <tbody>
+    <tr><td><code>exoharness</code></td><td>The substrate. Object model traits, filesystem/hosted <code>BasicExoHarness</code>, JSON protocol + server, HTTP transport (server and client), turn-queue contract and stored coordinator, sandbox abstraction and ~10 providers, egress proxy, vaults/secrets.</td><td>63.9k</td><td><span class="src">crates/exoharness/src/types.rs</span> <span class="src">crates/exoharness/src/basic.rs</span> <span class="src">crates/exoharness/src/protocol.rs</span> <span class="src">crates/exoharness/src/server.rs</span> <span class="src">crates/exoharness/src/turn_coordinator.rs</span> <span class="src">crates/exoharness/src/sandbox_provider/mod.rs</span> <span class="src">crates/exoharness/src/egress/mod.rs</span></td></tr>
+    <tr><td><code>executor</code></td><td>Everything above the substrate: <code>Runtime</code> facade, <code>LocalProvider</code>/<code>HttpProvider</code>, turn queue runner, the harness executors, TS-runner host, managed-agent REST service + route table, Slack adapter, schedulers.</td><td>40.7k</td><td><span class="src">crates/executor/src/harness_executor.rs</span> <span class="src">crates/executor/src/provider.rs</span> <span class="src">crates/executor/src/turn_queue.rs</span> <span class="src">crates/executor/src/basic.rs</span> <span class="src">crates/executor/src/native/typescript.rs</span> <span class="src">crates/executor/src/managed_agents/http.rs</span> <span class="src">crates/executor/src/managed_agents/service.rs</span> <span class="src">crates/executor/src/native/http_service.rs</span></td></tr>
+    <tr><td><code>cli</code></td><td>The <code>exo</code> binary: clap commands, inline REPL, ratatui TUI, <code>--serve</code>, provider/OAuth login. Chooses <code>LocalProvider</code> or <code>HttpProvider</code>. See <a href="cli-and-server.html">CLI &amp; server</a>.</td><td>25.0k</td><td><span class="src">crates/cli/src/main.rs</span> <span class="src">crates/cli/src/providers.rs</span> <span class="src">crates/cli/src/tui.rs</span> <span class="src">crates/cli/src/serve.rs</span></td></tr>
+    <tr><td><code>managed-agents</code></td><td>Agent definition files (markdown + frontmatter), permissions, identity, vault types, and the <em>wire</em> half of the runtime HTTP API: <code>protocol.rs</code>, <code>RuntimeClient</code>, SSE codec. See <a href="managed-agents.html">Managed agents</a>.</td><td>3.2k</td><td><span class="src">crates/managed-agents/src/http/protocol.rs</span> <span class="src">crates/managed-agents/src/http/client.rs</span> <span class="src">crates/managed-agents/src/http/sse.rs</span> <span class="src">crates/managed-agents/src/lib.rs</span></td></tr>
+    <tr><td><code>worker-runtime</code></td><td>Compiles <code>executor</code> + <code>exoharness</code> to <code>wasm32</code> as <code>WorkerRuntime</code>; the file starts with <code>#![cfg(target_arch = "wasm32")]</code>, so it is empty on native targets. See <a href="#cloudflare">Cloudflare</a>.</td><td>2.4k</td><td><span class="src">crates/worker-runtime/src/lib.rs</span> <span class="src">crates/worker-runtime/src/host.rs</span> <span class="src">crates/worker-runtime/src/operations.rs</span> <span class="src">crates/worker-runtime/src/execution.rs</span></td></tr>
+    <tr><td><code>firecracker-guest</code></td><td>Static Rust PID 1 for Firecracker microVMs; speaks <code>firecracker-protocol</code> over vsock.</td><td>1.6k</td><td><span class="src">crates/firecracker-guest/src</span></td></tr>
+    <tr><td><code>mcp</code></td><td>MCP client abstraction and config always compile; the native connector and OAuth live behind the <code>client</code> feature. Wasm builds use <code>default-features = false</code> and supply their own connector (<code>WorkerMcp</code>). <span class="src">crates/mcp/src/lib.rs:1-14</span></td><td>1.6k</td><td><span class="src">crates/mcp/src/client.rs</span> <span class="src">crates/mcp/src/native.rs</span> <span class="src">crates/mcp/src/auth.rs</span></td></tr>
+    <tr><td><code>cost</code></td><td>LiteLLM-style pricing table loader used to price model usage.</td><td>0.4k</td><td><span class="src">crates/cost/src/table.rs</span> <span class="src">crates/cost/src/loader.rs</span></td></tr>
+    <tr><td><code>firecracker-protocol</code></td><td>Versioned (<code>PROTOCOL_VERSION = 4</code>) host/guest message types with size limits; has a fuzz target.</td><td>0.15k</td><td><span class="src">crates/firecracker-protocol/src/lib.rs:1-30</span></td></tr>
+  </tbody>
+</table>
+<p class="muted">* Lines of <code>.rs</code> under each crate including tests, measured with <code>wc</code>.</p>
+
+<p>Edges come straight from each <code>Cargo.toml</code>: <code>cli</code> &rarr; executor, managed-agents, exoharness, mcp, cost <span class="src">crates/cli/Cargo.toml:35-42</span>; <code>executor</code> &rarr; cost, mcp, managed-agents, exoharness <span class="src">crates/executor/Cargo.toml:51-54</span>; <code>managed-agents</code> &rarr; mcp, exoharness <span class="src">crates/managed-agents/Cargo.toml:20-24</span>; <code>exoharness</code> &rarr; only the optional <code>firecracker-protocol</code> <span class="src">crates/exoharness/Cargo.toml:92</span>; <code>worker-runtime</code> &rarr; executor (no default features), managed-agents, mcp, cost, exoharness <span class="src">crates/worker-runtime/Cargo.toml:13-18</span>. A tenth workspace member, <code>examples/self-improving-agent/scheduler-runner</code>, depends on <code>executor</code>. <span class="src">Cargo.toml:12</span></p>
+
+<h3 id="crates-features">Cargo features carry the portability story</h3>
+<p>The same source tree must compile for native and for <code>wasm32-unknown-unknown</code>, so everything platform-specific is feature-gated:</p>
+<table>
+  <thead><tr><th>Feature</th><th>Crate</th><th>Pulls in</th></tr></thead>
+  <tbody>
+    <tr><td><code>store</code></td><td>exoharness</td><td>the hosted <code>BasicExoHarness</code>, <code>ExoHarnessServer</code>, <code>Storage</code>, AES-GCM vault crypto; no filesystem, no process spawning. This is what wasm links.</td></tr>
+    <tr><td><code>basic-backend</code></td><td>exoharness</td><td><code>store</code> + tokio fs/net/process, OCI image pulls, the TLS-intercepting egress proxy, the actix HTTP server, local sandbox processes.</td></tr>
+    <tr><td><code>http-client</code></td><td>exoharness</td><td><code>reqwest</code> for <code>HttpClient</code> (separate from <code>HttpExoHarness</code>, which compiles without it).</td></tr>
+    <tr><td><code>native</code> (default)</td><td>executor</td><td>actix, boa JS, the LLM router, Slack, OIDC; <code>worker-runtime</code> depends on executor with <code>default-features = false</code>.</td></tr>
+    <tr><td><code>smolvm</code>, <code>firecracker</code>, <code>aws-agentcore</code></td><td>exoharness / executor</td><td>optional sandbox backends. <span class="src">crates/exoharness/Cargo.toml:8-40</span> <span class="src">crates/executor/Cargo.toml:8-40</span></td></tr>
+  </tbody>
+</table>
+
+<h3 id="crates-other">Everything outside <code>crates/</code></h3>
+<table>
+  <thead><tr><th>Path</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><code>exoharness/typescript/harness</code></td><td>The <code>@exo/harness</code> author API (<code>defineHarness</code>, <code>TurnContext</code>, tool registry) and <code>runner.ts</code>, the guest side of the JSONL host protocol. <span class="src">exoharness/typescript/harness/index.ts:446</span> <span class="src">exoharness/typescript/harness/runner.ts</span></td></tr>
+    <tr><td><code>exoharness/typescript/model-runtime</code></td><td>Shared turn-loop helpers for TS harnesses: Responses-API input shaping, usage and cost events. <span class="src">exoharness/typescript/model-runtime/turn-loop.ts</span></td></tr>
+    <tr><td><code>exoharness/typescript/codex</code>, <code>cursor</code></td><td>Codex app-server client, replay and recovery; Cursor SDK sandbox worker. <span class="src">exoharness/typescript/codex/harness.ts</span></td></tr>
+    <tr><td><code>exoharness/examples/typescript</code></td><td>The actual preset harness modules (<code>codex-harness.ts</code>, <code>claude-code-harness.ts</code>, <code>pi-harness.ts</code>, <code>basic-harness.ts</code>, <code>rlm-harness.ts</code>…).</td></tr>
+    <tr><td><code>exoharness/cloudflare</code></td><td>The Worker: three Durable Object classes plus the JS I/O half of the wasm runtime. See <a href="#cloudflare">below</a>.</td></tr>
+    <tr><td><code>exoharness/containers</code></td><td>Dockerfiles for the <code>*-sandbox</code> / <code>*-devbox</code> images the presets pin by digest. <span class="src">exoharness/containers/README.md</span></td></tr>
+    <tr><td><code>support/firecracker</code></td><td>Scripts that build the guest initramfs and a Lima admin VM, plus egress smoke tests. <span class="src">support/firecracker/README.md</span></td></tr>
+    <tr><td><code>eval/harbor</code></td><td>Python plugin that runs Exo executors as a Harbor external agent over benchmark catalogs; it attaches Harbor's task container to a fresh conversation with <code>exo sandbox attach</code>. <span class="src">eval/harbor/README.md</span></td></tr>
+    <tr><td><code>examples/</code></td><td><code>tutorial/1_ticket_triage</code> and <code>self-improving-agent</code> (scheduler, tools, Slack). See <a href="examples.html">Examples</a>.</td></tr>
+    <tr><td><code>fuzz/</code>, <code>docs/</code>, <code>website/</code></td><td>Fuzz target for the firecracker protocol; operator docs (egress, providers, resources, managed adapters); the VitePress site (<code>website/docs-src</code>).</td></tr>
+  </tbody>
+</table>
+
+<h2 id="lifecycle">Lifecycle of one request</h2>
+
+<p>Take <code>exo run agent.md --prompt "..."</code>. The same path, minus the CLI front end, serves <code>POST /exo/agent/{id}/thread/{id}/turn</code> over HTTP. The CLI builds a <code>Runtime</code> around either a <code>LocalProvider</code> (in-process <code>BasicExoHarness</code> + <code>ManagedExecutor</code>) or, when a remote provider is selected, an <code>HttpProvider</code> that speaks the runtime REST API; the code after that point is identical. <span class="src">crates/cli/src/providers.rs:17-110</span></p>
+
+<svg class="diagram" viewBox="0 0 940 620" role="img" aria-label="Sequence diagram of one turn through Exo">
+  <defs><marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z"/></marker></defs>
+  <rect class="box-accent" x="15" y="12" width="130" height="44" rx="6"/><text x="80" y="31" text-anchor="middle" class="b">Client</text><text x="80" y="47" text-anchor="middle" class="muted">CLI / HTTP caller</text>
+  <rect class="box-blue" x="175" y="12" width="130" height="44" rx="6"/><text x="240" y="31" text-anchor="middle" class="b">Runtime</text><text x="240" y="47" text-anchor="middle" class="muted">+ LocalProvider</text>
+  <rect class="box" x="335" y="12" width="130" height="44" rx="6"/><text x="400" y="31" text-anchor="middle" class="b">Turn queue</text><text x="400" y="47" text-anchor="middle" class="muted">TurnQueue impl</text>
+  <rect class="box-blue" x="495" y="12" width="130" height="44" rx="6"/><text x="560" y="31" text-anchor="middle" class="b">ExecutorHarness</text><text x="560" y="47" text-anchor="middle" class="muted">HarnessExecutor</text>
+  <rect class="box-teal" x="655" y="12" width="130" height="44" rx="6"/><text x="720" y="31" text-anchor="middle" class="b">Exoharness</text><text x="720" y="47" text-anchor="middle" class="muted">BasicExoHarness</text>
+  <rect class="box-warn" x="805" y="12" width="120" height="44" rx="6"/><text x="865" y="31" text-anchor="middle" class="b">Model / sandbox</text><text x="865" y="47" text-anchor="middle" class="muted">egress-proxied</text>
+  <path d="M80,56 L80,600" stroke="var(--line)" stroke-dasharray="3 4"/>
+  <path d="M240,56 L240,600" stroke="var(--line)" stroke-dasharray="3 4"/>
+  <path d="M400,56 L400,600" stroke="var(--line)" stroke-dasharray="3 4"/>
+  <path d="M560,56 L560,600" stroke="var(--line)" stroke-dasharray="3 4"/>
+  <path d="M720,56 L720,600" stroke="var(--line)" stroke-dasharray="3 4"/>
+  <path d="M865,56 L865,600" stroke="var(--line)" stroke-dasharray="3 4"/>
+
+  <path class="arrow" d="M80,92 L240,92"/><text x="88" y="86" class="muted">1 start_turn(input)</text>
+  <path class="arrow" d="M240,128 L400,128"/><text x="248" y="122" class="muted">2 enqueue(TurnSubmission{work})</text>
+  <path class="arrow-dash" d="M240,164 L80,164"/><text x="92" y="158" class="muted">3 TurnRecord + stream (HTTP 202)</text>
+  <path class="arrow" d="M240,200 L400,200"/><text x="248" y="194" class="muted">4 claim, peek, start (lease)</text>
+  <path class="arrow" d="M240,236 L720,236"/><text x="410" y="230" class="muted">5 begin_turn(initial_events=[TurnWork])</text>
+  <path class="arrow" d="M240,272 L560,272"/><text x="300" y="266" class="muted">6 submit(StartTurn(ExecutorTurn))</text>
+  <path class="arrow" d="M560,308 L865,308"/><text x="640" y="302" class="muted">7 model.complete_stream</text>
+  <path class="arrow" d="M560,344 L720,344"/><text x="566" y="338" class="muted">8 turn.add_events(...)</text>
+  <path class="arrow" d="M560,380 L865,380"/><text x="640" y="374" class="muted">9 tool: run in sandbox</text>
+  <path class="arrow-dash" d="M720,416 L80,416"/><text x="250" y="410" class="muted">10 watch_events -&gt; SSE exo_event / ExecutionStreamEvent</text>
+  <path class="arrow-dash" d="M560,452 L240,452"/><text x="300" y="446" class="muted">11 TurnFinished(outcome)</text>
+  <path class="arrow" d="M240,488 L720,488"/><text x="330" y="482" class="muted">12 TurnEnded (finish)</text>
+  <path class="arrow" d="M240,524 L400,524"/><text x="248" y="518" class="muted">13 acknowledge, next head</text>
+  <path class="arrow-dash" d="M240,560 L80,560"/><text x="92" y="554" class="muted">14 Completed(SendResult)</text>
+</svg>
+
+<ol class="steps">
+  <li><strong>Client builds a request.</strong> The CLI's <code>Commands::Run</code> arm opens (or creates) the agent and thread, then calls <code>tui::run_prompt</code>, which calls <code>Runtime::start_turn</code> with a user <code>Message</code>. <span class="src">crates/cli/src/main.rs:1180-1215</span> <span class="src">crates/cli/src/tui.rs:83-92</span> <span class="src">crates/cli/src/tui.rs:635-654</span> Over HTTP the equivalent is <code>POST turn</code> with <code>SubmitTurnBody</code>; <code>prepare_turn</code> resolves harness/model overrides into an <code>AgentConfig</code>. <span class="src">crates/executor/src/managed_agents/service.rs:89-134</span></li>
+  <li><strong>Accept, don't execute.</strong> <code>start_turn</code> submits <code>HarnessCommand::StartTurn(ProviderTurn)</code> to the provider, which calls <code>accept_local_turn</code>: authorize via the caller's <code>ResourceScope::Thread</code> check, resolve configs into a <code>TurnWork</code>, mint a UUIDv7 <code>TurnRecord</code> and enqueue. Acceptance does not wait for an earlier turn or VM startup. <span class="src">crates/executor/src/harness_executor.rs:602-628</span> <span class="src">crates/executor/src/provider.rs:408-424</span> <span class="src">crates/executor/src/turn_queue.rs:357-417</span></li>
+  <li><strong>Receipt returns.</strong> The caller gets <code>(TurnRecord, ExecutionStreamHandle)</code> right away; HTTP answers <code>202</code> and the HTTP handler spawns progress forwarding on the platform host so admission outlives a disconnected requester. <span class="src">crates/executor/src/managed_agents/http.rs:246-274</span></li>
+  <li><strong>Queue worker drains per thread.</strong> <code>spawn_queue</code>/<code>run_queue</code> claim a <code>TurnLease</code>, <code>peek</code> the head, <code>start</code> it (persisting admission and subscribing to a control watch for cancel/suspend), and loop until the queue is idle. <span class="src">crates/executor/src/turn_queue.rs:529-700</span> <span class="src">crates/exoharness/src/turn_coordinator.rs:134-177</span></li>
+  <li><strong><code>start_local_turn</code> prepares and begins the turn.</strong> It materializes filesystem resources and previews, calls <code>executor.prepare_conversation</code>, then <code>thread.begin_turn(BeginTurnRequest{ initial_events: [TurnWork] })</code>, which atomically appends <code>session_started</code> (if new), <code>turn_started</code>, the user messages and the work order. <span class="src">crates/executor/src/harness_executor.rs:630-762</span></li>
+  <li><strong>Hand to the executor.</strong> <code>ExecutorHarness::submit</code> registers the turn in its active map, spawns the execution under a <code>watch</code> channel for cancel/suspend/shutdown, and wraps the <code>TurnHandle</code> in <code>HarnessTurn</code> so every <code>add_events</code> routes through the event sink. <span class="src">crates/executor/src/harness_executor.rs:799-815</span> <span class="src">crates/executor/src/harness_adapter.rs:141-215</span></li>
+  <li><strong>Model call.</strong> For <code>Basic</code>, <code>run_turn_loop</code> rebuilds the prompt from events, calls <code>complete_model_round</code> against <code>ModelClient</code> (the native one is <code>RouterModelClient</code>, built on <code>braintrust_llm_router</code>). <span class="src">crates/executor/src/basic.rs:175-195</span> <span class="src">crates/executor/src/native/harness_runtime.rs:40</span> TS harnesses do the same in <code>runner.ts</code> and reach Rust only through the JSONL protocol.</li>
+  <li><strong>Persist as you go.</strong> Model output becomes <code>messages</code>, <code>tool_requested</code>, usage and cost events via <code>turn.add_events</code>. A final answer is committed together with the <code>exo.runtime.turn_completed</code> marker so recovery can tell finished from interrupted. <span class="src">crates/executor/src/basic.rs:195-214</span></li>
+  <li><strong>Tools run in the sandbox.</strong> Tool calls pass permission policy (<code>permissions::authorize</code>), then run via the <code>ToolRuntime</code>; shell commands go to the thread's sandbox through <code>run_in_sandbox</code>. <span class="src">crates/executor/src/basic.rs:237-260</span> See <a href="tools-and-mcp.html">Tools &amp; MCP</a> and <a href="sandboxes.html">Sandboxes</a>.</li>
+  <li><strong>Events reach the client.</strong> Locally, <code>HarnessEvents</code> forwards each persisted event to the turn's stream; remotely, the server's SSE watch merges the durable log with ephemeral progress, and <code>HttpProvider</code> decodes it with <code>turn_stream</code> (see <a href="#http">HTTP</a>). <span class="src">crates/executor/src/harness_events.rs:217-236</span> <span class="src">crates/executor/src/harness_events.rs:264-300</span> <span class="src">crates/executor/src/harness_events.rs:322-394</span></li>
+  <li><strong>Finish.</strong> When the executor returns, <code>ExecutorHarness</code> emits <code>TurnFinished</code> then <code>ExecutionStopped</code>; the runtime's finalizer calls <code>finalize_turn</code> (which calls <code>finish()</code>, writing <code>turn_ended</code>, after first persisting an <code>error</code> event if the turn failed) and pushes <code>ExecutionStreamEvent::Completed</code>. <span class="src">crates/executor/src/harness_adapter.rs:300-318</span> <span class="src">crates/executor/src/shared.rs:6-25</span> <span class="src">crates/executor/src/harness_executor.rs:824-890</span></li>
+  <li><strong>Acknowledge.</strong> After terminal events are durable, <code>run_queue</code> calls <code>coordinator.acknowledge</code>, which returns the next head, and loops. <span class="src">crates/executor/src/turn_queue.rs:700-702</span></li>
+</ol>
+
+<figure class="code">
+  <figcaption><strong>Admission: the work payload goes into the queue, identity is minted before anything runs</strong> <span class="src">crates/executor/src/turn_queue.rs:386-421</span></figcaption>
+  <pre><code class="language-rust">let turn = TurnRecord {
+    id: Uuid7::now(),
+    session_id: work.request.session_id.unwrap_or_else(Uuid7::now),
+};
+let key = HarnessTurnKey::new(scope.agent_id, scope.thread_id, turn.id);
+let (sender, receiver) = mpsc::unbounded_channel();
+// Publish the execution identity and observer before the queue entry can
+// become visible to a live drain.
+provider.turns.register_observer(key, self, sender.clone());
+let accepted = match provider
+    .turns
+    .coordinator
+    .enqueue(
+        scope,
+        TurnSubmission {
+            turn,
+            work,
+            principal,
+            options,
+        },
+    )
+    .await</code></pre>
+</figure>
+
+<div class="callout surprise"><p class="callout-title">Idempotency means a retry can attach to a turn that already finished</p>
+<p><code>TurnOptions.idempotency_key</code> is principal-scoped and receipts live 24 hours. When <code>enqueue</code> reports <code>duplicate: true</code>, <code>accept_local_turn</code> re-registers the observer under the <em>original</em> turn id and, if the journal says the turn is finished, replays its completion through <code>watch_turn</code> from the start. <code>HttpProvider</code> does the symmetric thing on the client: with a key set, it first fetches <code>error,turn_ended</code> events for the turn and short-circuits if it already ended. <span class="src">crates/exoharness/src/turn_coordinator.rs:25-36</span> <span class="src">crates/executor/src/turn_queue.rs:437-482</span> <span class="src">crates/executor/src/native/http_provider.rs:72-103</span></p></div>
+
+<div class="callout"><p class="callout-title">Where durability lives for a queued turn</p>
+<p>The CLI installs <code>BasicExoHarness::turn_coordinator()</code>, which persists <code>turn_queue.json</code> per thread; embedded <code>LocalProvider::with_host</code> uses <code>StoredTurnCoordinator::in_memory()</code> and loses its queue on restart unless you call <code>with_turn_coordinator</code>. On restart the runtime reconciles the saved head against the event journal: resume if started, re-run if not, ack if already complete. Recovery is not exactly-once for external side effects. <span class="src">crates/exoharness/src/basic/turn_queue.rs:59</span> <span class="src">crates/executor/src/provider.rs:130-160</span> <span class="src">crates/executor/src/turn_queue.rs:255</span> Details in <a href="data-model.html">Data model</a>.</p></div>
+
+<h2 id="http">HTTP API and wire protocol</h2>
+
+<p>There are <strong>two different HTTP surfaces</strong>, and the repo's docs only describe one of them well.</p>
+
+<table>
+  <thead><tr><th></th><th>Store RPC (<code>/request</code>)</th><th>Runtime API (<code>/exo/...</code>)</th></tr></thead>
+  <tbody>
+    <tr><td>Abstraction</td><td>the raw exoharness protocol: <code>protocol::Request</code> / <code>Response</code></td><td>the managed-agent REST service: agents, threads, turns, SSE</td></tr>
+    <tr><td>Shape</td><td>one unary <code>POST /request</code> with a <code>ClientMessage</code> envelope; <code>GET /health</code>. Errors are HTTP 200 with <code>ok:false</code></td><td>conventional REST under <code>RUNTIME_PATH = "/exo"</code>, real status codes, SSE for events</td></tr>
+    <tr><td>Server</td><td><code>serve_exoharness_http*</code> (actix) &rarr; <code>ExoHarnessServer</code></td><td><code>RuntimeHttpService</code> (actix) or the Worker, both via one route table</td></tr>
+    <tr><td>Client</td><td><code>HttpExoHarness</code> over <code>RpcTransport</code></td><td><code>RuntimeClient</code> + <code>HttpProvider</code>'s <code>RuntimeTransport</code></td></tr>
+    <tr><td>Streaming</td><td>none</td><td>SSE event watch</td></tr>
+  </tbody>
+</table>
+<p><span class="src">crates/exoharness/src/http/server.rs:47-69</span> <span class="src">crates/exoharness/src/http.rs:12</span> <span class="src">crates/managed-agents/src/http.rs:9</span> <span class="src">exoharness/docs/http.md</span></p>
+
+<h3 id="http-store">Store RPC: one envelope, one enum</h3>
+<p><code>ClientMessage::Request{id, request}</code> in, <code>ServerMessage::Response{id, ok, response, error}</code> out. <code>Request</code> is a <code>#[serde(tag = "type")]</code> enum with one variant per substrate operation (vaults, agents, bindings, conversations, sandboxes and processes, <code>conversation_begin_turn</code>, <code>turn_add_events</code>, <code>turn_finish</code>…). Handles do not cross the wire: turns are addressed by <code>(agent_id, conversation_id, session_id, turn_id)</code> and the server reconstructs the handle per call. <span class="src">crates/exoharness/src/protocol.rs:46-66</span> <span class="src">crates/exoharness/src/server.rs:84-97</span></p>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: one request enum, three transports</p>
+<p><code>protocol::Request</code> is dispatched by the same <code>ExoHarnessServer::handle_request</code> whether it arrives (a) over <code>POST /request</code>, (b) as an <code>exo_request</code> line on a TypeScript harness's stdin/stdout, or (c) as <code>Operation::Request</code> inside the wasm runtime. <code>HttpExoHarness</code> then re-implements the <em>entire</em> handle trait family on top of an <code>ExoHttpTransport</code> trait, so a "remote exoharness" is a drop-in <code>Arc&lt;dyn ExoHarness&gt;</code>. In Cloudflare, a thread Durable Object uses exactly this to talk to the account object. <span class="src">crates/exoharness/src/server.rs:84</span> <span class="src">crates/executor/src/native/typescript.rs:449-462</span> <span class="src">crates/worker-runtime/src/operations.rs:89-92</span> <span class="src">crates/exoharness/src/http/client.rs:41-72</span> <span class="src">crates/worker-runtime/src/account.rs:13-36</span></p></div>
+
+<h3 id="http-runtime">Runtime API route table</h3>
+<p>One function, <code>managed_agents::http::route</code>, matches <code>(method, path-segments)</code> and is shared by native actix and the Worker. A <code>Platform</code> trait carries the differences (account id, <code>RuntimeHost</code>, whether to stream, cancel behavior, whether to expose store RPC). Unknown paths 404; a known path with the wrong verb is 405 (the <code>routes!</code> macro re-matches the same patterns to decide). <span class="src">crates/executor/src/managed_agents/http.rs:11-47</span> <span class="src">crates/executor/src/managed_agents/http.rs:119-136</span></p>
+
+<table>
+  <thead><tr><th>Route (under <code>/exo</code>)</th><th>Handler</th></tr></thead>
+  <tbody>
+    <tr><td><code>GET identity</code></td><td>account id (<code>ProviderIdentity</code>)</td></tr>
+    <tr><td><code>GET|PUT environment</code>, <code>DELETE environment/{name}</code></td><td>named sandbox environments</td></tr>
+    <tr><td><code>GET|POST agent</code>, <code>POST agent/managed</code></td><td>list/create agents; create from a definition</td></tr>
+    <tr><td><code>GET|DELETE agent/{a}</code>, <code>PUT agent/{a}/definition</code></td><td>agent record / definition</td></tr>
+    <tr><td><code>GET|POST agent/{a}/artifact</code>, <code>GET .../artifact/read</code></td><td>agent artifacts</td></tr>
+    <tr><td><code>GET|POST agent/{a}/thread</code></td><td>list/create threads</td></tr>
+    <tr><td><code>GET|DELETE agent/{a}/thread/{t}</code>, <code>POST .../fork</code>, <code>PUT .../environment</code>, <code>GET .../previews</code></td><td>thread lifecycle</td></tr>
+    <tr><td><code>GET agent/{a}/thread/{t}/event</code></td><td>paged event query (<code>EventsQuery</code>: <code>session_id</code>, <code>turn_id</code>, <code>after</code>, <code>limit</code>, <code>direction</code>, <code>event_type</code>)</td></tr>
+    <tr><td><code>GET agent/{a}/thread/{t}/event/watch?after=</code></td><td>SSE stream</td></tr>
+    <tr><td><code>POST agent/{a}/thread/{t}/turn</code></td><td>submit a turn &rarr; <strong>202</strong> <code>SubmitTurnResult{agent,thread,turn,harness}</code></td></tr>
+    <tr><td><code>GET turn/{id}</code>, <code>POST turn/{id}/cancel</code>, <code>/approval-response</code>, <code>/frontend-tool-result</code></td><td>turn control and human-in-the-loop</td></tr>
+    <tr><td><code>[agent/{a}[/thread/{t}]]/vault[/{v}[/secret[/{s}]]]</code></td><td>vault CRUD at global, agent or thread scope</td></tr>
+    <tr><td><code>POST adapter/{name}</code>, <code>POST agent/{a}/adapter/{name}</code></td><td>Slack webhooks, authenticated by Slack signature, outside the bearer middleware</td></tr>
+    <tr><td><code>POST request</code> (Worker only)</td><td>store RPC, when <code>Platform::exposes_store_protocol()</code></td></tr>
+  </tbody>
+</table>
+<p><span class="src">crates/executor/src/managed_agents/http.rs:139-306</span> <span class="src">crates/executor/src/native/http_service.rs:177-196</span></p>
+
+<figure class="code">
+  <figcaption><strong>The route table is declarative pattern matching on path segments</strong> <span class="src">crates/executor/src/managed_agents/http.rs:224-239</span></figcaption>
+  <pre><code class="language-rust">routes!(method, tail;
+("GET", []) =&gt; reply!(get_thread, &amp;thread),
+("GET", ["previews"]) =&gt; {
+    let agent = service.agent(thread.agent_id).await?;
+    let conversation = service.thread(agent.as_ref(), thread.thread_id).await?;
+    return json(platform.previews(agent.as_ref(), conversation).await?);
+},
+("GET", ["event", "watch"]) =&gt; {
+    let agent = service.agent(thread.agent_id).await?;
+    let conversation = service.thread(agent.as_ref(), thread.thread_id).await?;
+    let query: WatchQuery = query(r)?;
+    return Ok(Response::Watch(
+        api::watch_events(conversation.as_ref(), progress.subscribe(), query.after)
+            .await?,
+    ));
+},</code></pre>
+</figure>
+
+<p>Auth on the native server is a <code>from_fn</code> middleware that compares a static bearer token; with the "remote" auth mode (<code>crate::remote::AuthServer</code>) each request is mapped to a principal and a per-principal <code>Runtime</code> clone via <code>with_caller</code>. Bodies are capped at 2 MiB, except thread create/fork at 256 MiB (embedded environments), and non-JSON bodies are rejected. <span class="src">crates/executor/src/native/http_service.rs:276-296</span> <span class="src">crates/executor/src/native/http_service.rs:412-452</span> The client's <code>HttpClient</code> refuses redirects, forbids credentials in the URL, forwards an optional <code>x-exo-context</code> JSON header, and supports a bearer token or a token-provider callback that is awaited per request. <span class="src">crates/exoharness/src/http_client.rs:27-107</span></p>
+
+<h3 id="http-watch">Event watch, SSE and reconnect semantics</h3>
+<p>The watch endpoint is the one place where two streams are merged. <code>api::watch_events</code> selects over (1) the thread's durable <code>watch_events(Excluded(after))</code> and (2) an in-process <code>tokio::broadcast</code> of <em>ephemeral</em> progress events. Progress events (<code>LinguaStreamChunk</code> deltas, <code>RuntimeStatus</code> custom events like "Preparing workspace") are minted in <code>forward_progress</code> with fresh UUIDv7 ids and are <strong>never written to the log</strong>; a lagging subscriber just skips them. <span class="src">crates/executor/src/managed_agents/service.rs:811-826</span> <span class="src">crates/executor/src/managed_agents/service.rs:768-806</span></p>
+
+<figure class="code">
+  <figcaption><strong>Durable + ephemeral merge for the SSE watch; no `after` means replay from the beginning</strong> <span class="src">crates/executor/src/managed_agents/service.rs:811-826</span></figcaption>
+  <pre><code class="language-rust">/// Subscribe before loading history so both transports merge saved events with live progress.
+pub async fn watch_events(
+    thread: &amp;dyn ThreadHandle,
+    receiver: broadcast::Receiver&lt;Event&gt;,
+    after: Option&lt;exoharness::EventId&gt;,
+) -&gt; Result&lt;EventStream&gt; {
+    let durable = thread
+        .watch_events(std::ops::Bound::Excluded(
+            after.unwrap_or_else(|| Uuid7(Default::default())),
+        ))
+        .await?;
+    Ok(Box::pin(futures::stream::select(
+        durable,
+        progress_stream(receiver, thread.record().id),
+    )))
+}</code></pre>
+</figure>
+
+<p>Inside <code>BasicExoHarness::watch_events</code> the durable half is replay-then-live without gaps: it takes the write lock, subscribes to a per-thread <code>broadcast::channel(64)</code> <em>first</em>, then lists stored event batches after the bound. If the receiver reports <code>Lagged</code>, it resubscribes and rescans storage from the last key it emitted. <span class="src">crates/exoharness/src/basic.rs:1833-1870</span> <span class="src">crates/exoharness/src/basic.rs:1912-1925</span></p>
+
+<h4>Framing</h4>
+<p>SSE with exactly three frame kinds: <code>event: exo_event</code> + one JSON-encoded <code>Event</code> in <code>data:</code>; <code>event: error</code> with <code>{"error": "..."}</code>; and a comment heartbeat <code>:\n\n</code> every 10 seconds. The decoder tolerates CRLF, multi-line <code>data:</code>, byte-at-a-time chunks, unknown event names, and treats a stream that ends mid-event as an error. Response headers disable proxy buffering (<code>x-accel-buffering: no</code>). <span class="src">crates/managed-agents/src/http/sse.rs:20-34</span> <span class="src">crates/managed-agents/src/http/sse.rs:74-129</span> <span class="src">crates/executor/src/native/http_service.rs:506-514</span> With an authenticated server, the watch also re-validates the session every second and ends the stream if it has been revoked. <span class="src">crates/executor/src/native/http_service.rs:482-503</span></p>
+
+<h4>Reconnect</h4>
+<p>The wire has no <code>Last-Event-ID</code>; resumption is explicit via <code>?after=&lt;event_id&gt;</code> and the cursor is a UUIDv7 event id. The pieces:</p>
+<ul>
+  <li><code>turn_stream</code> turns raw events into <code>ExecutionStreamEvent</code>s, filters by turn id, and emits a <code>Checkpoint{event_id}</code> after every <em>durable</em> event so clients always know the last committed position. If the SSE connection drops it errors with "runtime progress disconnected; reconnect to retrieve saved history". <span class="src">crates/executor/src/harness_events.rs:322-394</span></li>
+  <li><code>Runtime::watch_turn(thread, turn, after)</code> re-attaches from a checkpoint (or from just after <code>turn_started</code>) and re-seeds any earlier <code>error</code> event so partial text cannot be misreported as success. <span class="src">crates/executor/src/harness_executor.rs:540-596</span></li>
+  <li><code>Runtime::reconnect_turn</code> is the "open the app again" path: find the latest <code>turn_started</code>/<code>turn_ended</code>; if the turn is live, replay pending approvals and attach. The inline REPL calls it at startup. <span class="src">crates/executor/src/harness_executor.rs:465-538</span> <span class="src">crates/cli/src/tui.rs:659-668</span></li>
+  <li>The remote client opens the watch from <code>result.thread.latest_event_id</code> (the head at submit time) after the 202. <span class="src">crates/executor/src/native/http_provider.rs:111-122</span></li>
+</ul>
+
+<div class="callout surprise"><p class="callout-title">`Bound::Unbounded` means different things on the two sides of the wire</p>
+<p>In <code>BasicExoHarness::watch_events</code>, <code>Unbounded</code> is <em>live-only</em>: it is rewritten to <code>Excluded(latest_event_id)</code> and no history is scanned. But <code>RuntimeTransport::watch_events</code> maps <code>Unbounded</code> to <code>after = None</code>, and the server turns <code>None</code> into <code>Excluded(Uuid7(0))</code>, i.e. a <em>full replay</em>. The behaviors only line up if callers always pass an explicit cursor, which the turn code does. <span class="src">crates/exoharness/src/basic.rs:1841-1850</span> <span class="src">crates/executor/src/native/http_provider.rs:601-615</span> <span class="src">crates/executor/src/managed_agents/service.rs:817-821</span></p></div>
+
+<div class="callout surprise"><p class="callout-title">The raw `HttpExoHarness` client cannot watch or begin turns by default</p>
+<p><code>ExoHttpTransport::watch_events</code> defaults to <code>unsupported("watch_events")</code>, and the stock <code>RpcTransport</code> does not override it, so the "store RPC over HTTP" client has no event streaming at all; the docs say so ("unary only"). Event watching works only with transports that implement it: <code>RuntimeTransport</code> (SSE) and the Worker's <code>AccountTransport</code> (DO RPC subscription). In the other direction <code>RuntimeTransport::request</code> maps only a subset of <code>protocol::Request</code> onto REST routes and <code>bail!</code>s on the rest with "runtime HTTP does not expose …". <span class="src">crates/exoharness/src/http/client.rs:47-66</span> <span class="src">crates/exoharness/src/http/client.rs:114-145</span> <span class="src">crates/executor/src/native/http_provider.rs:596-598</span> <span class="src">exoharness/docs/http.md</span></p></div>
+
+<div class="callout warn"><p class="callout-title">Unrecognized errors become HTTP 400</p>
+<p><code>error_status</code> maps a typed <code>RequestError</code> to its status, <code>UnsupportedRequest</code> to 501, and <em>everything else</em> to 400, including internal failures that did not go through <code>internal_error()</code>. Clients cannot distinguish "bad input" from "server bug" on those paths. <span class="src">crates/executor/src/managed_agents/service.rs:170-178</span></p></div>
+
+<h3 id="http-ts">The third protocol: JSONL to the TypeScript runner</h3>
+<p>TypeScript harnesses run in a long-lived <code>node</code> child process per module path. Host &rarr; guest messages are <code>init</code>, <code>shutdown</code>, <code>runtime_response</code>, <code>exo_response</code>, <code>runtime_event</code>; guest &rarr; host are <code>runtime_request</code> (execute a tool, start/stop a sandbox process), <code>exo_request</code> (a <code>protocol::Request</code>), <code>stream_event</code>, <code>done</code>, <code>error</code>. Undecodable lines are rejected <em>by id</em> via a lenient preview struct, so one bad tool call does not kill the turn. <span class="src">crates/executor/src/native/typescript.rs:565-600</span> <span class="src">crates/executor/src/typescript_runtime.rs:521-612</span> <span class="src">exoharness/typescript/harness/wire.ts</span></p>
+
+<figure class="code">
+  <figcaption><strong>The guest's own-turn writes are routed through the observed turn; everything else goes straight to the server</strong> <span class="src">crates/executor/src/native/typescript.rs:452-462</span></figcaption>
+  <pre><code class="language-rust">let result = match *request {
+    ExoRequest::TurnAddEvents { agent_id, conversation_id, session_id, turn_id, data }
+        if agent_id == agent.record().id
+            &amp;&amp; conversation_id == conversation.record().id
+            &amp;&amp; session_id == turn.record().session_id
+            &amp;&amp; turn_id == turn.record().id =&gt;
+    {
+        turn.add_events(data).await.map(|result| ExoResponse::AddEvents { result })
+    }
+    request =&gt; exoharness_server.handle_request(request).await,
+};</code></pre>
+</figure>
+
+<h2 id="worker-runtime">crates/worker-runtime</h2>
+
+<p><code>worker-runtime</code> exists to run the <em>same</em> <code>Runtime</code>, <code>LocalProvider</code> and <code>BasicExoHarness</code> inside a Cloudflare Worker. Rust is built as a <code>cdylib</code> with the <code>worker</code> cargo profile and bound with <code>wasm-bindgen</code>. <span class="src">crates/worker-runtime/Cargo.toml:9-10</span> <span class="src">Cargo.toml:109-114</span> <span class="src">exoharness/cloudflare/scripts/build-runtime.mjs</span></p>
+
+<p>The design is "sans-IO": there is no Tokio runtime and no threads. Rust owns all logic; JavaScript owns every side effect. <code>WorkerRuntime</code> keeps a <code>FuturesUnordered</code> of in-flight operations. JS calls <code>submit(op)</code> to start an operation, then <code>poll()</code>, which advances the futures and returns a <code>Progress</code> value: <code>calls</code> (host I/O Rust wants performed), <code>cancelled</code>, <code>completed</code> operations, a <code>pending</code> flag and emitted runtime <code>events</code>. JS performs each call and answers with <code>resolve(id, result, error)</code>. <span class="src">crates/worker-runtime/src/lib.rs:36-60</span> <span class="src">crates/worker-runtime/src/lib.rs:200-243</span></p>
+
+<figure class="code">
+  <figcaption><strong>Everything Rust cannot do itself is an enumerated host request</strong> <span class="src">crates/worker-runtime/src/host.rs:16-56</span></figcaption>
+  <pre><code class="language-rust">pub(crate) enum HostRequest {
+    Sleep { millis: u64 },
+    Storage { operation: StorageOperation },
+    Sandbox { command: crate::sandbox::Command },
+    Mcp { command: crate::mcp::Command },
+    McpHttp { request: crate::mcp::HttpRequest, token: Option&lt;String&gt; },
+    OauthHttp { request: OAuthRequest },
+    Model { request: ModelRequest },
+    ResetHarness,
+    Harness { payload: TypeScriptInitPayload },
+    AccountRequest { request: exoharness::protocol::Request },
+    Subscribe { agent_id: exoharness::AgentId, thread_id: exoharness::ThreadId, after: std::ops::Bound&lt;exoharness::EventId&gt; },
+    Subscription { command: crate::account::SubscriptionCommand },
+}</code></pre>
+</figure>
+
+<p>The inbound side is the mirror enum <code>Operation</code>: <code>Request</code> (store RPC), <code>Http</code> (the shared route table), <code>HarnessRequest</code>, <code>ProxyHeaders</code> (egress credential substitution), <code>SandboxPolicy</code>, <code>DrainQueue</code>, <code>WatchState/WatchNext/WatchClose</code>. <span class="src">crates/worker-runtime/src/operations.rs:10-47</span> A Worker has no sandbox providers of its own, so only one backend is registered, <code>cloudflare</code>, implemented by sending <code>HostRequest::Sandbox</code> to JS. <span class="src">crates/worker-runtime/src/lib.rs:81-85</span></p>
+
+<h2 id="cloudflare">The Cloudflare backend</h2>
+
+<p><code>exoharness/cloudflare</code> is a TypeScript Worker (about 1.7k lines under <code>src/</code>) that instantiates the wasm module and provides the I/O. It declares three SQLite-backed Durable Object classes plus an R2 bucket. <span class="src">exoharness/cloudflare/wrangler.jsonc:20-34</span></p>
+
+<table>
+  <thead><tr><th>Object</th><th>Count</th><th>Owns</th></tr></thead>
+  <tbody>
+    <tr><td><code>ExoProvider</code> (<code>PROVIDERS</code>)</td><td>one per <code>ACCOUNT_ID</code></td><td>the "account": agents, events, encrypted vaults, the shared sandbox manager; serves store RPC and every non-turn route. <span class="src">exoharness/cloudflare/src/provider.ts:119-133</span></td></tr>
+    <tr><td><code>ExoThread</code> (<code>THREADS</code>)</td><td>one per (account, agent, thread)</td><td>that thread's <code>StoredTurnCoordinator</code>, the running Rust runtime for the turn, and SSE watches. Recovery alarm every 180 s while work remains. <span class="src">exoharness/cloudflare/src/provider.ts:135-144</span></td></tr>
+    <tr><td><code>ExoSandbox</code> (<code>SANDBOXES</code>)</td><td>one per sandbox</td><td>a Cloudflare Container plus exec/snapshot plumbing. <span class="src">exoharness/cloudflare/src/sandbox.ts</span></td></tr>
+  </tbody>
+</table>
+
+<p>The front-door <code>fetch</code> authenticates (Cloudflare Access audience, or a static <code>EXO_TOKEN</code>), then routes: <code>agent/*/thread/*/turn</code> and <code>.../event/watch</code> go to the thread object by name, everything else to the single account object. The name comes from Rust (<code>WorkerRuntime::thread_name</code>) so aliasing IDs cannot produce two queue owners. <span class="src">exoharness/cloudflare/src/index.ts:18-62</span> <span class="src">crates/worker-runtime/src/lib.rs:62-66</span></p>
+
+<figure class="code">
+  <figcaption><strong>Turn and watch traffic is sharded per thread; the rest hits the account object</strong> <span class="src">exoharness/cloudflare/src/index.ts:40-61</span></figcaption>
+  <pre><code class="language-ts">      const path = requestPath(url);
+      if (
+        path[0] === "agent" &amp;&amp;
+        path[2] === "thread" &amp;&amp;
+        (path[4] === "turn" || (path[4] === "event" &amp;&amp; path[5] === "watch"))
+      ) {
+        let name: string;
+        try {
+          name = threadObjectName(env.ACCOUNT_ID, path[1], path[3]);
+        } catch (error) {
+          return Response.json({ error: String(error) }, { status: 400 });
+        }
+        return await env.THREADS.getByName(name).handleRequest(request);
+      }
+      return await env.PROVIDERS.getByName(env.ACCOUNT_ID).handleRequest(
+        request,
+      );</code></pre>
+</figure>
+
+<p>Inside a thread object the Rust state is <em>not</em> a <code>BasicExoHarness</code>: <code>WorkerRuntime::new(.., thread = true)</code> builds an <code>HttpExoHarness</code> over <code>AccountTransport</code>, which turns every store call into <code>HostRequest::AccountRequest</code> &rarr; the account object's <code>requestExo</code> RPC, and event watches into DO RPC <code>Subscribe</code>/<code>Subscription</code> calls. The account object (<code>thread = false</code>) holds the real <code>BasicExoHarness::hosted(HostStorage, VAULT_KEY, ..)</code>. Both build their own <code>StoredTurnCoordinator</code>; the queue state is saved through the DO's storage with an alarm flag so acceptance and the recovery alarm are one atomic write before the 202. <span class="src">crates/worker-runtime/src/lib.rs:70-125</span> <span class="src">crates/worker-runtime/src/turn_queue.rs:38-60</span> <span class="src">exoharness/cloudflare/src/provider.ts:10-30</span> <span class="src">exoharness/cloudflare/src/provider.ts:58-115</span></p>
+
+<h3 id="cloudflare-gaps">What is and is not implemented there</h3>
+<table>
+  <thead><tr><th>Capability</th><th>Status on Workers</th></tr></thead>
+  <tbody>
+    <tr><td>Harnesses</td><td><code>basic</code> and <code>codex</code> only (<code>worker_agent_config</code> rejects the rest, plus custom tools, adapters and tool creation). The Codex TS harness is imported directly into the Worker bundle (<code>createCodexHarness</code>), not spawned via Node. <span class="src">crates/worker-runtime/src/execution.rs:46-60</span> <span class="src">exoharness/cloudflare/src/runtime-io.ts:4</span></td></tr>
+    <tr><td>Model calls</td><td><code>WorkerModel</code> sends <code>HostRequest::Model</code> to JS (OpenAI-compatible Responses). It completes whole responses, so streaming is enabled only for the TypeScript harness kind. <span class="src">crates/worker-runtime/src/execution.rs:82-92</span> <span class="src">crates/worker-runtime/src/http.rs:30-33</span></td></tr>
+    <tr><td>Sandboxes</td><td>Cloudflare Containers only; egress is a Worker-side proxy that asks Rust for credential headers (<code>ProxyHeaders</code>). <span class="src">exoharness/cloudflare/src/network.ts</span></td></tr>
+    <tr><td>Storage</td><td>values over 64 KiB spill to R2, smaller stay in DO SQLite (the same threshold is applied to the queue blob). <span class="src">crates/worker-runtime/src/turn_queue.rs:55</span></td></tr>
+    <tr><td>Auth model</td><td>shared by all approved callers: "per-user authorization is not implemented". <span class="src">exoharness/cloudflare/README.md</span></td></tr>
+    <tr><td>Recovery</td><td>model calls can repeat after a crash; tools with ambiguous outcomes fail rather than replay; not exactly-once.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: poll-driven Rust futures instead of a runtime in wasm</p>
+<p>Rather than shipping an async runtime into wasm, <code>poll()</code> drains a task list, polls a <code>FuturesUnordered</code> in a loop until nothing woke, and returns the new host calls as data. The <code>Host</code> struct doubles as the <code>RuntimeHost</code> (spawn/sleep) and as an <code>ArcWake</code>, so a reply arriving from JS re-arms the loop. The result: the same <code>LocalProvider</code> code that runs with Tokio natively runs unchanged in a DO, and the JS side is a thin, testable switch statement. <span class="src">crates/worker-runtime/src/lib.rs:200-243</span> <span class="src">crates/worker-runtime/src/host.rs:133-150</span> <span class="src">exoharness/cloudflare/src/runtime.ts:49-183</span></p></div>
+
+<div class="callout surprise"><p class="callout-title">The pending-watch hold keeps a Durable Object resident</p>
+<p>While any operation is pending (for example an SSE read), the JS wrapper hands a never-resolving promise to <code>ctx.waitUntil</code> so the object is not evicted and its in-memory progress broadcast subscription survives; disconnecting aborts the watch and releases the hold. This is why ephemeral streaming chunks work at all on a platform that otherwise evicts idle objects. <span class="src">exoharness/cloudflare/src/runtime.ts:145-158</span></p></div>
+
+<h2 id="trust">Trust boundaries</h2>
+
+<p>The substrate is trusted; what the model and its code do is not. Concretely:</p>
+
+<table>
+  <thead><tr><th>Component</th><th>Where it runs</th><th>Trust</th></tr></thead>
+  <tbody>
+    <tr><td><code>BasicExoHarness</code>, event log, vault decryption (AES-GCM master key), <code>AccessPolicy</code> checks</td><td>host process (or the account DO)</td><td><strong>Trusted.</strong> Secrets are only ever decrypted here. <span class="src">crates/exoharness/src/access.rs</span></td></tr>
+    <tr><td><code>Runtime</code>, <code>LocalProvider</code>, turn queue, permission checks, <code>BasicExecutor</code> / <code>RlmExecutor</code> loops</td><td>host process</td><td><strong>Trusted.</strong></td></tr>
+    <tr><td>Model calls (<code>RouterModelClient</code>), MCP client connections (<code>connect_mcp</code>), previews proxy</td><td>host process</td><td><strong>Trusted</strong>; model credentials come from vaults, and a missing credential fails instead of falling back to host env keys. <span class="src">crates/executor/src/native/managed_executor.rs:66-68</span></td></tr>
+    <tr><td>TypeScript harness module and tool modules (<code>runner.ts</code>)</td><td><em>host</em> machine, as a <code>node</code> child, <strong>not</strong> in the sandbox</td><td><strong>Trusted code.</strong> The docs say loading one is a trust decision; there is no capability sandbox around the module, and it can send arbitrary <code>exo_request</code>s that <code>ExoHarnessServer</code> will serve. <span class="src">website/docs-src/architecture/harnesses.md</span> <span class="src">crates/executor/src/native/typescript.rs:461</span></td></tr>
+    <tr><td>Egress proxy / credential substitution</td><td>on the VM host, outside the sandbox (Worker-side proxy on Cloudflare)</td><td><strong>Trusted.</strong> Swaps placeholder secrets for real ones only for destinations the secret's policy allows. <span class="src">crates/exoharness/src/egress/mod.rs:1-6</span> See <a href="egress-and-vaults.html">Egress &amp; vaults</a>.</td></tr>
+    <tr><td>Shell commands, Codex / Claude Code / Pi native processes, agent-written tools</td><td>inside the thread's <strong>sandbox</strong> (smolvm / firecracker / docker / hosted)</td><td><strong>Untrusted.</strong> Sees placeholder credentials; network is policy-limited. Codex is launched with <code>startSandboxProcess</code> running <code>codex app-server --listen stdio://</code>. <span class="src">exoharness/typescript/codex/harness.ts:261</span> <span class="src">exoharness/typescript/codex/harness.ts:1495</span></td></tr>
+    <tr><td>Host mounts</td><td>real host files exposed to the sandbox</td><td>A read-only mount still lets the agent read it; a raw key in a mount defeats substitution. <span class="src">website/docs-src/architecture/sandboxes.md</span></td></tr>
+  </tbody>
+</table>
+
+<div class="callout surprise"><p class="callout-title">The "harness" that Codex/Claude Code run under is host-side glue; the agent is in the sandbox</p>
+<p>It is easy to assume a Codex preset runs Codex "inside Exo's process". It does not: the TS harness module is the trusted <em>adapter</em> (it translates Codex app-server messages into Exo events and handles recovery), while the Codex binary runs in the sandbox and talks to the adapter over stdio via the host's <code>start_sandbox_process</code> bridge. That is why harness replacement keeps the thread (state lives in the exoharness) but recovery quality still depends on the adapter. <span class="src">exoharness/typescript/codex/harness.ts:255-270</span> <span class="src">crates/executor/src/typescript_runtime.rs:539-560</span></p></div>
+
+<div class="callout warn"><p class="callout-title">Queue ownership is not a write fence</p>
+<p>The design doc is explicit: a turn lease token does not fence event or tool writes; "TypeScript turn requests carry durable turn ids, but there is no separate turn lease token". Single-host exclusion comes from local session leases (<code>with_local_sessions</code>) and the stored coordinator requiring one owner, not from per-write fencing. A competing-worker coordinator must bring its own atomicity and report lost ownership through the control watch. <span class="src">exoharness/docs/design/architecture.md</span> <span class="src">crates/exoharness/src/turn_coordinator.rs:113-135</span> <span class="src">crates/cli/src/providers.rs:55-58</span></p></div>
+
+<h2 id="next">Where to go next</h2>
+<ul>
+  <li><a href="data-model.html">Data model</a> &mdash; event variants, ids, artifacts, snapshots in the log, the stored turn-queue state.</li>
+  <li><a href="harnesses.html">Harnesses</a> and <a href="native-harnesses.html">Native harnesses</a> &mdash; the TS API, <code>runner.ts</code>, Codex/Claude Code/Pi adapters, recovery.</li>
+  <li><a href="sandboxes.html">Sandboxes</a> &mdash; providers, lifecycle, snapshots, firecracker.</li>
+  <li><a href="egress-and-vaults.html">Egress &amp; vaults</a> &mdash; the proxy, destination policy, OAuth refresh.</li>
+  <li><a href="managed-agents.html">Managed agents</a> &mdash; definitions, permissions, Slack adapter.</li>
+  <li><a href="cli-and-server.html">CLI &amp; server</a> &mdash; commands, TUI, <code>exo run --serve</code>, providers.</li>
+  <li><a href="tools-and-mcp.html">Tools &amp; MCP</a>, <a href="reference.html">Reference</a>.</li>
+</ul>
+
+</main>
+<aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/wiki.js"></script>
+</body>
+</html>

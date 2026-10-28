@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harnesses &amp; executors · Exo internals</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav id="nav"></nav>
+<main>
+<header>
+  <div class="kicker">Runtime internals</div>
+  <h1>Harnesses &amp; executors</h1>
+  <p class="lede">The harness contract and the engine that runs it: how a submitted turn becomes a queue entry, a journaled turn, and a call into a Rust executor or a long-lived Node process speaking line-delimited JSON; how an interrupted turn is recovered; and where the "semantics vs. infrastructure" line is actually drawn in code.</p>
+</header>
+
+<h2>Three things called "harness"</h2>
+<p>The word is overloaded in the source. Before reading code it helps to keep three layers apart; the docs' "harness" (<span class="src">website/docs-src/architecture/harnesses.md</span>) is only the last one.</p>
+
+<table>
+  <thead><tr><th>Name in code</th><th>Where</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>trait Harness&lt;T&gt;</code></td>
+      <td><span class="src">crates/exoharness/src/harness.rs:86-101</span></td>
+      <td>A tiny command/event bus: <code>submit(StartTurn | CancelTurn | SuspendTurn | ResumeTurn)</code> in, <code>HarnessEvent</code> out. It knows nothing about models or tools. The only real implementation is <code>ExecutorHarness</code> (and <code>LocalProvider</code>, which wraps it).</td>
+    </tr>
+    <tr>
+      <td><code>trait HarnessExecutor</code></td>
+      <td><span class="src">crates/executor/src/harness_executor.rs:80-188</span></td>
+      <td>The real semantic seam on the Rust side: <code>execute_turn</code> / <code>resume_turn</code> plus capability flags. Implemented by <code>BasicExecutor</code>, <code>RlmExecutor</code>, <code>TypeScriptExecutor</code>, and the router <code>ManagedExecutor</code>.</td>
+    </tr>
+    <tr>
+      <td><code>interface TypeScriptHarness</code></td>
+      <td><span class="src">exoharness/typescript/harness/index.ts:438-444</span></td>
+      <td>What a user writes: a module exporting <code>runTurn(context)</code> and optionally <code>resumeTurn(context)</code>. Codex, Claude Code, Pi and Cursor are modules of this shape (<a href="native-harnesses.html">native-harnesses</a>).</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>Config selects the executor through <code>AgentHarnessKind</code> (<span class="src">crates/executor/src/executor_types.rs:45-53</span>): <code>Basic</code>, <code>Rlm</code>, <code>TypeScript</code>, <code>Exo</code>. The string in an agent definition (<code>harness: codex</code>, <code>harness: ./my.ts</code>) is resolved by <code>resolve_harness</code> in <span class="src">crates/executor/src/managed_agents/config.rs:130-199</span>: <code>basic</code> and <code>rlm</code> map to the Rust executors, the presets <code>codex / claude-code / cursor / cursor-sdk / pi</code> map to bundled TypeScript modules under <code>exoharness/examples/typescript/</code> (<span class="src">crates/executor/src/managed_agents/config.rs:11-50</span>), and anything that looks like a path ending in <code>.ts/.tsx/.js/.mjs/.cjs</code> becomes <code>AgentHarnessKind::TypeScript</code> with that module.</p>
+
+<h2>Layer cake: from <code>send</code> to a harness call</h2>
+
+<pre class="diagram">
+Runtime::start_turn (harness_executor.rs:602)
+  |  HarnessCommand::StartTurn(ProviderTurn)
+  v
+LocalProvider  --accept_local_turn-->  TurnQueue::enqueue(TurnWork)      [durable if coordinator is]
+  |                                      (turn_queue.rs:357)
+  |  spawn_queue: claim(thread) -> lease -> run_queue loop (turn_queue.rs:529,581)
+  v
+open_queue_head: journal says Unstarted | Running | Finished              (turn_queue.rs:706)
+  |  Runtime::execute_turn(work, recovering)
+  v
+start_local_turn: prepare_conversation, begin_turn(+TurnWork event)       (harness_executor.rs:630)
+  |  harness.submit(StartTurn(ExecutorTurn))
+  v
+ExecutorHarness::submit: spawn task, race executor vs cancel signal       (harness_adapter.rs:141)
+  |  executor.execute_turn(...)  or  executor.resume_turn(...)
+  v
+ManagedExecutor -> per-thread cached { BasicExecutor | RlmExecutor | TypeScriptExecutor }
+                                                                          (managed_executor.rs:73)
+  |                                              |
+  |  Rust loop, in-process                       |  node --import tsx runner.ts &lt;module&gt;
+  v                                              v     stdin/stdout, one JSON object per line
+  turn.add_events(..)  &lt;---- every event flows through HarnessTurn ----&gt;  context.exoharness.current.turn.addEvents
+  v
+HarnessEvents -> TurnHandle::add_events -> stream relay + Checkpoint      (harness_events.rs:189)
+  v
+outcome -> finalizer: completion marker, then turn.finish() (TurnEnded)   (harness_executor.rs:824)
+</pre>
+
+<p>Two things worth noticing immediately. First, the Rust executors and the TypeScript runner write to the same <code>TurnHandle</code>: the event log is the only state both agree on. Second, with <code>LocalProvider</code> the <code>Runtime</code> never calls an executor directly; even a single in-process <code>send</code> goes through an (in-memory or durable) queue, so there is one code path for first runs, queued runs and recovery.</p>
+
+<h2>The turn lifecycle, as implemented</h2>
+
+<h3>1. Admission and queueing</h3>
+<ol class="steps">
+  <li><code>Runtime::start_turn</code> submits <code>HarnessCommand::StartTurn(ProviderTurn)</code> and waits on a oneshot receipt (<span class="src">crates/executor/src/harness_executor.rs:602-628</span>). <code>LocalProvider::submit</code> forwards it to <code>accept_local_turn</code> (<span class="src">crates/executor/src/provider.rs:408-427</span>).</li>
+  <li><code>accept_local_turn</code> snapshots the merged agent config (agent config artifact + thread model override + thread harness override, <span class="src">crates/executor/src/harness_executor.rs:914-930</span>) and the conversation config into a <code>TurnWork</code>, allocates the <code>TurnRecord</code> (<code>Uuid7::now()</code>, reusing the caller's <code>session_id</code> if any), registers the stream observer <em>before</em> enqueueing so a live drain cannot miss it, then calls <code>coordinator.enqueue</code> (<span class="src">crates/executor/src/turn_queue.rs:388-423</span>). Idempotency keys come back as <code>accepted.duplicate</code> and replay the finished result from the journal (<span class="src">crates/executor/src/turn_queue.rs:438-465</span>).</li>
+  <li><code>spawn_queue</code> calls <code>coordinator.claim(thread)</code>; only the holder of the per-thread <code>TurnLease</code> drains that thread, so turns on one thread are strictly FIFO and cross-process safe if the coordinator is (<span class="src">crates/executor/src/turn_queue.rs:529-579</span>). The queue contract (enqueue / claim / peek / start / set_suspended / acknowledge / release_if_idle) is <code>TurnQueue</code> in <span class="src">crates/exoharness/src/turn_coordinator.rs:91-169</span>.</li>
+  <li><code>run_queue</code> loops: peek the head, <code>start</code> it (which also returns a control watch stream of <code>Run | Cancel | Suspend</code>), open it, then <code>select!</code> between control updates (forwarded to the harness as <code>Resume/Cancel/Suspend</code> commands) and the execution stream (<span class="src">crates/executor/src/turn_queue.rs:581-704</span>). After the stream ends it asks the <em>journal</em>, not the stream, whether the turn finished.</li>
+</ol>
+
+<div class="callout warn">
+  <p class="callout-title">Durable queue is opt-in</p>
+  <p><code>LocalProvider::with_host</code> builds <code>StoredTurnCoordinator::in_memory()</code> (<span class="src">crates/executor/src/provider.rs:131-157</span>), so embedders using <code>LocalProvider::basic / rlm / typescript</code> get a queue that dies with the process. The CLI replaces it with the storage-backed one via <code>.with_turn_coordinator(state.turn_coordinator())</code> (<span class="src">crates/cli/src/providers.rs:90-93</span>); the worker runtime does the same (<span class="src">crates/worker-runtime/src/lib.rs:106-120</span>). "Exo durably queues submitted turns" in the architecture doc is true of the shipped binaries, not of the library default.</p>
+</div>
+
+<h3>2. Journal status decides what "start" means</h3>
+<p><code>open_queue_head</code> never trusts in-memory state. It derives <code>JournalStatus</code> from three event kinds on the turn: <code>TurnStarted</code> without <code>TurnEnded</code> is <code>Running</code>, neither is <code>Unstarted</code>, <code>TurnEnded</code> is <code>Finished</code> (with an <code>Error</code> event meaning failed) (<span class="src">crates/executor/src/turn_queue.rs:849-892</span>). Then:</p>
+<ul>
+  <li><code>Unstarted</code>: run <code>head.work</code> from the queue entry with <code>recovering = false</code>.</li>
+  <li><code>Running</code>: there is no in-memory work to hand over, so the <code>TurnWork</code> is parsed back out of the turn's own events (<code>TurnWork::from_events</code>) and executed with <code>recovering = true</code> (<span class="src">crates/executor/src/turn_queue.rs:794-801</span>).</li>
+  <li>An <code>Error</code> event or the completion marker is already present: do not run anything, just <code>finish()</code> (<span class="src">crates/executor/src/turn_queue.rs:731-742</span>).</li>
+</ul>
+<p>The work is in the log because <code>start_local_turn</code> commits it atomically with the turn start:</p>
+
+<figure class="code">
+  <figcaption><strong>Recovery state rides in the same write as <code>TurnStarted</code></strong> <span class="src">crates/executor/src/harness_executor.rs:745-762</span></figcaption>
+  <pre><code class="language-rust">let turn = if recovering {
+    thread.turn_handle(record).await?
+} else {
+    let work = TurnWork {
+        streaming,
+        agent_config: agent_config.clone(),
+        thread_config: thread_config.clone(),
+        request: request.clone(),
+    };
+    thread
+        .begin_turn(BeginTurnRequest {
+            turn: record,
+            new_session: request.session_id.is_none(),
+            input: request.input.clone(),
+            initial_events: vec![work.event()?],
+        })
+        .await?
+};</code></pre>
+</figure>
+<p><code>BeginTurnRequest.initial_events</code> is documented as "committed in the same write as TurnStarted and the input" (<span class="src">crates/exoharness/src/types.rs:397-406</span>); <code>work.event()</code> is a <code>Custom</code> event named <code>exo.runtime.turn_work</code> (<span class="src">crates/executor/src/harness_executor.rs:37-72</span>). A crash can therefore never leave a started turn without the configuration needed to resume it, and the configuration the turn <em>started</em> with is what recovery uses, even if the agent config changed in between.</p>
+
+<div class="callout idea">
+  <p class="callout-title">Idea worth stealing: write the recovery inputs into the journal atomically with the start marker</p>
+  <p>Instead of a side table of "in-flight jobs", the turn's own event stream carries <code>exo.runtime.turn_work</code>. Recovery is then a pure function of the log: find turns with <code>TurnStarted</code> and no <code>TurnEnded</code>, read the work event, call <code>resume_turn</code>. See <code>recovery_query</code> (<span class="src">crates/executor/src/harness_executor.rs:1296-1309</span>), which fetches exactly the five event kinds recovery needs.</p>
+</div>
+
+<h3>3. Preparing and starting execution</h3>
+<p><code>start_local_turn</code> (<span class="src">crates/executor/src/harness_executor.rs:630-895</span>) is the glue: marks the thread's queue owner active, lazily <code>init</code>s the harness with the <code>HarnessEvents</code> sink (once, via <code>OnceCell</code>), materializes filesystem resources and appends their locations to <code>agent_config.instructions</code> as a system message (only on non-recovery runs), calls <code>executor.prepare_conversation</code> (the "called once before each execute/resume, under the thread's turn lease" hook, <span class="src">crates/executor/src/harness_executor.rs:145-156</span>), calls <code>begin_turn</code> or <code>turn_handle</code>, registers the live turn, and submits an <code>ExecutorTurn</code> to <code>ExecutorHarness</code>.</p>
+
+<p><code>ExecutorHarness::submit</code> spawns a task that runs the executor future inside a <code>biased select!</code> against a <code>watch</code> channel carrying a <code>StopReason</code> (<code>Cancel</code>, <code>Shutdown</code>, <code>Suspend</code>), wraps the executor in <code>catch_unwind</code>, and converts the result to a <code>HarnessTurnOutcome</code> (<span class="src">crates/executor/src/harness_adapter.rs:141-325</span>). On cancel, shutdown or suspend it also calls <code>executor.cancel_turn</code> (for TypeScript that kills the runner process). It then emits <code>TurnFinished</code> and <code>ExecutionStopped</code> into the sink.</p>
+
+<h3>4. Events are the only output channel</h3>
+<p>Whatever an executor appends goes through <code>HarnessTurn::add_events</code> (<span class="src">crates/executor/src/harness_events.rs:96-126</span>), which emits <code>HarnessEvent::TurnEvents</code>; <code>HarnessEvents</code> appends to the real <code>TurnHandle</code>, then synthesizes the live stream: <code>Messages</code>, <code>ToolRequested</code>, <code>ToolResult</code>, <code>LinguaStreamChunk</code> become <code>ExecutionStreamEvent</code>s, followed by a <code>Checkpoint { event_id }</code> after each persisted batch (<span class="src">crates/executor/src/harness_events.rs:189-261</span>). Clients that disconnect resume with <code>watch_turn(after = last checkpoint)</code>, which replays the same event format from storage (<span class="src">crates/executor/src/harness_executor.rs:540-591</span>); live streaming and replay share <code>turn_stream</code> (<span class="src">crates/executor/src/harness_events.rs:322-394</span>).</p>
+<p><code>HarnessTurn</code> also keeps a <code>pending_tools</code> set updated from <code>ToolRequested</code>/<code>ToolResult</code> acknowledgements. That set is the only piece of "tool semantics" the host infers from the event stream, and it exists to support one thing: a suspension boundary that waits until no tool call is in flight (<span class="src">crates/executor/src/harness_events.rs:46-73</span>).</p>
+
+<h3>5. Finalization</h3>
+<p>The finalizer task spawned at the end of <code>start_local_turn</code> awaits the outcome and maps it (<span class="src">crates/executor/src/harness_executor.rs:824-891</span>):</p>
+<table>
+  <thead><tr><th>Outcome</th><th>What gets written</th></tr></thead>
+  <tbody>
+    <tr><td><code>Completed</code></td><td>Looks for a <code>exo.runtime.turn_completed</code> custom event for this turn; adds it if the harness did not, then <code>turn.finish()</code> (appends <code>TurnEnded</code>).</td></tr>
+    <tr><td><code>Failed(e)</code> / <code>Cancelled</code></td><td><code>finalize_turn</code>: append <code>EventData::Error { message }</code> then <code>finish()</code> (<span class="src">crates/executor/src/shared.rs:6-25</span>). Cancel is just a failure with message "harness turn cancelled".</td></tr>
+    <tr><td><code>Suspended</code></td><td>No terminal event. Returns <code>TurnSuspended</code>; the journal stays <code>Running</code> and the queue entry stays at the head with control = Suspend.</td></tr>
+    <tr><td><code>Interrupted</code> (shutdown)</td><td>No terminal event, error "harness turn interrupted"; the next process start recovers it.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout idea">
+  <p class="callout-title">Idea worth stealing: a completion marker closes the answer-to-TurnEnded crash window</p>
+  <p>If the process dies after the final assistant message is persisted but before <code>TurnEnded</code>, a naive recovery would re-run the model. <code>BasicExecutor</code> commits the last response events <em>and</em> <code>exo.runtime.turn_completed</code> in one <code>add_events</code> call (<span class="src">crates/executor/src/basic.rs:197-205</span>); for harnesses that don't, the finalizer adds the marker itself. <code>open_queue_head</code> treats the marker as "just finish it" (<span class="src">crates/executor/src/turn_queue.rs:731-742</span>).</p>
+</div>
+
+<h2>Executors and their capabilities</h2>
+<p>Each executor advertises, per <code>AgentConfig</code>, what recovery operations are safe. The host enforces the rest.</p>
+
+<figure class="code">
+  <figcaption><strong>The executor seam: two entry points and three opt-in flags</strong> <span class="src">crates/executor/src/harness_executor.rs:92-103</span>, <span class="src">crates/executor/src/harness_executor.rs:170-187</span></figcaption>
+  <pre><code class="language-rust">fn can_resume_pending_approval(&amp;self, _config: &amp;AgentConfig) -&gt; bool {
+    false
+}
+
+fn can_reconcile_unresolved_tool_call(&amp;self, _config: &amp;AgentConfig) -&gt; bool {
+    false
+}
+
+/// Whether unfinished execution can be suspended and resumed.
+fn can_suspend_turn(&amp;self, _config: &amp;AgentConfig) -&gt; bool {
+    false
+}
+
+// ...
+
+// A harness must opt in after it can reconstruct execution progress without
+// repeating tool or sandbox side effects from the interrupted turn.
+async fn resume_turn(
+    &amp;self,
+    _agent: &amp;dyn AgentHandle,
+    // ... same arguments as execute_turn ...
+) -&gt; Result&lt;()&gt; {
+    anyhow::bail!(
+        "{} harness cannot safely resume an unfinished turn",
+        self.name()
+    )
+}</code></pre>
+</figure>
+
+<table>
+  <thead><tr><th><code>AgentHarnessKind</code></th><th>Executor</th><th>Resume pending approval</th><th>Suspend</th><th>Reconcile unresolved tool calls</th><th><code>resume_turn</code></th></tr></thead>
+  <tbody>
+    <tr><td><code>Basic</code></td><td><code>BasicExecutor</code> (Rust loop)</td><td>yes</td><td>yes</td><td>no</td><td>implemented (<code>load_turn_progress</code>)</td></tr>
+    <tr><td><code>Rlm</code></td><td><code>RlmExecutor</code> (Rust + Boa JS)</td><td>no</td><td>no</td><td>no</td><td>default: bails</td></tr>
+    <tr><td><code>TypeScript</code></td><td><code>TypeScriptExecutor</code> (node runner)</td><td>no</td><td>yes</td><td>yes</td><td>forwards to module's <code>resumeTurn</code> or fails</td></tr>
+    <tr><td><code>Exo</code></td><td><code>TypeScriptExecutor</code> + <code>ExoToolRuntime</code></td><td>no</td><td>no (as reported by the router)</td><td>no (as reported by the router)</td><td>forwards to module's <code>resumeTurn</code></td></tr>
+  </tbody>
+</table>
+<p>Table sources: <span class="src">crates/executor/src/native/managed_executor.rs:73-102</span> (kind to executor), <span class="src">crates/executor/src/native/managed_executor.rs:132-145</span> (capability routing), <span class="src">crates/executor/src/basic.rs:440-446</span>. <code>ManagedExecutor</code> is the production router: it keeps one cached executor per thread (<code>ExecutorCache</code>, rebuilt if the harness kind or module path changes, refuses to reconfigure a busy thread, <span class="src">crates/executor/src/executor_cache.rs:44-110</span>) together with the thread's connected MCP servers (<a href="tools-and-mcp.html">tools-and-mcp</a>). Model access for the Rust executors is the <code>ModelClient</code> trait (<span class="src">crates/executor/src/executor_types.rs:203-207</span>), implemented by <code>RouterModelClient</code> (see <a href="native-harnesses.html">native-harnesses</a>).</p>
+
+<h2>The built-in Rust loop (<code>BasicExecutor</code>)</h2>
+<p>The Rust "basic" harness is the smallest complete example of the contract: rebuild the prompt from events every round, call the model, append, run tools, append results, repeat until a response has no tool calls.</p>
+
+<figure class="code">
+  <figcaption><strong>The loop: durable round marker, then tools, then repeat</strong> <span class="src">crates/executor/src/basic.rs:160-215</span> (trimmed)</figcaption>
+  <pre><code class="language-rust">for round in start_round.. {
+    let (tool_requests, resume_first_approval) = if let Some(saved_requests) =
+        pending_tool_requests.take()
+    {
+        // This model round was already committed; finish its tools before
+        // applying the limit to the next model call.
+        (saved_requests, resume_first_approval)
+    } else {
+        if agent_config
+            .max_tool_round_trips
+            .is_some_and(|limit| round &gt; limit)
+        {
+            return Ok(());
+        }
+
+        let messages = self
+            .materialize_prompt_history(conversation, &amp;agent_config.instructions)
+            .await?;
+        // ... build_model_request, add tool definitions ...
+        let response = complete_model_round(/* ... */).await?;
+
+        let mut events = model_response_events(response, &amp;self.pricing);
+        let tool_requests = collect_tool_requests(&amp;events);
+        if tool_requests.is_empty() {
+            // Commit the final answer and completion marker together for recovery.
+            events.push(EventData::Custom {
+                event_type: crate::harness_executor::RUNTIME_TURN_COMPLETED.to_owned(),
+                payload: serde_json::Value::Null,
+            });
+            turn.add_events(events).await?;
+            return Ok(());
+        }
+        events.insert(
+            0,
+            EventData::Custom {
+                event_type: BASIC_TOOL_ROUND.to_owned(),
+                payload: serde_json::to_value(BasicToolRound { round })?,
+            },
+        );
+        turn.add_events(events).await?;
+        (tool_requests, false)
+    };
+
+    self.execute_tool_round(/* ... */, tool_requests).await?;
+}</code></pre>
+</figure>
+
+<ul>
+  <li>The prompt is <em>derived</em>, not stored: <code>materialize_prompt_history</code> reads <code>messages / tool_requested / tool_result / frontend_tool_response</code> events with a per-conversation incremental cursor cache (<span class="src">crates/executor/src/basic.rs:80-133</span>). Tool calls left dangling at a batch boundary get a synthetic "tool execution did not complete before the previous turn ended" result (<span class="src">crates/executor/src/message_history.rs:145</span>; the TypeScript twin is <span class="src">exoharness/typescript/harness/index.ts:679-752</span>).</li>
+  <li>A tool error does not end the turn: it becomes <code>{"ok": false, "error": ...}</code> as the tool result (<span class="src">crates/executor/src/basic.rs:289-303</span>). Each tool is authorized (<code>permissions::authorize</code>) then executed; client ("frontend") tools are routed to <code>frontend_tools::execute</code> instead of <code>ToolRuntime</code>.</li>
+  <li><code>exo.basic.tool_round</code> is written <em>before</em> the round's tool requests. On recovery <code>load_turn_progress</code> replays only <code>tool_round / tool_requested / tool_result</code> events, finds the first still-unresolved request and resumes the tool phase of that round; it never calls the model again for a round already committed, because "calling the model again could produce a different set of tool calls" (<span class="src">crates/executor/src/basic.rs:319-427</span>). It refuses unless the unresolved call is a client tool or has a matching saved approval request.</li>
+</ul>
+
+<h2>TypeScript harnesses: process and wire protocol</h2>
+
+<h3>How a module is loaded and run</h3>
+<p>There is no HTTP and no JSON-RPC 2.0. <code>TypeScriptExecutor</code> spawns a Node child per <em>(conversation id, module path)</em> and talks to it over stdin/stdout with one JSON object per line, discriminated by a <code>kind</code> tag and correlated by numeric <code>id</code> where a reply is expected.</p>
+
+<ol class="steps">
+  <li><code>run_turn</code> checks the module file exists, builds the key <code>"{conversation_id}:{module_path}"</code>, and gets or starts a runner (<span class="src">crates/executor/src/native/typescript.rs:179-248</span>).</li>
+  <li><code>TypeScriptRunnerProcess::start</code> runs <code>node --import tsx exoharness/typescript/harness/runner.ts &lt;module&gt;</code> with <code>current_dir(workspace_root)</code>, <code>kill_on_drop(true)</code> and piped stdio (<span class="src">crates/executor/src/native/typescript.rs:286-333</span>). The <code>workspace_root</code> for the built-in constructors is <code>CARGO_MANIFEST_DIR/../..</code>, resolved at compile time (<span class="src">crates/executor/src/native/typescript.rs:556-561</span>).</li>
+  <li><code>runner.ts</code> <code>import()</code>s the module once, accepts a default export or a named <code>harness</code> export, and requires <code>runTurn</code> to be a function (<span class="src">exoharness/typescript/harness/runner.ts:234-249</span>, <span class="src">exoharness/typescript/harness/runner.ts:278-293</span>).</li>
+  <li>For each turn the host sends an <code>init</code> message (a <code>TypeScriptInitPayload</code>: agent, conversation, turn record, both configs, the <code>SendRequest</code>, <code>streaming</code>, <code>recovering</code>, tool definitions, native MCP servers; <span class="src">crates/executor/src/typescript_runtime.rs:522-535</span>). The runner builds a <code>TurnContext</code> from it (<span class="src">exoharness/typescript/harness/client.ts:1103-1224</span>) and calls <code>runTurn</code> or <code>resumeTurn</code>.</li>
+  <li>The runner replies <code>done</code> or <code>error</code>, then loops waiting for the next <code>init</code>. The Node process and any module-level state stay warm across turns of the same conversation.</li>
+</ol>
+
+<figure class="code">
+  <figcaption><strong>The wire protocol is two serde-tagged enums</strong> <span class="src">crates/executor/src/native/typescript.rs:563-585</span>, <span class="src">crates/executor/src/native/typescript.rs:658-677</span></figcaption>
+  <pre><code class="language-rust">#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum HostToGuestMessage {
+    Init {
+        payload: Box&lt;TypeScriptInitPayload&gt;,
+    },
+    Shutdown,
+    RuntimeResponse {
+        id: u64,
+        ok: bool,
+        payload: Option&lt;RuntimeResponsePayload&gt;,
+        error: Option&lt;String&gt;,
+    },
+    ExoResponse {
+        id: u64,
+        ok: bool,
+        response: Box&lt;Option&lt;ExoResponse&gt;&gt;,
+        error: Option&lt;String&gt;,
+    },
+    RuntimeEvent {
+        event: RuntimeEvent,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum GuestToHostMessage {
+    RuntimeRequest {
+        id: u64,
+        request: RuntimeRequest,
+    },
+    ExoRequest {
+        id: u64,
+        request: Box&lt;ExoRequest&gt;,
+    },
+    StreamEvent {
+        event: TypeScriptStreamEvent,
+    },
+    Done,
+    Error {
+        message: String,
+        stack: Option&lt;String&gt;,
+    },
+}</code></pre>
+</figure>
+
+<p>The TypeScript mirror is <code>HostToGuestMessage</code> / <code>GuestToHostMessage</code> in <span class="src">exoharness/typescript/harness/client.ts:411-435</span>; <code>wire.ts</code> only converts snake_case config records to camelCase (<span class="src">exoharness/typescript/harness/wire.ts:60-120</span>).</p>
+
+<table>
+  <thead><tr><th>Direction</th><th><code>kind</code></th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td>host to guest</td><td><code>init</code></td><td>Start (or recover) one turn.</td></tr>
+    <tr><td>host to guest</td><td><code>runtime_response</code> / <code>exo_response</code></td><td>Answer to a numbered request (<code>ok</code>, payload or error string).</td></tr>
+    <tr><td>host to guest</td><td><code>runtime_event</code></td><td>Unsolicited sandbox-process <code>output</code> / <code>exit</code> / <code>error</code> (<span class="src">crates/executor/src/typescript_runtime.rs:599-615</span>).</td></tr>
+    <tr><td>host to guest</td><td><code>shutdown</code></td><td>Declared and handled by <code>runner.ts</code>, but the Rust side never sends it (see surprises).</td></tr>
+    <tr><td>guest to host</td><td><code>runtime_request</code></td><td><code>authorize_tool</code>, <code>execute_tool</code>, <code>start_sandbox_process</code>, <code>write_sandbox_process_stdin</code>, <code>close_sandbox_process_stdin</code>, <code>close_sandbox_process</code> (<span class="src">crates/executor/src/typescript_runtime.rs:537-562</span>).</td></tr>
+    <tr><td>guest to host</td><td><code>exo_request</code></td><td>The <code>exoharness::protocol::Request</code> API (<span class="src">crates/exoharness/src/protocol.rs:66</span>). The TypeScript client's <code>RawExoRequest</code> covers agents, conversations, events, artifacts, turns, vaults and secrets (<span class="src">exoharness/typescript/harness/client.ts:223-386</span>).</td></tr>
+    <tr><td>guest to host</td><td><code>stream_event</code></td><td>Ephemeral UI events: <code>status</code>, <code>first_chunk</code>, <code>text_delta</code>, <code>tool_call</code>, <code>tool_result</code>.</td></tr>
+    <tr><td>guest to host</td><td><code>done</code> / <code>error</code></td><td>Turn end. <code>done</code> returns <code>Ok(())</code>; <code>error</code> becomes <code>bail!("typescript harness failed: ...")</code> with the JS stack.</td></tr>
+  </tbody>
+</table>
+
+<h3>Host-side multiplexing</h3>
+<p>The host's turn loop is a single <code>biased select!</code> over finished tool futures, the next stdout line, and a 100 ms child-exit poll (<span class="src">crates/executor/src/native/typescript.rs:414-505</span>). Details that matter:</p>
+<ul>
+  <li><code>runtime_request</code>s are pushed into a <code>FuturesUnordered</code> and answered whenever they finish, so a tool waiting on a human approval does not block output, other requests or noticing that the runner died. There is a test for exactly this (<span class="src">crates/executor/src/native/typescript.rs:1252-1345</span>).</li>
+  <li><code>exo_request</code>s are awaited inline. A <code>TurnAddEvents</code> whose agent, conversation, session and turn ids all match the running turn is routed to the host's <code>TurnHandle</code> (i.e. through <code>HarnessTurn</code>, so pending-tool tracking and the stream relay apply); any other request goes to <code>ExoHarnessServer::handle_request</code> (<span class="src">crates/executor/src/native/typescript.rs:450-462</span>).</li>
+  <li>A line that fails to decode is not fatal. If the lenient <code>GuestMessagePreview</code> can still recover <code>kind</code> and <code>id</code>, the host replies with <code>ok: false</code> so the guest's pending promise rejects; otherwise the line is logged and dropped (<span class="src">crates/executor/src/native/typescript.rs:508-528</span>, <span class="src">crates/executor/src/native/typescript.rs:587-632</span>).</li>
+  <li>The runtime half (<code>TypeScriptRuntime</code>) is deliberately transport-free: "Hosts only transport runner requests and events" (<span class="src">crates/executor/src/typescript_runtime.rs:1-2</span>). The Cloudflare Durable Object host reuses it from WASM and supplies a different <code>HarnessClient</code> to <code>createTurnContext</code> instead of stdio (<span class="src">exoharness/cloudflare/src/runtime-io.ts:420-465</span>). <code>HarnessClient</code> (<span class="src">exoharness/typescript/harness/client.ts:449-458</span>) is the real TypeScript transport abstraction.</li>
+</ul>
+
+<h3>What <code>runTurn</code> gets</h3>
+<figure class="code">
+  <figcaption><strong>The whole harness interface</strong> <span class="src">exoharness/typescript/harness/index.ts:408-444</span> (stream helpers elided)</figcaption>
+  <pre><code class="language-ts">export interface TurnContext {
+  readonly mcpServers: NativeMcpServer[];
+  readonly tools: ToolDefinition[];
+  readonly agentConfig: AgentConfig;
+  readonly conversationConfig: ConversationConfig;
+  readonly request: SendRequest;
+  readonly streaming: boolean;
+  readonly braintrustParent?: string | null;
+  readonly exoharness: ExoHarness;
+  authorizeTool(request: ToolRequest): Promise&lt;void&gt;;
+  executeTool(request: ToolRequest, toolCallId?: string): Promise&lt;ToolResult&gt;;
+  startSandboxProcess(
+    request: SandboxProcessStartRequest,
+  ): Promise&lt;SandboxProcess&gt;;
+  executePendingTools(toolCalls: PendingToolCall[]): Promise&lt;EventData[]&gt;;
+  stream: { /* status, firstChunk, text, toolCall, toolResult */ };
+}
+
+export interface TypeScriptHarness {
+  tools?: ToolModuleExport;
+  nativeToolApprovals?: boolean;
+  reconcileUnresolvedToolCalls?: boolean;
+  runTurn(context: TurnContext): Promise&lt;void&gt;;
+  resumeTurn?(context: TurnContext): Promise&lt;void&gt;;
+}</code></pre>
+</figure>
+
+<p>There is no <code>beginTurn</code> in the TypeScript API. The host has already begun the turn; the harness receives it as <code>context.exoharness.current.turn</code>, a <code>Turn</code> with <code>addEvents</code> and <code>writeArtifact*</code> and <em>no</em> <code>finish()</code> (<span class="src">exoharness/typescript/harness/index.ts:378-398</span>). (The wire type does include a <code>turn_finish</code> request, <span class="src">exoharness/typescript/harness/client.ts:380</span>, served by <span class="src">crates/exoharness/src/server.rs:550</span>, but no TS API method sends it.) Returning from <code>runTurn</code> sends <code>done</code>; the host adds the completion marker and <code>TurnEnded</code>. A harness reads history through <code>context.exoharness.current.conversation.getEvents()</code>, usually via <code>materializePromptMessages</code>, and writes <code>messages</code>, <code>tool_requested</code>, <code>tool_result</code> events with the helpers in <code>index.ts</code> (<code>messagesEvent</code>, <code>toolRequestedEvent</code>, <code>toolResultEvent</code>, <code>appendCustomEvent</code>).</p>
+
+<p>The stock loop, <code>runResponsesHarnessTurn</code> (<span class="src">exoharness/typescript/model-runtime/turn-loop.ts:34-217</span>), is the TypeScript twin of <code>BasicExecutor</code>: per round it rebuilds the tool registry, validates tool policies, materializes prompt messages from events, calls the Responses runtime (streaming through <code>context.stream.text</code> if <code>context.streaming</code>), appends response events, and for each tool call runs <code>tools.executePending</code> then appends the result events. It writes no round marker and defines no <code>resumeTurn</code>, so a <code>basic-harness.ts</code>-style module cannot be recovered (below). Hooks <code>instructions(context)</code> and <code>registerTools(registry, context)</code> are re-run every round, which is what the custom-harness tutorial uses to inject live context. Tool registry details, MCP and permissions: <a href="tools-and-mcp.html">tools-and-mcp</a>. Prompt text: <a href="prompts.html">prompts</a>.</p>
+
+<h3>Warm runners and reusable sandbox processes</h3>
+<p>The runner is cached in <code>TypeScriptExecutor.runners</code> and reused for the next turn of the same conversation. It is dropped (process killed) on: any failed turn, <code>cancel_turn</code> (called after cancel, shutdown and suspend), executor shutdown, or when a sandbox process the previous turn marked reusable is no longer running (<span class="src">crates/executor/src/native/typescript.rs:179-217</span>). A harness opts a child process into warm reuse with <code>startSandboxProcess({ command, reuseKey })</code>. The host records a <code>typescript_sandbox_process_reuse</code> custom event; the next runner (even after a service restart) finds the newest event for that key and sandbox, attaches to the still-running process from its latest cursor and reports <code>reused: true</code>. An exited newest generation is never resurrected by an older still-running one (<span class="src">crates/executor/src/typescript_runtime.rs:397-467</span>, with a regression test at <span class="src">crates/executor/src/typescript_runtime.rs:789-884</span>). This is what lets the Codex adapter keep a native app-server alive across turns and reconnect to it after a restart (<a href="native-harnesses.html">native-harnesses</a>).</p>
+
+<div class="callout surprise">
+  <p class="callout-title">Surprise: "shutdown" is a kill, and the shutdown message is dead code</p>
+  <p><code>HostToGuestMessage::Shutdown</code> exists on both sides, but nothing in the Rust crate ever constructs it (<span class="src">crates/executor/src/native/typescript.rs:569</span> is the only occurrence). <code>TypeScriptRunnerProcess::shutdown</code> is <code>child.kill()</code> plus cancelling tracked sandbox processes (<span class="src">crates/executor/src/native/typescript.rs:278-284</span>). A harness has no hook to flush or clean up; anything it must preserve has to already be in events or artifacts.</p>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">Warm runner caveats</p>
+  <p>The module is imported once per runner process (<span class="src">exoharness/typescript/harness/runner.ts:286-289</span>) and the cache key has no file mtime or content hash, so editing a harness file does not affect conversations whose runner is still warm. I found no idle eviction in <code>TypeScriptExecutor</code>: one Node process per active conversation persists until failure, cancel or shutdown. The runner inherits the host environment plus the executor's <code>env</code> map (<code>command.envs(env)</code>, <span class="src">crates/executor/src/native/typescript.rs:305-306</span>).</p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Surprise: the harness process gets the whole ExoHarness API</p>
+  <p>Every <code>exo_request</code> other than the matching <code>TurnAddEvents</code> is served by <code>ExoHarnessServer</code> over the executor's <code>root</code> <code>ExoHarness</code> (<span class="src">crates/executor/src/native/typescript.rs:390</span>, <span class="src">crates/executor/src/native/typescript.rs:461</span>). The TypeScript <code>ExoHarness</code> type exposes <code>newAgent</code>, <code>deleteAgent</code>, <code>createVault</code> and vault secret reads/writes, not just the current turn (<span class="src">exoharness/typescript/harness/index.ts:322-334</span>). Whatever limiting exists comes from the state object the provider was built with (<code>with_state</code> for caller-scoped runtimes), not from the runner protocol. This matches the architecture doc's trust model ("Harness modules ... run as trusted code in the harness process"), but it is broader than "a turn handle".</p>
+</div>
+
+<h2>Recovery, suspend and resume</h2>
+
+<h3>The pieces</h3>
+<ol class="steps">
+  <li><strong>On startup</strong> the service calls <code>Runtime::recover_unfinished_turns</code> (once, <code>OnceCell</code>-guarded; <span class="src">crates/executor/src/harness_executor.rs:392-397</span>, called from <span class="src">crates/executor/src/native/http_service.rs:110</span>). For the local provider that is <code>coordinator.pending_threads()</code> followed by <code>drain_queue</code> for each (<span class="src">crates/executor/src/harness_executor.rs:593-600</span>). Concurrency is a semaphore of 4 permits unless <code>set_recovery_concurrency</code> says otherwise (<span class="src">crates/executor/src/harness_executor.rs:209-215</span>, <span class="src">crates/cli/src/serve.rs:46</span>). Caller-scoped queue entries need a <code>recovery_resolver</code> to build a runtime with the right principal.</li>
+  <li><code>open_queue_head</code> classifies the head via the journal and calls <code>execute_turn(..., recovering = true)</code> for <code>Running</code> turns (above).</li>
+  <li><code>ExecutorHarness::submit</code> runs <code>restore_recovery_tools</code> unless the executor <em>reconciles</em> tool calls itself. It scans the turn for <code>tool_requested</code> without a matching <code>tool_result</code>, and refuses to continue (<code>cannot safely resume unresolved tool call ...</code>) unless that call is a client tool or the executor can resume a pending approval and an unanswered approval request matches (<span class="src">crates/executor/src/harness_adapter.rs:328-410</span>).</li>
+  <li>The executor's <code>resume_turn</code> runs. For <code>Basic</code> that is the round-marker replay above. For <code>TypeScript</code> it is <code>init.recovering = true</code> and <code>runner.ts</code> decides:</li>
+</ol>
+
+<figure class="code">
+  <figcaption><strong>The runner's recovery gate</strong> <span class="src">exoharness/typescript/harness/runner.ts:301-335</span></figcaption>
+  <pre><code class="language-ts">const context = createTurnContext(client, init);
+try {
+  if (harness.nativeToolApprovals !== true) {
+    validateToolPolicies(
+      context,
+      [
+        ...context.tools.map((tool) =&gt; tool.name),
+        ...(context.conversationConfig.shellProgram ? ["shell"] : []),
+      ],
+      false,
+    );
+  }
+  if (init.recovering) {
+    if (!harness.resumeTurn) {
+      throw new Error(
+        "this TypeScript harness cannot safely resume an unfinished turn",
+      );
+    }
+    if (
+      harness.reconcileUnresolvedToolCalls !== true &amp;&amp;
+      (await hasUnresolvedToolCalls(context))
+    ) {
+      throw new Error(
+        "this TypeScript harness cannot safely resume an unresolved tool call",
+      );
+    }
+    await harness.resumeTurn(context);
+  } else {
+    await harness.runTurn(context);
+  }
+  await client.done();
+} catch (error) {
+  await client.fail(error);
+  throw error;
+}</code></pre>
+</figure>
+
+<p><code>hasUnresolvedToolCalls</code> counts <code>tool_requested</code> minus <code>tool_result</code> per <code>tool_call_id</code> for the current turn (<span class="src">exoharness/typescript/harness/runner.ts:251-276</span>). So the Rust-side gate (<code>can_reconcile_unresolved_tool_call = config.typescript.is_some()</code>, <span class="src">crates/executor/src/native/typescript.rs:72-74</span>) always defers the decision to the module, and the module's own gate is the one that matters. Tests: a module with <code>reconcileUnresolvedToolCalls: true</code> gets <code>resumeTurn</code>, not <code>runTurn</code>, after a simulated crash (<span class="src">crates/executor/src/native/typescript.rs:905-1031</span>); a module that has <code>resumeTurn</code> but not the flag is rejected when a tool call is open (<span class="src">crates/executor/src/native/typescript.rs:1033-1141</span>).</p>
+
+<h3>Outcome by harness</h3>
+<table>
+  <thead><tr><th>Harness</th><th>Interrupted mid-turn, service restarts</th></tr></thead>
+  <tbody>
+    <tr><td><code>basic</code> (Rust)</td><td>Replays from the saved <code>exo.basic.tool_round</code>; can resume a pending approval; refuses other unresolved tool calls.</td></tr>
+    <tr><td><code>rlm</code></td><td>Fails: no <code>resume_turn</code> (<span class="src">crates/executor/src/harness_executor.rs:183-186</span>).</td></tr>
+    <tr><td>TypeScript, module with <code>resumeTurn</code></td><td>Calls it with <code>recovering = true</code>. Only <code>typescript/codex/harness.ts</code> in-tree does (<span class="src">exoharness/typescript/codex/harness.ts:352-375</span>); it sets <code>reconcileUnresolvedToolCalls: true</code>.</td></tr>
+    <tr><td>TypeScript, no <code>resumeTurn</code> (Claude Code, Pi, Cursor, <code>basic-harness.ts</code>)</td><td>Runner throws "cannot safely resume an unfinished turn"; host writes an <code>Error</code> event and ends the turn failed. A new turn on the thread works normally.</td></tr>
+  </tbody>
+</table>
+<p>That matches the architecture doc ("Claude Code and Pi currently end an interrupted turn as failed") and the agent-definition TODO list (<span class="src">website/docs-src/agent-definition.md:530-531</span>).</p>
+
+<h3>Suspend and resume</h3>
+<p>Suspension is a queue-level control (<code>TurnControl::Suspend</code>) distinct from cancel. <code>set_queued_suspended</code> only checks <code>executor.can_suspend_turn(config)</code> and then flips control in the coordinator (<span class="src">crates/executor/src/turn_queue.rs:284-319</span>). Inside <code>ExecutorHarness</code> the behavior depends on the other flag:</p>
+
+<figure class="code">
+  <figcaption><strong>Two suspend strategies, chosen by capability</strong> <span class="src">crates/executor/src/harness_adapter.rs:242-257</span></figcaption>
+  <pre><code class="language-rust">match reason {
+    Some(StopReason::Shutdown) =&gt; break HarnessTurnOutcome::Interrupted,
+    Some(StopReason::Cancel) =&gt; break HarnessTurnOutcome::Cancelled,
+    Some(StopReason::Suspend) if !resumable =&gt; {},
+    Some(StopReason::Suspend) if reconciles_tools =&gt; {
+        break HarnessTurnOutcome::Suspended;
+    }
+    Some(StopReason::Suspend) =&gt; suspending = true,
+    None =&gt; suspending = false,
+}
+// ...
+boundary = turn.suspension_boundary(), if suspending =&gt; {
+    drop(execution);
+    drop(boundary);
+    break HarnessTurnOutcome::Suspended;
+},</code></pre>
+</figure>
+<ul>
+  <li><strong>Resumable but not reconciling</strong> (Basic): set <code>suspending</code>, wait on <code>suspension_boundary</code> until <code>pending_tools</code> is empty, then drop the execution future while holding the guard so it cannot journal another tool request. Suspension never interrupts an in-flight tool.</li>
+  <li><strong>Reconciling</strong> (TypeScript): suspend immediately, even with a tool in flight, then <code>cancel_turn</code> kills the runner. Safety is pushed to <code>resumeTurn</code>.</li>
+  <li><strong>Not resumable</strong> (Rlm): <code>set_queued_suspended</code> returns <code>false</code> before touching the queue, and the harness ignores a stray <code>Suspend</code> signal.</li>
+</ul>
+
+<div class="callout warn">
+  <p class="callout-title">Suspend is accepted for TypeScript harnesses that cannot resume (from reading, not run)</p>
+  <p><code>ManagedExecutor::can_suspend_turn</code> is true for <em>every</em> <code>AgentHarnessKind::TypeScript</code> config (<span class="src">crates/executor/src/native/managed_executor.rs:136-141</span>), and the Rust side does not look for a <code>resumeTurn</code> export. Suspending a Claude Code or Pi turn therefore kills its runner; resuming it re-enters as <code>recovering = true</code>, hits the "cannot safely resume an unfinished turn" branch in <code>runner.ts</code>, and fails the turn. Only modules that export <code>resumeTurn</code> (Codex) get a real suspend/resume.</p>
+</div>
+
+<h2>The RLM harness</h2>
+<p>"RLM" (recursive language model) here is a harness that does not show the model the conversation. It hands the model a persistent JavaScript REPL in which the full transcript is a variable, plus the ability to ask sub-LLM questions about slices of it. The model works by writing code that inspects and chunks <code>context</code> and calling <code>subquery</code> over the chunks.</p>
+
+<h3>Mechanism (Rust, <code>AgentHarnessKind::Rlm</code>)</h3>
+<ol class="steps">
+  <li>At turn start, materialize all conversation messages and flatten them to a <code>USER:\n...</code> / <code>ASSISTANT:\n...</code> transcript; build <code>JsReplState::new(context_text, history_messages)</code> and append an <code>rlm_context_initialized</code> custom event (<span class="src">crates/executor/src/native/rlm.rs:54-70</span>).</li>
+  <li>The prompt is just instructions + an RLM system prompt + a root prompt with the latest request, a 400-char preview and metadata (<span class="src">crates/executor/src/native/rlm.rs:72-80</span>, <span class="src">crates/executor/src/native/rlm.rs:613-685</span>). Prompt text lives on <a href="prompts.html">prompts</a>.</li>
+  <li>Each round exposes three built-in tools (<code>repl_execute</code>, <code>subquery</code>, <code>subquery_variable</code>, <span class="src">crates/executor/src/native/rlm.rs:687-750</span>) plus any external and client tools. The model response goes through <code>complete_model_round</code> with <code>ModelStreamOutput::Internal</code>: chunks are used for TTFT but not shown to the user (<span class="src">crates/executor/src/native/rlm.rs:108-116</span>).</li>
+  <li><code>repl_execute</code> evaluates JS in the Boa engine. State is a JSON <code>Map</code> in Rust; each call builds a <em>fresh</em> <code>BoaContext</code>, injects <code>context</code>, <code>getMessages(role)</code>, <code>print</code> and the saved globals, evals the code, then reads back every JSON-serializable global (<span class="src">crates/executor/src/native/harness_js_repl.rs:27-111</span>). Only JSON-compatible values persist between calls; functions and closures do not.</li>
+  <li><code>subquery</code> / <code>subquery_variable</code> call <code>ModelClient::complete</code> directly with the instructions, a fixed "You are a subquery model ... Do not call tools" system message, and the prompt (or <code>question + variable value</code>). The result may be stored into a REPL global via <code>target_var</code> (<span class="src">crates/executor/src/native/rlm.rs:336-387</span>).</li>
+  <li>Termination: a response with no tool calls ends the turn, taking the answer from <code>FINAL(...)</code>, <code>FINAL_VAR(name)</code> or the plain text; or any tool call that leaves <code>globalThis.Final</code> non-null (<span class="src">crates/executor/src/native/rlm.rs:132-136</span>, <span class="src">crates/executor/src/native/rlm.rs:275-278</span>, <span class="src">crates/executor/src/native/rlm.rs:581-611</span>).</li>
+  <li>Persistence: only <code>rlm_*</code> custom events (<code>rlm_model_response</code>, <code>rlm_tool_call</code>, <code>rlm_tool_result</code>, <code>rlm_final_answer</code>) plus one final <code>Messages</code> event with the answer. Intermediate model turns are <em>not</em> <code>messages</code> events, so they never enter later prompts or <code>materialize_conversation_messages</code>.</li>
+</ol>
+
+<figure class="code">
+  <figcaption><strong>REPL state is a JSON map round-tripped through a throwaway Boa context</strong> <span class="src">crates/executor/src/native/harness_js_repl.rs:11-16</span>, <span class="src">crates/executor/src/native/harness_js_repl.rs:96-104</span></figcaption>
+  <pre><code class="language-rust">pub struct JsReplState {
+    context_json: String,
+    history_messages_json: String,
+    globals: Map&lt;String, Value&gt;,
+}
+
+// in execute():
+let value = context
+    .eval(Source::from_bytes(&amp;wrapped))
+    .map_err(|error| anyhow!("failed to execute JS repl code: {error}"))?;
+let json = value
+    .to_string(&amp;mut context)
+    .map_err(|error| anyhow!("failed to stringify JS repl result: {error}"))?
+    .to_std_string_escaped();
+let envelope: JsExecutionEnvelope = serde_json::from_str(&amp;json)?;
+self.globals = envelope.globals.clone();</code></pre>
+</figure>
+
+<div class="callout surprise">
+  <p class="callout-title">Surprise: the RLM is neither resumable nor error-tolerant, and "recursive" is one level deep</p>
+  <p>(1) <code>RlmExecutor</code> implements only <code>execute_turn</code>, so recovery fails by default. (2) A tool error returns <code>Err</code> out of the whole turn loop (<span class="src">crates/executor/src/native/rlm.rs:242-247</span>), whereas <code>BasicExecutor</code> turns it into an <code>{ok:false}</code> tool result. (3) <code>run_subquery</code> passes no tools and tells the sub-model not to call any, so recursion depth is exactly one; the recursion is the model's own loop of <code>repl_execute</code> over sub-answers. (4) Sub-queries use <code>model.complete</code> directly, with no turn trace and no persisted event of their own, only the tool result. (5) The REPL state lives in process memory and is rebuilt from the transcript each turn: variables from a previous turn are gone.</p>
+</div>
+
+<h3>A second implementation</h3>
+<p>There is also a TypeScript RLM at <span class="src">exoharness/examples/typescript/rlm-harness.ts</span> with the same tools and event names but <code>node:vm</code> as the engine (it records <code>engine: "node_vm"</code> vs the Rust <code>"boa_js"</code>, <span class="src">exoharness/examples/typescript/rlm-harness.ts:114</span>). The Rust one is selected by <code>harness: rlm</code>; the TS one by pointing <code>harness:</code> at the file. The two share no code: the loop, REPL wrapper and prompts are written twice.</p>
+
+<h2>Scheduler and wakeups</h2>
+<p>"Scheduling" in the executor crate is narrower than the name suggests. It runs <em>shell commands in a sandbox</em> on a timer and then <em>wakes a conversation</em> with a report; no model runs at the scheduled time.</p>
+
+<ul>
+  <li><strong>Data</strong>: <code>SchedulerStore</code> keeps JSON files: <code>tasks/{id}.json</code>, per-task <code>runs/</code>, and pending-fire records, written via temp-file + rename (<span class="src">crates/executor/src/native/scheduler_store.rs:14-60</span>, <span class="src">crates/executor/src/native/scheduler_store.rs:266-278</span>). It is outside the event log; the log only sees the resulting wakeup turn and the result artifact. Records are schema-versioned with one-step migrations that refuse records from newer builds (<span class="src">crates/executor/src/native/scheduler_types.rs:13-16</span>, <span class="src">crates/executor/src/native/scheduler_types.rs:390-418</span>).</li>
+  <li><strong>Creation</strong>: the <code>Exo</code> harness kind's <code>ExoToolRuntime</code> gives the model <code>schedule_sandbox_task</code>, <code>list_scheduled_tasks</code>, <code>cancel_scheduled_task</code>, <code>delete_scheduled_task</code> (<span class="src">crates/executor/src/native/harness_tool.rs:117-145</span>; see <a href="tools-and-mcp.html">tools-and-mcp</a>). Schedules are <code>@every 30m</code>, <code>@at &lt;rfc3339&gt;</code>, or exactly <code>*/N * * * *</code>; no other cron syntax (<span class="src">crates/executor/src/native/scheduler_types.rs:427-461</span>).</li>
+  <li><strong>Execution</strong>: <code>run_due_tasks</code> claims due tasks with a 10-minute lease, then <code>run_task</code> consults <code>plan_missed_fires</code>. <code>MissedPolicy</code> is <code>Skip</code>, <code>Once</code> or <code>All</code> (capped at <code>MAX_MISSED_FIRE_CATCHUP = 100</code>). Fires land on <code>anchor + n * interval</code>, not "last finish + interval" (<span class="src">crates/executor/src/native/scheduler_runtime.rs:46-126</span>, <span class="src">crates/executor/src/native/scheduler_types.rs:72-90</span>, <span class="src">crates/executor/src/native/scheduler_types.rs:272-300</span>). Sandbox mode is <code>Agent</code>, <code>Conversation</code> or <code>TaskFresh</code>.</li>
+  <li><strong>Reporting</strong>: stdout/stderr go into a conversation artifact <code>scheduled-tasks/{name}/{run}.json</code>, then <code>send_conversation_wakeup</code> submits a normal user-role turn containing the report prompt and previews, and ends the session (<span class="src">crates/executor/src/native/conversation_wakeup.rs:12-40</span>).</li>
+</ul>
+
+<figure class="code">
+  <figcaption><strong>Record the wakeup before attempting it</strong> <span class="src">crates/executor/src/native/scheduler_runtime.rs:340-358</span></figcaption>
+  <pre><code class="language-rust">// The wakeup is the only thing that tells the conversation this run
+// happened, and nothing retries a machine-sent event. Record it before
+// attempting delivery so a crash in between leaves a redeliverable trace
+// rather than silence.
+let fire = ScheduledFireRecord {
+    task_id: task.id.clone(),
+    task_name: task.name.clone(),
+    slot_ms,
+    run_id: run_id.to_string(),
+    agent_id: task.agent_id.clone(),
+    conversation_id: task.conversation_id.clone(),
+    prompt,
+    fired_at_ms: now_ms(),
+};
+store.put_pending_fire(&amp;fire).await?;
+send_conversation_wakeup(harness.as_ref(), &amp;agent, &amp;conversation, fire.prompt.clone()).await?;
+store
+    .mark_fire_delivered(&amp;fire.task_id, fire.slot_ms)
+    .await?;</code></pre>
+</figure>
+<p>On startup <code>redeliver_pending_wakes</code> resends any unconfirmed fire (at-least-once; the <code>(task, slot)</code> key bounds repeats; fires whose agent or conversation vanished are retired, <span class="src">crates/executor/src/native/scheduler_runtime.rs:71-102</span>).</p>
+
+<div class="callout surprise">
+  <p class="callout-title">Surprise: nothing in the server starts the scheduler</p>
+  <p><code>run_due_tasks</code> and <code>redeliver_pending_wakes</code> are exported, but the only caller in the repo is a separate binary, <span class="src">examples/self-improving-agent/scheduler-runner/src/main.rs:60-90</span>, which takes a <code>SchedulerRunnerLock</code> and polls. <code>exo serve</code> does not drive tasks, and the CLI's only use of <code>send_conversation_wakeup</code> is <code>conversation send</code> (<span class="src">crates/cli/src/main.rs:1978</span>). The runner is built and launched by <span class="src">examples/self-improving-agent/exo.sh</span>. Scheduled tasks created by an <code>exo</code>-kind agent will not fire unless that runner is running. The executor crate treats the scheduler as a library plus store, not a service.</p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Surprise: wakeups are serialized with a temp-dir lock file, outside the durable queue</p>
+  <p><code>send_conversation_wakeup</code> first acquires <code>$TMP/exo-wakeup-locks/{conversation}.lock</code> via <code>create_new</code>, polling every 100 ms and breaking locks older than 30 minutes (<span class="src">crates/executor/src/native/conversation_wakeup.rs:42-107</span>), and only then calls <code>Runtime::send</code>. This serializes concurrent scheduler runners and CLI sends on one machine; it does nothing across hosts, and the turn queue already serializes per thread. The lock is belt-and-braces for callers waiting on <code>send</code>, not part of the recovery design.</p>
+</div>
+
+<p>Related host-side event writers: <code>record_host_event</code> and <code>complete_rebuild_and_restart_update</code> append <code>Custom</code> events (e.g. <code>rebuild_and_restart_exo</code>) so host actions land in the same log the agent can read back via <code>list_conversation_events</code> (<span class="src">crates/executor/src/native/conversation_events.rs:1-12</span>, <span class="src">crates/executor/src/native/conversation_events.rs:106-132</span>). <code>agent_sandbox.rs</code> holds the agent-scoped sandbox, recorded in <code>config/agent-sandbox-v2.json</code> and deliberately <em>not</em> recreated when agent config drifts (<span class="src">crates/executor/src/native/agent_sandbox.rs:10-12</span>, <span class="src">crates/executor/src/native/agent_sandbox.rs:66-73</span>); see <a href="sandboxes.html">sandboxes</a>.</p>
+
+<h2>Where the semantic/infrastructure line is actually drawn</h2>
+<p>The architecture doc says the harness "decides how to call the model, build context, compact history, plan, and use tools" while the runtime provides "durable state, sandboxes, credentials, and network controls". The code mostly agrees but with specific, sometimes surprising, placement:</p>
+
+<table>
+  <thead><tr><th>Concern</th><th>Owner in code</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td>Turn identity, queue order, lease, cancel/suspend control</td><td>Host (<code>TurnQueue</code>)</td><td><span class="src">crates/executor/src/turn_queue.rs</span>, <span class="src">crates/exoharness/src/turn_coordinator.rs</span>. The harness can't start, finish or reorder turns.</td></tr>
+    <tr><td>Starting and ending the turn in the log</td><td>Host</td><td><code>begin_turn</code> / <code>finish</code> in <code>start_local_turn</code>; TS <code>Turn</code> has no <code>finish</code>.</td></tr>
+    <tr><td>Event ordering, append, live-stream relay, checkpoints</td><td>Host (<code>HarnessEvents</code>)</td><td><span class="src">crates/executor/src/harness_events.rs:189-261</span></td></tr>
+    <tr><td>Which events exist, what they contain, when to write them</td><td>Harness</td><td>Host only recognizes a handful of kinds for streaming and pending-tool bookkeeping; <code>custom</code> events are free-form (<code>rlm_*</code>, <code>exo.basic.tool_round</code>).</td></tr>
+    <tr><td>Prompt construction / history slice / compaction</td><td>Harness</td><td>Three independent implementations: <code>extend_message_history</code> (Basic), <code>materialize_conversation_messages</code> (RLM), <code>materializeEventsToMessages</code> (TS).</td></tr>
+    <tr><td>Model call</td><td>Harness (Rust executors via <code>ModelClient</code>; TS modules via <code>@exo/model-runtime</code> or native SDKs in-sandbox)</td><td><code>Runtime</code> has no model dependency at all.</td></tr>
+    <tr><td>Tool <em>selection</em> and loop shape</td><td>Harness</td><td>Round budget (<code>max_tool_round_trips</code>), parallel vs serial tool execution, error handling differ per loop.</td></tr>
+    <tr><td>Tool <em>authorization</em> (approval events, policy lookup)</td><td>Host, invoked by harness</td><td><code>authorize_tool</code> and <code>execute_tool</code> runtime requests both call <code>permissions::authorize</code> before running (<span class="src">crates/executor/src/typescript_runtime.rs:178-196</span>). The harness may only <em>declare</em> via <code>nativeToolApprovals</code> whether it can honor <code>always_ask</code>.</td></tr>
+    <tr><td>Tool <em>execution</em> (shell, MCP, client tools)</td><td>Host (<code>ToolRuntime</code>), invoked via <code>context.executeTool</code></td><td><span class="src">crates/executor/src/typescript_runtime.rs:201-232</span>. TS tool modules registered by the harness itself run in the harness process (trusted).</td></tr>
+    <tr><td>Sandbox creation, processes, snapshots, egress, credentials</td><td>Host</td><td><code>start_sandbox_process</code> calls <code>ensure_conversation_sandbox</code> itself (<span class="src">crates/executor/src/typescript_runtime.rs:315-321</span>); harness never sees credentials unless it reads vaults through <code>exo_request</code>.</td></tr>
+    <tr><td>Recovery strategy</td><td>Split: host decides <em>whether</em> and with what inputs, harness decides <em>how</em></td><td>Capability flags + <code>TurnWork</code> in the log (host); round markers / <code>resumeTurn</code> (harness).</td></tr>
+    <tr><td>Completion marker</td><td>Host fallback, harness optional</td><td><span class="src">crates/executor/src/harness_executor.rs:838-853</span></td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <p class="callout-title">Reading the line</p>
+  <p>The boundary is a <em>placement convention over a shared event log</em>, not a type-system wall. The host enforces ordering, authorization, sandbox access and journaling; it cannot stop a harness from writing arbitrary events, and does not need to, because recovery only trusts what recovery code replays. Because the Rust "basic" loop is itself a harness living in the host process, the same line runs through the middle of the Rust crate: <code>basic.rs</code> and <code>rlm.rs</code> are on the semantic side, <code>harness_executor.rs</code>, <code>harness_adapter.rs</code>, <code>turn_queue.rs</code> on the infrastructure side.</p>
+</div>
+
+<h2>Docs vs. code</h2>
+<table>
+  <thead><tr><th>Doc claim</th><th>Code</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><span class="src">website/docs-src/architecture/harnesses.md:43-47</span> lists bundled harnesses <code>codex</code>, <code>claude-code</code>, <code>pi</code>.</td>
+      <td>Presets also include <code>cursor</code> / <code>cursor-sdk</code>, and kinds <code>basic</code>, <code>rlm</code>, <code>exo</code>, <code>typescript</code> exist (<span class="src">crates/executor/src/managed_agents/config.rs:130-199</span>). <span class="src">exoharness/docs/coding-agent-harnesses.md:3-18</span> does cover Cursor.</td>
+    </tr>
+    <tr>
+      <td>Loop step 5 "Finish the turn" (<span class="src">website/docs-src/architecture/harnesses.md:54-63</span>).</td>
+      <td>For TypeScript harnesses finishing is host-owned; the harness returns from <code>runTurn</code>. There is no <code>finish</code> on the TS <code>Turn</code>.</td>
+    </tr>
+    <tr>
+      <td>"Exo durably queues submitted turns."</td>
+      <td>True with a persistent coordinator (CLI, worker); library default is in-memory (<span class="src">crates/executor/src/provider.rs:131-157</span>).</td>
+    </tr>
+    <tr>
+      <td>Recovery section: custom harness may implement <code>resumeTurn</code> and declare <code>reconcileUnresolvedToolCalls: true</code>.</td>
+      <td>Accurate (<span class="src">exoharness/typescript/harness/runner.ts:312-326</span>). Not mentioned: <code>resumeTurn</code> without the flag is allowed for turns with no open tool call; and suspend/resume hits the same gate.</td>
+    </tr>
+    <tr>
+      <td>Tutorial: "A TypeScript harness is a module whose default export implements one method: <code>runTurn(context)</code>" (<span class="src">website/docs-src/tutorials/write-your-own-agent.md:22-27</span>).</td>
+      <td>Accurate, with <code>resumeTurn</code>, <code>nativeToolApprovals</code>, <code>reconcileUnresolvedToolCalls</code> and <code>tools</code> optional; a named <code>harness</code> export also works (<span class="src">exoharness/typescript/harness/runner.ts:237</span>).</td>
+    </tr>
+    <tr>
+      <td><span class="src">exoharness/docs/coding-agent-harnesses.md:41-44</span>: built-in constructors resolve runners "from the source checkout used to build Exo".</td>
+      <td>Literal: <code>env!("CARGO_MANIFEST_DIR")</code> is baked in at compile time (<span class="src">crates/executor/src/native/typescript.rs:556-561</span>), and <code>node --import tsx</code> must resolve from it.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Where to go next</h2>
+<ul>
+  <li>Codex / Claude Code / Pi / Cursor adapters and the model runtime: <a href="native-harnesses.html">native-harnesses</a>.</li>
+  <li>Tool registry, MCP, skills, approvals: <a href="tools-and-mcp.html">tools-and-mcp</a>.</li>
+  <li>The sandbox layer that <code>startSandboxProcess</code> and shell run on: <a href="sandboxes.html">sandboxes</a>.</li>
+  <li>Event types and storage: <a href="data-model.html">data-model</a>; overall picture: <a href="architecture.html">architecture</a>.</li>
+</ul>
+
+</main>
+<aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/wiki.js"></script>
+</body>
+</html>

@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Surprises &amp; gotchas · Exo internals</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav id="nav"></nav>
+<main>
+<header>
+  <div class="kicker">Distilled</div>
+  <h1>Surprises &amp; gotchas</h1>
+  <p class="lede">Places where the code does something other than what the docs, the names, or a reasonable first guess suggest. The repo is young and says so ("under construction"), so a good share of these are docs that lag the code or features that are declared but not wired.</p>
+</header>
+
+<p>Every item here was checked against the source at the commit this wiki was written for. Items marked <span class="pill">read, not run</span> come from reading the code; nobody executed them. Tags: <span class="pill">docs drift</span> the docs say otherwise, <span class="pill">dead path</span> declared or parsed but unreachable, <span class="pill">default</span> a default that bites, <span class="pill">security</span> relevant to the trust model.</p>
+
+<h2>Vocabulary and structure</h2>
+
+<div class="callout surprise">
+  <p class="callout-title">"Conversation" in the docs is "thread" in the code <span class="pill">docs drift</span></p>
+  <p><code>ConversationHandle</code> is <code>pub use ThreadHandle as ConversationHandle</code>. Event variants are <code>ThreadCreated</code> / <code>ThreadForked</code> with <code>#[serde(alias = "conversation_*")]</code>. <code>exoharness/docs/design/architecture.md</code> still names <code>ExecutorHarnessRuntime</code> and <code>HarnessConversation</code>, neither of which exists, and puts <code>runtime_host.rs</code> in the executor crate when it is in <code>crates/exoharness</code>.</p>
+  <p><span class="src">crates/exoharness/src/types.rs:296-297</span> · <span class="src">crates/exoharness/src/types.rs:566-583</span> · <span class="src">crates/executor/src/lib.rs:33</span> · <a href="architecture.html">architecture</a></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Three different things are called "harness" <span class="pill">docs drift</span></p>
+  <p><code>trait Harness&lt;T&gt;</code> is a command/event bus in <code>exoharness</code>. <code>trait HarnessExecutor</code> is the real semantic seam. <code>TypeScriptHarness</code> is a user module. The docs describe only the last. They also list three bundled harnesses, while the code has a Cursor preset and executor kinds basic / rlm / exo / typescript.</p>
+  <p><span class="src">crates/exoharness/src/harness.rs:86-101</span> · <span class="src">crates/executor/src/harness_executor.rs:80-188</span> · <span class="src">crates/executor/src/managed_agents/config.rs:130-199</span> · <a href="harnesses.html">harnesses</a></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">There is no <code>beginTurn</code> in the TypeScript harness API, and a harness cannot finish a turn</p>
+  <p>The interface is <code>runTurn(context)</code> and an optional <code>resumeTurn(context)</code>. The host begins the turn, hands it over as <code>context.exoharness.current.turn</code> (which exposes only <code>addEvents</code> and artifact writes), and writes <code>TurnEnded</code> after the harness reports done. The raw wire type has a <code>turn_finish</code> request but no TS API sends it.</p>
+  <p><span class="src">exoharness/typescript/harness/index.ts:378-398</span> · <span class="src">exoharness/typescript/harness/index.ts:438-444</span> · <span class="src">exoharness/typescript/harness/client.ts:380</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Sessions and turns have no stored record</p>
+  <p><code>start_session</code> mints a UUIDv7 and appends <code>SessionStarted</code>. A turn is just the events carrying its <code>turn_id</code>, and <code>turn_handle()</code> rebuilds a handle by scanning the whole thread's events.</p>
+  <p><span class="src">crates/exoharness/src/basic.rs:1654-1682</span> · <span class="src">crates/exoharness/src/basic.rs:1776-1813</span> · <a href="data-model.html">data model</a></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">"Identity" is a person, not an agent</p>
+  <p>There is no content-hash identity for agents. <code>identity.rs</code> maps an email or Slack user to a private vault (<code>IdentityRecord</code>, <code>BindVault</code>, <code>BindSlack</code>, <code>TrustSlack</code>). An agent has a random id and a slug, and its definition is the highest version of the artifact <code>managed-agents/agent.json</code>.</p>
+  <p><span class="src">crates/managed-agents/src/identity.rs:4-46</span> · <span class="src">crates/managed-agents/src/lib.rs:21-23</span> · <a href="managed-agents.html">managed agents</a></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">The "managed agents" API is not Anthropic- or OpenAI-compatible</p>
+  <p>It is a custom <code>/exo</code> REST plus SSE protocol. Only vocabulary (<code>always_allow</code> / <code>always_ask</code>, MCP <code>type: url</code>) resembles Anthropic's. The protocol structs are also a superset of what the local runtime supports: <code>parent</code>, <code>endpoint_name</code>, <code>reasoning_effort</code>, <code>auto_approve_tools</code>, <code>page_scope</code>, <code>reset_history</code> and <code>delivery_callback</code> all return 501 locally.</p>
+  <p><span class="src">crates/managed-agents/src/http.rs:9</span> · <span class="src">crates/executor/src/managed_agents/service.rs:95-107</span> · <span class="src">crates/managed-agents/src/http/protocol.rs:220-250</span></p>
+</div>
+
+<h2>The event log and the queue</h2>
+
+<div class="callout surprise">
+  <p class="callout-title">The optimistic head check can never fire <span class="pill">dead path</span></p>
+  <p><code>ensure_conversation_head</code> compares the freshly loaded record head with the <code>expected_head</code> that every caller derives from that same record (or passes <code>None</code>). There is one call site, and "turn is stale and cannot be resumed" is unreachable. A test named <code>turn_artifact_write_allows_interleaved_conversation_writes</code> confirms interleaving is intended, while the architecture doc still says head tracking is enforced inside the exoharness.</p>
+  <p><span class="src">crates/exoharness/src/basic.rs:2459-2466</span> · <span class="src">crates/exoharness/src/basic.rs:2507-2556</span> · <span class="src">crates/exoharness/src/basic_tests.rs:1178-1257</span> · <span class="src">website/docs-src/architecture/data-model.md:46-50</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Real write ordering is one process-wide async mutex</p>
+  <p><code>BasicExoHarnessInner.write_lock</code> serialises every metadata and event write for all agents and threads, held across the storage PUT. Cross-process exclusion is an OS flock per thread (<code>sessions/&lt;agent&gt;/&lt;thread&gt;.lock</code>).</p>
+  <p><span class="src">crates/exoharness/src/basic.rs:199</span> · <span class="src">crates/exoharness/src/basic.rs:230-232</span> · <span class="src">crates/exoharness/src/basic/sessions.rs:86-109</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Every read lists the whole <code>events/</code> directory</p>
+  <p><code>get_events</code>, <code>load_conversation_record</code> and thread listing call <code>list_keys</code> on the events prefix each time. The cost is O(event objects), and the batch index only helps <code>get_event</code>. Also, storage is files and <code>object_store</code>: <code>sqlx</code> is declared in the workspace manifest but no crate uses it.</p>
+  <p><span class="src">crates/exoharness/src/basic.rs:2718-2735</span> · <span class="src">crates/exoharness/src/basic.rs:2825-2830</span> · <span class="src">Cargo.toml:66-72</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Fork re-mints every event id</p>
+  <p>A fork is a full copy: it filters by <code>id &lt;= up_to_inclusive</code> in the parent's id space, rewrites <code>id</code>, <code>thread_id</code> and <code>created_at</code>, writes one file per event (batching is lost), copies only <code>bindings/</code> and <code>artifacts/</code> (not <code>sandboxes/</code>, <code>title.json</code> or <code>turn_queue.json</code>), and then appends <code>ThreadForked</code>. Parent cursors are meaningless in the child.</p>
+  <p><span class="src">crates/exoharness/src/basic.rs:2037-2106</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Two event variants never reach the log <span class="pill">dead path</span></p>
+  <p><code>ThreadUpdated</code> has no producer anywhere. <code>LinguaStreamChunk</code> and <code>runtime_status</code> are synthesised with throw-away ids onto a broadcast channel for watchers, and a test asserts that history contains none.</p>
+  <p><span class="src">crates/exoharness/src/types.rs:573</span> · <span class="src">crates/executor/src/managed_agents/service.rs:768-790</span> · <span class="src">crates/executor/src/native/http_tests.rs:545-551</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">The default turn queue is in memory <span class="pill">default</span></p>
+  <p><code>LocalProvider::with_host</code> installs <code>StoredTurnCoordinator::in_memory()</code>. Durability needs <code>.with_turn_coordinator(...)</code>, which only the CLI and the worker runtime call. A test pins that the default does not recover from the journal after a restart. Anyone embedding the crates gets a non-durable queue unless they wire it.</p>
+  <p><span class="src">crates/executor/src/provider.rs:131-157</span> · <span class="src">crates/executor/src/turn_queue/tests.rs:585-612</span> · <span class="src">crates/cli/src/providers.rs:90-93</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">History cache can bake in a fabricated cancellation <span class="pill">read, not run</span></p>
+  <p><code>extend_message_history</code> flushes pending tool calls at the end of each incremental batch. With the per-thread cursor cache, a prompt built while a tool is still in flight caches the synthetic failure and then skips the late real result. The cache map has no eviction in this file.</p>
+  <p><span class="src">crates/executor/src/message_history.rs:13-14</span> · <span class="src">crates/executor/src/message_history.rs:96-101</span> · <span class="src">crates/executor/src/basic.rs:80-134</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title"><code>Bound::Unbounded</code> means live-only on one side of the wire and full replay on the other</p>
+  <p><code>BasicExoHarness::watch_events</code> rewrites it to <code>Excluded(latest_event_id)</code>. The HTTP runtime transport maps it to <code>after=None</code>, which the server turns into <code>Excluded(Uuid7(0))</code>, a full replay. It is consistent only because turn code always passes an explicit cursor.</p>
+  <p><span class="src">crates/exoharness/src/basic.rs:1841-1850</span> · <span class="src">crates/executor/src/native/http_provider.rs:601-615</span> · <span class="src">crates/executor/src/managed_agents/service.rs:817-821</span></p>
+</div>
+
+<h2>Harnesses, recovery and tools</h2>
+
+<div class="callout surprise">
+  <p class="callout-title">Claude Code, Pi and Cursor fail interrupted turns, though Rust says they can reconcile <span class="pill">read, not run</span></p>
+  <p><code>ManagedExecutor::can_suspend_turn</code> is true for every TypeScript kind, and <code>TypeScriptExecutor::can_reconcile_unresolved_tool_call</code> is just <code>config.typescript.is_some()</code>. The real gate is in <code>runner.ts</code>: on resume (<code>recovering=true</code>) it throws when the module has no <code>resumeTurn</code>. Only <code>codex/harness.ts</code> exports one.</p>
+  <p><span class="src">crates/executor/src/native/managed_executor.rs:136-141</span> · <span class="src">crates/executor/src/native/typescript.rs:72-74</span> · <span class="src">exoharness/typescript/harness/runner.ts:312-317</span> · <a href="native-harnesses.html">native harnesses</a></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">TS harnesses run unsandboxed on the host and get the whole store API <span class="pill">security</span></p>
+  <p><code>runner.ts</code> is a <code>node</code> child of the host. Only <code>TurnAddEvents</code> matching the active turn ids is intercepted; every other <code>exo_request</code> goes straight to <code>ExoHarnessServer</code> (agents, vaults, secrets, <code>delete_agent</code>). What runs in the sandbox is the vendor binary (for Codex, <code>codex app-server --listen stdio://</code>). Loading a harness or tool module is a trust decision, as the docs say, but the breadth of what that code can call is wider than the prose suggests.</p>
+  <p><span class="src">crates/executor/src/native/typescript.rs:297-318</span> · <span class="src">crates/executor/src/native/typescript.rs:450-462</span> · <span class="src">exoharness/typescript/codex/harness.ts:261</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Transport is newline-delimited JSON to a persistent Node child, and "shutdown" is SIGKILL</p>
+  <p>Not JSON-RPC and not HTTP. One <code>node --import tsx runner.ts &lt;module&gt;</code> process per (conversation, module), reused across turns. <code>HostToGuestMessage::Shutdown</code> is defined on both sides but the Rust host never sends it. Warm runners also never reload code: the module is <code>import()</code>ed once and the cache key has no mtime or hash, so edits do not apply to warm conversations.</p>
+  <p><span class="src">crates/executor/src/native/typescript.rs:286-333</span> · <span class="src">crates/executor/src/native/typescript.rs:569</span> · <span class="src">exoharness/typescript/harness/runner.ts:155-157</span> · <span class="src">exoharness/typescript/harness/runner.ts:286-289</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Nothing in the server runs the scheduler <span class="pill">dead path</span></p>
+  <p><code>run_due_tasks</code> and <code>redeliver_pending_wakes</code> are exported, but the only caller is the example binary <code>exo-scheduler-runner</code>. Tasks are shell commands in a sandbox, not model turns, and fire only while that binary runs.</p>
+  <p><span class="src">examples/self-improving-agent/scheduler-runner/src/main.rs:60-90</span> · <span class="src">crates/executor/src/native/scheduler_runtime.rs:46-60</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Global <code>permission_policy</code> does not govern MCP tools <span class="pill">default</span></p>
+  <p><code>for_mcp_tool</code> never reads the top-level policy. MCP tools resolve through the exposed-name entry, the server tool entry, the server default, and finally a hard-coded <code>always_ask</code>. Setting the agent default to <code>always_allow</code> leaves MCP tools at ask.</p>
+  <p><span class="src">crates/managed-agents/src/permissions.rs:37-45</span> · <span class="src">crates/managed-agents/src/permissions.rs:136-153</span> · <a href="tools-and-mcp.html">tools &amp; MCP</a></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Resumable approvals work only for the Basic harness</p>
+  <p>Resume needs <code>tool_call_id</code> and <code>round</code> passed to <code>authorize</code>. The TypeScript runtime path and RLM pass <code>None</code>, so after a restart a TS-harness approval is orphaned and a fresh approval with a new id is created. "Allow for tool" is also session-wide, per function name and argument-blind.</p>
+  <p><span class="src">crates/executor/src/typescript_runtime.rs:182-193</span> · <span class="src">crates/executor/src/native/rlm.rs:181-196</span> · <span class="src">crates/executor/src/permissions.rs:198-222</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">MCP <code>isError: true</code> becomes <code>ok: true</code> in the TS result envelope</p>
+  <p><code>resultOk</code> only reads a boolean <code>ok</code>, while MCP's <code>CallToolResult</code> uses <code>isError</code>. The Claude bridge checks both; the generic path does not.</p>
+  <p><span class="src">exoharness/typescript/harness/tools.ts:237-242</span> · <span class="src">exoharness/typescript/harness/client-tools.ts:6-13</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Docs say three default built-in tools; code registers one <span class="pill">docs drift</span></p>
+  <p><code>exoharness/docs/tools.md</code> claims <code>shell</code>, <code>inspect_tools</code> and <code>manage_tool</code>. <code>defaultBuiltInToolNames</code> returns <code>["shell"]</code>, plus two legacy tools if <code>enableAgentToolCreation</code>. Only the example profiles list all three. Also parsed-but-dead: <code>frontend_tools[].defer_loading</code> is read nowhere outside tests, and <code>auto_approve_tools</code> is rejected by the local runtime.</p>
+  <p><span class="src">exoharness/docs/tools.md:102-108</span> · <span class="src">exoharness/typescript/model-runtime/turn-loop.ts:78-87</span> · <span class="src">crates/managed-agents/src/http/protocol.rs:129-146</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Rust executes tools whose schemas live in TypeScript</p>
+  <p><code>ExoToolRuntime</code> implements <code>snapshot_sandbox</code>, <code>schedule_sandbox_task</code> and others but returns no definitions. The schemas live in <code>examples/self-improving-agent/tools/sandbox-tools.ts</code> via <code>hostTool()</code>.</p>
+  <p><span class="src">crates/executor/src/native/harness_tool.rs:81-190</span> · <span class="src">examples/self-improving-agent/tools/host-tools.ts:23-37</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Claude Code only half runs in the sandbox, and persists only the last assistant text</p>
+  <p>The Agent SDK <code>query()</code>, hooks and the in-process <code>exo_runtime</code> MCP server run in the host runner; only the CLI binary is spawned in the sandbox. Each <code>assistant</code> SDK message also overwrites <code>state.finalText</code>, so intermediate text between tool calls is not in the canonical transcript (raw SDK messages are saved separately as <code>claude_sdk_messages</code>).</p>
+  <p><span class="src">exoharness/examples/typescript/claude-code-harness.ts:355-356</span> · <span class="src">exoharness/examples/typescript/claude-code-harness.ts:379-391</span> · <span class="src">exoharness/examples/typescript/claude-code-harness.ts:617-750</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">The Codex usage doc does not match the code <span class="pill">docs drift</span></p>
+  <p>The doc says usage counts <code>rawResponse/completed</code> records including replay compaction. The code sums <code>last</code> deltas from <code>thread/tokenUsage/updated</code> for the active turn, because resumed app-servers do not emit raw response events. Replay compaction is consumed by <code>waitForCompaction</code> and never accumulated (read, not run).</p>
+  <p><span class="src">exoharness/docs/coding-agent-harnesses.md:48-50</span> · <span class="src">exoharness/typescript/codex/usage.ts:20-43</span> · <span class="src">exoharness/typescript/codex/replay.ts:124-144</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Most OpenAI models do not use the Responses API in the TS model loop</p>
+  <p>Only <code>o1-pro</code>, <code>o3-pro</code>, <code>gpt-5-pro</code>, <code>gpt-5.N</code> (N&ge;3) and <code>gpt-5*-codex</code> get <code>ResponsesRuntime</code>. Everything else, and anything on an OpenRouter base URL, goes through Chat Completions normalised into a Responses-shaped object. Responses requests use <code>store: false</code>, so reasoning items are dropped on replay.</p>
+  <p><span class="src">exoharness/typescript/model-runtime/responses.ts:300-343</span> · <span class="src">exoharness/typescript/model-runtime/responses.ts:996-1013</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">The RLM is shallower and more brittle than its name suggests</p>
+  <p>It is not resumable, a tool error aborts the turn, and a tool-approval denial aborts it too instead of reaching the model. "Recursive" is depth one: <code>run_subquery</code> passes no tools. The "persistent" REPL is a fresh Boa context per call with JSON globals rehydrated, so functions vanish. There is a second, independent RLM in TS using <code>node:vm</code>, with a 2 s timeout and host closures, while the Rust REPL has no timeout I could find (read, not run). The Rust system prompt even contains literal <code>{{ }}</code>; see <a href="prompts.html">prompts</a>.</p>
+  <p><span class="src">crates/executor/src/native/rlm.rs:242-247</span> · <span class="src">crates/executor/src/native/rlm.rs:357-387</span> · <span class="src">crates/executor/src/native/harness_js_repl.rs:27-111</span> · <span class="src">exoharness/examples/typescript/rlm-harness.ts:114</span></p>
+</div>
+
+<h2>Credentials, network and sandboxes</h2>
+
+<div class="callout surprise">
+  <p class="callout-title">Nothing outside tests constructs <code>EgressError::Rejected</code> <span class="pill">dead path</span></p>
+  <p>The "typed egress rejections" change (#405) adds the variant and a 403 mapping, but both in-tree resolvers push vault errors through <code>?</code> into <code>Internal</code>, so a local guest still gets a generic 502. It is a hook for hosted resolvers. The PR text calls it <code>EgressRejection</code>; the type is <code>EgressError::Rejected</code>. Policy denials are 502 on the native proxy but 403 in the worker runtime.</p>
+  <p><span class="src">crates/exoharness/src/egress_credentials.rs:324-336</span> · <span class="src">crates/exoharness/src/egress/mod.rs:594-606</span> · <span class="src">crates/worker-runtime/src/operations.rs:148-158</span> · <a href="egress-and-vaults.html">egress &amp; vaults</a></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">The policy language is small <span class="pill">security</span></p>
+  <p>No wildcards (<code>*.example.com</code> and IP literals are rejected at load), no method or path rules (they only reach the resolver), and no CIDR in the proxy path (<code>allowed_egress_cidrs</code> is emitted only on the non-proxy Firecracker firewall path). Substitution is header-only: a placeholder in a URL, query or body is forwarded as an inert literal, and <code>deny_unknown_fields</code> rejects a <code>body</code> injection location. A non-443 origin grant is accepted and unit-tested but cannot be used through the sandbox proxy.</p>
+  <p><span class="src">crates/exoharness/src/types.rs:840-873</span> · <span class="src">crates/exoharness/src/types.rs:913-918</span> · <span class="src">crates/exoharness/src/credential_policy.rs:212</span> · <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:3556-3561</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Cursor puts the real API key in the sandbox <span class="pill">security</span></p>
+  <p>Codex, Claude Code and Pi get a vault secret bound to an env var at the egress proxy. Cursor has no entry in <code>sandbox_model_credential_variable</code>; its harness calls <code>resolveModel</code> and copies the plaintext into <code>env.CURSOR_API_KEY</code>. Its image is also the only one not published or digest-pinned.</p>
+  <p><span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts:67</span> · <span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts:590</span> · <span class="src">crates/executor/src/managed_agents/config.rs:71-99</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Only two vault presets exist, and some vault docs are stale <span class="pill">docs drift</span></p>
+  <p><code>openai</code> and <code>github</code>. For Anthropic use <code>--token-env ANTHROPIC_API_KEY --allow-origin https://api.anthropic.com</code>. The website says <code>exo vault bind --email</code> is "planned / not implemented", yet the CLI dispatches <code>Bind</code> to <code>identity::run</code> and the Slack adapter reads <code>use_sender_vault</code>. And <code>docs/providers.md</code> says vault writes need local Exo while the CLI has remote branches.</p>
+  <p><span class="src">crates/cli/src/vaults/login.rs:11-15</span> · <span class="src">crates/cli/src/main.rs:1170</span> · <span class="src">crates/executor/src/managed_agents/adapters/slack.rs:357</span> · <span class="src">crates/cli/src/vaults.rs:197-207</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">MCP OAuth is not in the MCP crate</p>
+  <p><code>crates/mcp</code> only injects a bearer token and retries once on 401. Discovery and the browser flow live in the CLI vault login (<code>rmcp::AuthorizationManager</code>, a 300 s window).</p>
+  <p><span class="src">crates/cli/src/vaults/login.rs:162-240</span> · <span class="src">crates/mcp/src/native.rs:108-126</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">No local sandbox backend runs an idle timer <span class="pill">default</span></p>
+  <p><code>idle_seconds = 0</code> means "expire immediately", and true one-shot mode is unreachable through the harness because <code>sandbox_request()</code> always sets <code>idle_ttl: Some(...)</code>. Docker reaps expired warm containers lazily at the next <code>acquire</code>. smolvm only reports <code>is_running = false</code> once the idle clock passes the TTL (the #404 fix) and leaves stopping to the owner. Firecracker reaps in <code>acquire_raw</code>. Only remote providers and Cloudflare's alarm have real timers, and Sprites ignores the TTL. Defaults also differ by layer: executor 300 s, raw harness create 60 s.</p>
+  <p><span class="src">crates/exoharness/src/basic/sandboxes.rs:2624-2626</span> · <span class="src">crates/exoharness/src/sandbox/native.rs:344-365</span> · <span class="src">crates/exoharness/src/sandbox_provider/smolvm.rs:1323-1343</span> · <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:766-769</span> · <a href="sandboxes.html">sandboxes</a></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">PTY is implemented but unreachable <span class="pill">dead path</span></p>
+  <p>smolvm and the Firecracker guest both implement terminals, but the harness rejects <code>SandboxProcessMode::Pty</code> ("only supports exec-mode processes"), nothing outside tests calls <code>start_terminal</code>, and the Lima handle has no terminal at all. The Firecracker README's <code>sandbox connect</code> and <code>sandbox exec</code> do not exist; the CLI has <code>run | forward | attach | detach</code>.</p>
+  <p><span class="src">crates/exoharness/src/basic/sandboxes.rs:2183-2185</span> · <span class="src">crates/exoharness/src/sandbox.rs:283-289</span> · <span class="src">crates/cli/src/main.rs:774-815</span> · <span class="src">support/firecracker/README.md:92-95</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Snapshot kinds are mutually exclusive per backend, and payloads are mostly references</p>
+  <p>E2B accepts only <code>Full</code>; Docker, Daytona, Sprites and smolvm only <code>Filesystem</code>; Firecracker both. Only Docker returns real bytes. The docs overstate the egress-proxy restriction: in code only Firecracker <em>Full</em> capture and restore is blocked by a proxy (<code>PROXIED_SNAPSHOT_UNSUPPORTED</code>); filesystem snapshots restore with a fresh proxy binding.</p>
+  <p><span class="src">crates/exoharness/src/sandbox_provider/e2b.rs:402-408</span> · <span class="src">crates/exoharness/src/basic/sandboxes.rs:1615-1667</span> · <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:1078-1080</span> · <span class="src">crates/exoharness/src/sandbox_provider/firecracker_filesystem.rs:321-345</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">The macOS "Lima backend" is the Linux backend behind a stdio bridge</p>
+  <p><code>run_firecracker_bridge</code> instantiates <code>FirecrackerSandboxBackend</code> per distinct config; even the OCI pull and <code>mkfs.ext4</code> happen inside Lima. The egress runtime and credential resolver stay in the macOS process and relay accepted proxy connections over the bridge.</p>
+  <p><span class="src">crates/exoharness/src/sandbox_provider/firecracker_bridge.rs:220-250</span> · <span class="src">crates/exoharness/src/sandbox_provider/firecracker_bridge.rs:302</span> · <span class="src">crates/exoharness/src/sandbox_provider/firecracker_lima.rs:666-700</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Docker cannot preview; Firecracker rejects host mounts</p>
+  <p>Docker's <code>prepare_request</code> hard-codes <code>tcp_ports: vec![]</code> and has no <code>connect_tcp</code>. Firecracker requires <code>internal</code> mounts (resource disks, max 20), at most one durable workspace that must equal the workdir, and a whitespace-free workdir because it travels on the kernel command line.</p>
+  <p><span class="src">crates/exoharness/src/sandbox/native.rs:323-341</span> · <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:2516-2580</span></p>
+</div>
+
+<h2>HTTP, server and CLI</h2>
+
+<div class="callout surprise">
+  <p class="callout-title">No daemon and no service auto-start</p>
+  <p><code>exo run</code> builds the whole runtime in-process each time. Only <code>exo run --serve</code> is a server, and <code>service.lock</code> is taken only by <code>serve</code> and local <code>identity</code>. Preview links need the owning process alive. <code>run --serve</code> ignores the saved provider selection unless <code>--provider</code> is explicit. <code>--tui</code> silently falls back to the line REPL when stdin is not a TTY, and is a hard error with an HTTP provider.</p>
+  <p><span class="src">crates/cli/src/main.rs:1151</span> · <span class="src">crates/cli/src/serve.rs:52-62</span> · <span class="src">crates/cli/src/main.rs:1043-1053</span> · <span class="src">crates/cli/src/main.rs:1209-1224</span> · <a href="cli-and-server.html">CLI &amp; server</a></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Native <code>exo run --serve</code> does not expose <code>/exo/request</code></p>
+  <p><code>Platform::exposes_store_protocol</code> defaults to <code>false</code> and only the Worker returns <code>true</code>. The standalone <code>serve_exoharness_http*</code> server is re-exported but has no production caller in the repo, only tests. The "store RPC over HTTP" client is unary only: its <code>watch_events</code> defaults to <code>unsupported(..)</code>. Any unrecognised error is also HTTP 400 rather than 500.</p>
+  <p><span class="src">crates/executor/src/managed_agents/http.rs:14-17</span> · <span class="src">crates/worker-runtime/src/http.rs:23-25</span> · <span class="src">crates/exoharness/src/http/client.rs:47-66</span> · <span class="src">crates/executor/src/managed_agents/service.rs:170-178</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title"><code>worker-runtime</code> is an empty crate on native targets, and the Worker supports little</p>
+  <p>The crate is <code>#![cfg(target_arch = "wasm32")]</code>. The Worker supports only the <code>basic</code> and <code>codex</code> harnesses, rejects custom tools and adapters, and its model client refuses streaming, so streaming is enabled only for the TypeScript kind.</p>
+  <p><span class="src">crates/worker-runtime/src/lib.rs:1</span> · <span class="src">crates/worker-runtime/src/execution.rs:46-60</span> · <span class="src">crates/worker-runtime/src/execution.rs:82-92</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Other small things</p>
+  <ul>
+    <li>Replayed history in the TUI shows "now" timestamps, because <code>render_message_lines</code> stamps each message at render time. <span class="src">crates/cli/src/render.rs:145</span></li>
+    <li><code>mise.toml</code> has no tasks. Pre-commit runs JS tooling and rustfmt; clippy is pre-push; <code>cargo test</code> and fuzzing never run from a hook, and fuzz is not in CI either. <span class="src">mise.toml:1-9</span> · <span class="src">scripts/precommit.mjs:45-71</span></li>
+    <li>The docs' event-kinds table is scraped from the Rust source with regexes at VitePress build time and throws if <code>EventData::kind()</code> moves. <span class="src">website/docs-src/.vitepress/event-kinds.ts:4-33</span></li>
+    <li><code>eval/harbor</code> calls CLI commands and flags that no longer exist (<code>exo secret create</code>, <code>exo model create</code>, <code>agent create --model --module</code>), so it is stale. <span class="src">eval/harbor/eval.py:411-437</span> · <span class="src">eval/harbor/src/exo_harbor/exo.py:34-61</span></li>
+    <li>Harbor forbids <code>--n-concurrent &gt; 1</code> on purpose, since trials share one self-evolving agent. <span class="src">eval/harbor/src/exo_harbor/plugin.py:33-40</span></li>
+    <li>Each Slack message is its own session, so Slack approvals always send <code>allow_for_tool: false</code>, and adapters poll every 2 s over all agents. <span class="src">crates/executor/src/managed_agents/adapters/mod.rs:775-794</span> · <span class="src">crates/executor/src/managed_agents/adapters/mod.rs:304-376</span></li>
+    <li>MCP failure tolerance is keyed on a string prefix: <code>connect_mcp</code> uses the tolerant path iff the caller principal starts with <code>"adapter-"</code>. <span class="src">crates/executor/src/managed_mcp.rs:36-49</span></li>
+    <li>Old stored agent shapes are still read: <code>from_json</code> accepts an untagged <code>Flat | Nested</code> form even though the docs claim no wrapper. <span class="src">crates/managed-agents/src/lib.rs:113-132</span></li>
+  </ul>
+</div>
+
+<h2>Docs that disagree with the code</h2>
+
+<table>
+  <thead><tr><th>Doc claim</th><th>What the code does</th><th>Refs</th></tr></thead>
+  <tbody>
+    <tr><td><code>tools:</code> in an agent file is a list of declaration objects (marked "Planned")</td><td>Field is <code>Vec&lt;PathBuf&gt;</code>; the documented YAML would fail to parse</td><td><span class="src">website/docs-src/agent-definition.md:99-125</span> · <span class="src">crates/managed-agents/src/frontmatter.rs:27-28</span></td></tr>
+    <tr><td>Slack adapter option <code>vaults</code></td><td>Field is <code>turn_vaults</code>; <code>deny_unknown_fields</code> rejects the documented key</td><td><span class="src">website/docs-src/adapters/slack.md:425</span> · <span class="src">crates/managed-agents/src/adapters.rs:53-54</span></td></tr>
+    <tr><td><code>exoharness/docs/managed-agents.md</code> documents <code>adapterType</code>, <code>workerCommand</code>, <code>secretEnv</code></td><td>One typed variant, <code>AdapterDefinition::Slack</code></td><td><span class="src">exoharness/docs/managed-agents.md:250-262</span> · <span class="src">crates/managed-agents/src/adapters.rs:9-11</span></td></tr>
+    <tr><td>Three default built-ins: shell, inspect_tools, manage_tool</td><td>Only <code>shell</code> by default</td><td><span class="src">exoharness/docs/tools.md:102-108</span> · <span class="src">exoharness/typescript/model-runtime/turn-loop.ts:78-87</span></td></tr>
+    <tr><td>Cost doc: <code>cache_creation_input_token_cost_above_1hr</code> is "parsed but unused"</td><td><code>ModelEntry</code> has no such field; code also prefers provider-reported <code>provider_cost_usd</code> (undocumented)</td><td><span class="src">crates/cost/src/table.rs:8-20</span> · <span class="src">crates/executor/src/model_events.rs:43-56</span></td></tr>
+    <tr><td>Local sandbox design: Apple <code>container</code> recommended; checkpoint stores</td><td>Doc is "proposed"; the real default is smolvm; those stores do not exist</td><td><span class="src">exoharness/docs/design/local-sandbox.md</span> · <span class="src">crates/exoharness/src/types.rs:1023-1027</span></td></tr>
+    <tr><td>Containers are not adopted across processes</td><td>Docker adopts by <code>exo.sandbox.key</code> and spec-hash labels</td><td><span class="src">exoharness/docs/sandbox-snapshots.md</span> · <span class="src">crates/exoharness/src/sandbox/native.rs:1234-1272</span></td></tr>
+    <tr><td>Head tracking is enforced inside the exoharness</td><td>The check cannot fail in the reference implementation</td><td><span class="src">website/docs-src/architecture/data-model.md:46-50</span> · <span class="src">crates/exoharness/src/basic.rs:2459-2466</span></td></tr>
+    <tr><td>The self-improving agent's <code>me.md</code> teaches Discord voice, WhatsApp, Signal adapters</td><td>The only adapter in code is Slack; <code>me.md</code> also gives a doubled SELF.md path</td><td><span class="src">examples/self-improving-agent/prompts/me.md:11-21</span> · <span class="src">crates/managed-agents/src/adapters.rs:7-11</span></td></tr>
+  </tbody>
+</table>
+
+<h2>Self-improving agent gotchas</h2>
+
+<div class="callout warn">
+  <p class="callout-title">"Validate and rebuild" is two <code>cargo build</code>s</p>
+  <p>The tool description, <code>me.md</code> and SELF-CONTROL say validate, but the only command is <code>restart-all --build</code>: no TS type-check and no tests, so a broken <code>harness.ts</code> is found on the next turn. The bootstrap profile also does not isolate import-time breakage (read, not run): <code>profiles/index.ts</code> statically imports both profiles and <code>harness.ts</code> statically imports the memory and todo tools. The drain grace (300 s) is shorter than the task command timeout (10 min), so a long scheduled task at restart time is killed.</p>
+  <p><span class="src">examples/self-improving-agent/tools/guardian-tools.ts:53</span> · <span class="src">examples/self-improving-agent/profiles/index.ts:1-2</span> · <span class="src">examples/self-improving-agent/scripts/exo-service-guardian:127</span> · <span class="src">crates/executor/src/native/scheduler_types.rs:11</span> · <a href="examples.html">examples</a></p>
+</div>
+
+<div class="callout warn">
+  <p class="callout-title">Round-budget exhaustion is silent in one loop and an error in another</p>
+  <p><code>runResponsesTurnLoop</code> simply returns when <code>round &gt; maxToolRoundTrips</code>. <code>assertRoundBudget</code> (RLM, TS) and the Rust RLM bail with an error. Likewise, omitting <code>nativeToolApprovals</code> in a custom harness has teeth: the runner validates policies as if it were <code>false</code> and rejects <code>always_ask</code>.</p>
+  <p><span class="src">exoharness/typescript/model-runtime/turn-loop.ts:114-120</span> · <span class="src">exoharness/typescript/harness/index.ts:482-496</span> · <span class="src">crates/executor/src/native/rlm.rs:84-89</span> · <span class="src">exoharness/typescript/harness/runner.ts:302-310</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">There is no compaction or summarisation prompt anywhere</p>
+  <p>No history-summarising instruction exists, and thread titles are not LLM-generated: <code>thread_name_from_messages</code> takes the first 80 characters of the first user message. Context control is per-round re-injection of small state plus the RLM. A plain managed agent's whole prompt is its markdown body as one <code>system</code> message, and an empty body is rejected. Codex, Claude Code and Pi receive only <code>agentConfig.instructions</code> flattened to a string; skills, memory and todo are features of the TS Responses loop only.</p>
+  <p><span class="src">crates/exoharness/src/basic.rs:3042-3070</span> · <span class="src">crates/executor/src/managed_agents/config.rs:342-344</span> · <span class="src">crates/managed-agents/src/lib.rs:97-106</span> · <span class="src">exoharness/typescript/codex/harness.ts:881-883</span> · <a href="prompts.html">prompts</a></p>
+</div>
+
+</main>
+<aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/wiki.js"></script>
+</body>
+</html>

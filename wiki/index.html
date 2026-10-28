@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overview · Exo internals</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav id="nav"></nav>
+<main>
+<header>
+  <div class="kicker">Start here</div>
+  <h1>Exo internals</h1>
+  <p class="lede">An implementation wiki for Exo, an open-source runtime that hosts agents behind an API with durable conversations, sandboxes, credential substitution and network control. It explains how the code works, shows the code that matters, and collects the prompts, ideas and surprises.</p>
+</header>
+
+<h2>What Exo is, in one paragraph</h2>
+
+<p>You describe an agent as a markdown file (frontmatter for harness, model and tools; body as instructions). Exo stores it, runs it on a <strong>harness</strong> of your choice (Codex, Claude Code, Pi, a built-in loop, or your own TypeScript module), and keeps everything the harness does as an <strong>append-only event log</strong> per thread. Commands run in a <strong>sandbox</strong> (Firecracker microVM, smolvm, Docker, or a remote provider) whose network goes through an <strong>egress proxy</strong> that swaps placeholder credentials for real secrets held in a <strong>vault</strong>, so the model never sees a raw key. Because the log is the source of truth, clients can disconnect, services can restart, and threads can be forked or resumed.</p>
+
+<div class="callout">
+  <p class="callout-title">The central design bet</p>
+  <p>Split a harness into <em>semantics</em> (prompt assembly, model calls, compaction, planning, tool choice) and <em>infrastructure</em> (identity, history, artifacts, secrets, sandboxes). Exo owns only the infrastructure, called the <strong>exoharness</strong>, and delegates semantics to whichever harness you plug in. The exoharness stores and orders events but never decides what goes in a prompt. The README and <code>exoharness/docs/spec.md</code> state this; the code below shows where the line really falls.</p>
+</div>
+
+<svg class="diagram" viewBox="0 0 760 430" role="img" aria-label="Layer diagram: clients, runtime, harnesses, exoharness, sandboxes">
+  <defs><marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z"/></marker></defs>
+  <rect class="box-blue" x="20" y="10" width="720" height="62" rx="8"/>
+  <text class="b" x="36" y="32">Clients</text>
+  <text class="muted" x="36" y="52">exo CLI / TUI · HTTP + SSE (/exo/...) · Slack adapter · Cloudflare Worker front door</text>
+  <rect class="box-accent" x="20" y="92" width="720" height="78" rx="8"/>
+  <text class="b" x="36" y="114">Runtime / executor (crates/executor)</text>
+  <text class="muted" x="36" y="134">Provider (Local | Http) · durable TurnQueue per thread · TurnWork recovery · permissions · MCP · scheduler</text>
+  <text class="muted" x="36" y="153">HarnessExecutor trait: run_turn / resume_turn / cancel / suspend</text>
+  <rect class="box-warn" x="20" y="190" width="720" height="78" rx="8"/>
+  <text class="b" x="36" y="212">Harnesses (the semantics)</text>
+  <text class="muted" x="36" y="232">basic loop · rlm · TypeScript modules over JSONL: Codex app-server, Claude Code, Pi, Cursor, your own</text>
+  <text class="muted" x="36" y="251">decide the prompt, the model call, the tools, compaction, and when a turn is done</text>
+  <rect class="box-teal" x="20" y="288" width="720" height="62" rx="8"/>
+  <text class="b" x="36" y="310">Exoharness (the substrate, crates/exoharness)</text>
+  <text class="muted" x="36" y="330">agents · threads · sessions · turns · events (UUIDv7 log) · artifacts · vaults · secrets · bindings · sandbox registry</text>
+  <rect class="box" x="20" y="368" width="350" height="52" rx="8"/>
+  <text class="b" x="36" y="390">Sandbox providers</text>
+  <text class="muted" x="36" y="408">Firecracker (+Lima) · smolvm · Docker · Daytona · E2B · …</text>
+  <rect class="box" x="390" y="368" width="350" height="52" rx="8"/>
+  <text class="b" x="406" y="390">Egress proxy + vault</text>
+  <text class="muted" x="406" y="408">TLS intercept · placeholder → secret · DNS/host policy</text>
+  <path class="arrow" d="M380,72 L380,92"/>
+  <path class="arrow" d="M380,170 L380,190"/>
+  <path class="arrow" d="M380,268 L380,288"/>
+  <path class="arrow" d="M195,350 L195,368"/>
+  <path class="arrow" d="M565,350 L565,368"/>
+</svg>
+
+<h2>Where to go</h2>
+
+<div class="cards">
+  <a class="card" href="architecture.html"><strong>Architecture &amp; crate map</strong><span>The exoharness / executor / harness split, every crate, one request traced end to end, the HTTP protocol, the Cloudflare/wasm runtime.</span></a>
+  <a class="card" href="data-model.html"><strong>Data model &amp; event log</strong><span>EventData variants, UUIDv7 ids, batch objects, head derivation, watch, fork, the turn queue and its journal.</span></a>
+  <a class="card" href="harnesses.html"><strong>Harnesses &amp; executors</strong><span>The harness contract, the Rust execution loop, the TS runner and its wire protocol, recovery, the scheduler, RLM.</span></a>
+  <a class="card" href="native-harnesses.html"><strong>Codex, Claude Code, Pi &amp; Cursor</strong><span>How vendor runtimes are driven and projected onto events, with write-ahead intents and replay.</span></a>
+  <a class="card" href="tools-and-mcp.html"><strong>Tools, MCP &amp; skills</strong><span>Three tool kinds, built-ins, MCP connection and auth, approvals as events, skills.</span></a>
+  <a class="card" href="sandboxes.html"><strong>Sandboxes</strong><span>Provider traits, the Firecracker stack, snapshots, idle TTL, the Lima bridge, previews.</span></a>
+  <a class="card" href="egress-and-vaults.html"><strong>Egress, secrets &amp; vaults</strong><span>Placeholder substitution, the TLS interceptor, host binding, AEAD-bound policy, OAuth refresh.</span></a>
+  <a class="card" href="managed-agents.html"><strong>Managed agents &amp; adapters</strong><span>The agent file schema, the <code>/exo</code> HTTP API, the Slack adapter, authority and identity.</span></a>
+  <a class="card" href="cli-and-server.html"><strong>CLI, server &amp; tooling</strong><span>The command tree, in-process vs remote runtimes, the TUI, test styles, CI, fuzz, eval.</span></a>
+  <a class="card" href="prompts.html"><strong>Prompts, verbatim</strong><span>Every model-facing prompt and tool description found, where it is injected, and what it is doing.</span></a>
+  <a class="card" href="examples.html"><strong>Examples &amp; custom harnesses</strong><span>The self-improving agent, a minimal custom harness, the Game Boy agent, RLM in TypeScript.</span></a>
+  <a class="card" href="ideas.html"><strong>Ideas worth stealing</strong><span>Transferable techniques, grouped: recovery, log design, security, portability, agent design.</span></a>
+  <a class="card" href="surprises.html"><strong>Surprises &amp; gotchas</strong><span>Dead paths, risky defaults, and a table of places where the docs and the code disagree.</span></a>
+  <a class="card" href="reference.html"><strong>Glossary &amp; file map</strong><span>Terms as the code uses them, and the files to open first for each subsystem.</span></a>
+</div>
+
+<h3>Suggested reading paths</h3>
+<table>
+  <thead><tr><th>If you want to…</th><th>Read</th></tr></thead>
+  <tbody>
+    <tr><td>Understand the whole system in 30 minutes</td><td><a href="architecture.html">Architecture</a> → <a href="data-model.html">Data model</a> → <a href="harnesses.html">Harnesses</a> → <a href="surprises.html">Surprises</a></td></tr>
+    <tr><td>Evaluate the security model</td><td><a href="egress-and-vaults.html">Egress &amp; vaults</a> → <a href="sandboxes.html">Sandboxes</a> → trust-boundary notes in <a href="architecture.html">Architecture</a> and <a href="harnesses.html">Harnesses</a></td></tr>
+    <tr><td>Write a custom harness or tool</td><td><a href="harnesses.html">Harnesses</a> → <a href="tools-and-mcp.html">Tools</a> → <a href="examples.html">Examples</a> → <a href="prompts.html">Prompts</a></td></tr>
+    <tr><td>Borrow ideas for another system</td><td><a href="ideas.html">Ideas worth stealing</a>, then follow the links</td></tr>
+    <tr><td>Host agents for users (Slack, API)</td><td><a href="managed-agents.html">Managed agents</a> → <a href="cli-and-server.html">CLI &amp; server</a> → <a href="architecture.html">Architecture</a></td></tr>
+  </tbody>
+</table>
+
+<h2>The repository at a glance</h2>
+
+<p>About 139k lines of Rust across nine crates plus a TypeScript harness layer, a Cloudflare backend and container images. Line counts include tests, which are a large share (the egress proxy tests alone are 2.8k lines and serve as its specification).</p>
+
+<table>
+  <thead><tr><th>Path</th><th>Role</th><th>Approx. Rust lines</th></tr></thead>
+  <tbody>
+    <tr><td><code>crates/exoharness</code></td><td>The substrate: types, event log, storage, sandboxes and providers, egress, vaults, resources, HTTP protocol</td><td>64k</td></tr>
+    <tr><td><code>crates/executor</code></td><td>Runtime and execution: turn queue, harness executors, TS runner host, managed-agents service and adapters, MCP, permissions</td><td>41k</td></tr>
+    <tr><td><code>crates/cli</code></td><td>The <code>exo</code> binary: command tree, TUI, providers, vault commands, OAuth</td><td>25k</td></tr>
+    <tr><td><code>crates/managed-agents</code></td><td>Agent-file schema, frontmatter, HTTP wire types, identity, permissions, MCP vault selection</td><td>3.2k</td></tr>
+    <tr><td><code>crates/worker-runtime</code></td><td>The wasm build of the runtime for Cloudflare Workers / Durable Objects</td><td>2.4k</td></tr>
+    <tr><td><code>crates/firecracker-guest</code>, <code>-protocol</code></td><td>Guest PID 1 agent and the host/guest JSON protocol</td><td>1.8k</td></tr>
+    <tr><td><code>crates/mcp</code>, <code>crates/cost</code></td><td>MCP client with credential refresh; LiteLLM-based pricing</td><td>2k</td></tr>
+    <tr><td><code>exoharness/typescript</code></td><td>Harness runtime (<code>harness/</code>), Codex adapter, Cursor, model-runtime turn loop</td><td>TypeScript</td></tr>
+    <tr><td><code>exoharness/examples</code>, <code>examples/</code></td><td>Claude Code / Pi / Cursor harnesses, RLM, Game Boy agent, the self-improving agent</td><td>TypeScript</td></tr>
+    <tr><td><code>exoharness/cloudflare</code>, <code>exoharness/containers</code></td><td>Worker and Durable Object front door; pinned sandbox images per vendor CLI</td><td>TypeScript / Docker</td></tr>
+    <tr><td><code>website/docs-src</code>, <code>docs/</code>, <code>exoharness/docs</code></td><td>Published docs, operator references, design docs (some stale; see <a href="surprises.html">surprises</a>)</td><td>Markdown</td></tr>
+  </tbody>
+</table>
+
+<h2>Ten things worth knowing before you dive in</h2>
+
+<ol class="steps">
+  <li><strong>The log is the database.</strong> A thread is a directory of UUIDv7-named event objects. The head is derived from the keys, a turn's status is computed from its events, and approvals, wakeups and process-reuse markers are events too. See <a href="data-model.html">data model</a>.</li>
+  <li><strong>Recovery payloads ride along with the start event.</strong> <code>TurnWork</code> is written in the same batch as <code>TurnStarted</code>, so any started turn can be resumed from the journal alone. See <a href="harnesses.html">harnesses</a> and <a href="ideas.html">ideas</a>.</li>
+  <li><strong>Harnesses decide what resumes.</strong> Only Codex among the bundled harnesses can resume an interrupted turn; Claude Code and Pi end it as failed. See <a href="native-harnesses.html">native harnesses</a>.</li>
+  <li><strong>The sandbox never sees a real secret.</strong> It sees <code>exo_egress_…</code> placeholders; the proxy swaps them in headers only, and only for hosts the secret's policy allows. See <a href="egress-and-vaults.html">egress &amp; vaults</a>.</li>
+  <li><strong>Secret policy is cryptographically bound.</strong> The destination policy is part of the AEAD associated data, so editing the vault file to widen it breaks decryption.</li>
+  <li><strong>TypeScript harnesses are trusted code on the host.</strong> They talk JSONL to a Node child and can call most of the store API. Only the vendor binaries run in the sandbox. See <a href="harnesses.html">harnesses</a>.</li>
+  <li><strong>Approvals are events.</strong> Any connected client can answer a pending approval, even after a restart, but resuming it mid-tool only works for the Basic harness. See <a href="tools-and-mcp.html">tools &amp; MCP</a>.</li>
+  <li><strong>One runtime, many shapes.</strong> The same Rust runs natively on Tokio, in a CLI process, or compiled to wasm inside a Cloudflare Durable Object using a sans-IO design. See <a href="architecture.html">architecture</a>.</li>
+  <li><strong>There is no compaction prompt.</strong> Context is controlled by re-injecting small state each round and by the RLM pattern. See <a href="prompts.html">prompts</a>.</li>
+  <li><strong>Treat the docs as a guide, not a spec.</strong> The project says it is under construction, and several documents describe removed or planned features. <a href="surprises.html">Surprises</a> has the list.</li>
+</ol>
+
+<h2>About this wiki</h2>
+
+<p>It was written from a read of the source at commit <code>58fa2ff</code> (the pre-existing docs were used as input and checked against the code). Source references like <span class="src">crates/exoharness/src/types.rs:296</span> link to that exact commit on GitHub, so line numbers stay valid as the repo moves. Nothing was built or run to produce it; where a claim rests only on reading code, the page says so. The pages are plain static HTML: open <code>wiki/index.html</code> in a browser, or serve the folder.</p>
+
+<details>
+  <summary>Regenerating the search index</summary>
+  <p>Search runs client-side from <code>assets/search-index.js</code>. After editing any page, run <code>node wiki/build-search.mjs</code> to rebuild it. The glossary and file-map tables in <a href="reference.html">reference.html</a> were assembled from per-subsystem notes; edit that page directly from now on.</p>
+</details>
+
+</main>
+<aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/wiki.js"></script>
+</body>
+</html>

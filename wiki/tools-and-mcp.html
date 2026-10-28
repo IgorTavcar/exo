@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tools, MCP &amp; skills · Exo internals</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav id="nav"></nav>
+<main>
+<header>
+  <div class="kicker">Runtime internals</div>
+  <h1>Tools, MCP &amp; skills</h1>
+  <p class="lede">How an agent gets its tools (TypeScript modules, client-executed tools, MCP servers), how a model's tool call is authorized, executed and recorded as events, and how an interrupted call is reconciled after a restart. Skills are covered at the end.</p>
+</header>
+
+<h2 id="overview">The big picture</h2>
+
+<p>Exo has no single "tool system". A tool is a <code>ToolDefinition</code> (name, description, JSON-schema <code>parameters</code>) that the model sees, plus one of three ways of <em>executing</em> it. The durable record is always the same pair of events, <code>tool_requested</code> and <code>tool_result</code> <span class="src">crates/exoharness/src/types.rs:601-610</span>, regardless of who ran the call.</p>
+
+<table>
+<thead><tr><th>Kind</th><th>Declared by</th><th>Runs where</th><th>Authorization</th></tr></thead>
+<tbody>
+<tr><td><strong>TS module tool</strong> (built-in, library, agent)</td><td>A <code>Tool</code> object exported from a <code>.ts</code> module; loaded by the TS harness each model round</td><td>In the Node harness process (trusted code, not sandboxed); may call back to Rust via <code>context.executeTool</code> for "host tools" such as <code>shell</code></td><td>Harness calls <code>context.authorizeTool</code> before <code>execute</code>, unless the instance is marked <code>authorization: "runtime"</code></td></tr>
+<tr><td><strong>Client tool</strong> (internally "frontend tool")</td><td>The HTTP caller, as <code>frontend_tools</code> on a turn request</td><td>In the caller's application. The runtime parks the turn on an event until a result is posted</td><td>Same Rust <code>authorize</code> gate, then waits for <code>agent_runtime.frontend_tool_response</code></td></tr>
+<tr><td><strong>MCP tool</strong></td><td>The agent definition's <code>mcp_servers</code>; tool list discovered from the server at thread start</td><td>Remote MCP server over streamable HTTP, called from the Rust host (Basic/TS/Exo harnesses) or from inside the sandbox (Codex / Claude Code)</td><td>Rust <code>authorize</code>; MCP tools default to <code>always_ask</code></td></tr>
+</tbody>
+</table>
+
+<p>The Rust trait that unifies "things the host can execute" is <code>ToolRuntime</code>: <code>definitions()</code>, <code>execute()</code>, <code>mcp_servers()</code>, and an overridable <code>permission_policy()</code> <span class="src">crates/executor/src/executor_types.rs:215-254</span>. Runtimes are decorators: <code>McpToolRuntime&lt;T&gt;</code> wraps an inner runtime (<code>BasicToolRuntime</code> or <code>ExoToolRuntime</code>) and adds MCP tools on top <span class="src">crates/executor/src/mcp.rs:13-17</span>; client tools are layered on by <code>frontend_tools</code> helper functions rather than a runtime wrapper.</p>
+
+<pre class="diagram">
+  model response  --&gt;  tool_requested event(s) appended to the turn
+                                   |
+        +--------------------------+--------------------------------+
+        | TS harness (Responses loop)                               | Rust BasicExecutor
+        v                                                           v
+  HarnessToolRegistry.get(name)                              permissions::authorize(policy)
+   |-- library/agent/built-in TS tool                          |-- frontend_tools::contains ? wait for response event
+   |     authorizeTool --&gt; Rust authorize                      `-- ToolRuntime.execute
+   |     handler.execute() in Node                                    |-- McpToolSet.has_tool ? MCP call
+   `-- authorization:"runtime"  (shell, host tools,                   `-- inner runtime (shell, ...)
+       MCP + client tools from context.tools)
+         context.executeTool --&gt; Rust handle_request:
+            authorize -&gt; client tool? wait : ToolRuntime.execute
+                                   |
+                  tool_result event appended (compacted in TS path)
+</pre>
+
+<p>Pages that own the neighbouring topics: the harness contract is in <a href="harnesses.html">Harnesses</a>, the Codex / Claude Code adapters in <a href="native-harnesses.html">Native harnesses</a>, and vault / egress-proxy internals in <a href="egress-and-vaults.html">Egress &amp; vaults</a>. System-prompt wording of the tools is on <a href="prompts.html">Prompts</a>.</p>
+
+<h2 id="dispatch">Routing a tool call</h2>
+
+<h3 id="ts-dispatch">TypeScript path: <code>HarnessToolRegistry</code></h3>
+
+<p>The shared Responses turn loop rebuilds a fresh registry <em>every model round</em> (this is why a newly installed tool is "available next round") <span class="src">exoharness/typescript/model-runtime/turn-loop.ts:122-127</span>. After registering built-ins, library modules from <code>agentConfig.typescript.toolModulePaths</code>, and installed tools, it registers every Rust-supplied definition in <code>context.tools</code> (MCP tools + client tools) as a pass-through instance <span class="src">exoharness/typescript/model-runtime/turn-loop.ts:128-143</span>. It then calls <code>validateToolPolicies</code>, sends <code>tools.definitions()</code> to the model, appends the response events, and executes each returned call <span class="src">exoharness/typescript/model-runtime/turn-loop.ts:197-206</span>.</p>
+
+<figure class="code">
+  <figcaption><strong>The whole TS dispatch: lookup, optional authorize, execute</strong> <span class="src">exoharness/typescript/harness/tools.ts:107-124</span></figcaption>
+  <pre><code class="language-ts">private async executeToolCall(
+  toolCall: PendingToolCall,
+): Promise&lt;{ tool: ToolInstance; result: ToolResult }&gt; {
+  const tool = this.tools.get(toolCall.request.functionName);
+  if (!tool) {
+    throw new Error(
+      `tool execution is not configured for ${toolCall.request.functionName}`,
+    );
+  }
+  if (tool.authorization !== "runtime") {
+    await this.context.authorizeTool(toolCall.request);
+  }
+  const result = await tool.handler.execute(toolCall.request.arguments, {
+    context: this.context,
+    toolCallId: toolCall.toolCallId,
+  });
+  return { tool, result };
+}</code></pre>
+</figure>
+
+<p>Any exception (unknown tool, denied approval, handler error) is caught in <code>executeToolCallOrError</code> and turned into <code>{ ok: false, error }</code> so a failing tool never crashes the turn <span class="src">exoharness/typescript/harness/tools.ts:90-105</span>. Denial surfaces to the model exactly this way: the Rust side throws <code>tool call denied by the user: NAME</code>.</p>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: <code>authorization: "runtime"</code> avoids double approval</p>
+<p>A tool that delegates to Rust (<code>shell</code>, MCP, client tools) would be authorized twice: once by the TS registry, once inside Rust's <code>execute_tool</code> handler. Instead of de-duplicating at the Rust side, <code>ToolInstance</code> carries a one-value flag <span class="src">exoharness/typescript/harness/tools.ts:29-34</span> and delegating tools set it. The TS registry skips <code>authorizeTool</code>; <code>handle_request</code> authorizes exactly once <span class="src">crates/executor/src/typescript_runtime.rs:173-199</span>. TS-native tools (no flag) use the explicit <code>AuthorizeTool</code> runtime request, which returns <code>null</code> after the same <code>authorize</code> gate.</p></div>
+
+<h3 id="result-compaction">Result compaction</h3>
+
+<p>Every TS-path result is wrapped before it reaches the event log. <code>compactToolResult</code> always writes the full JSON to an artifact <code>tool-results/&lt;tool&gt;/&lt;callId&gt;/result.json</code>, additionally writes <code>stdout.txt</code> / <code>stderr.txt</code> when the result has those string fields, and returns an envelope <span class="src">exoharness/typescript/harness/tools.ts:156-182</span>:</p>
+
+<table>
+<thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>ok</code></td><td><code>result.ok</code> if it is a boolean, else <code>true</code> <span class="src">exoharness/typescript/harness/tools.ts:237-242</span></td></tr>
+<tr><td><code>toolName</code>, <code>toolCallId</code>, <code>source</code></td><td><code>source</code> is <code>built_in</code>, <code>library</code> or <code>agent</code>; unknown tools default to <code>built_in</code></td></tr>
+<tr><td><code>resultArtifact</code>, <code>artifacts[]</code></td><td>Artifact references (id, path, version, size, mime type)</td></tr>
+<tr><td><code>value</code> / <code>truncated</code></td><td>The raw result inline if its pretty-printed JSON is &le; 8 000 chars, else <code>null</code> and <code>truncated: true</code> <span class="src">exoharness/typescript/harness/tools.ts:14-15</span></td></tr>
+<tr><td><code>preview</code></td><td>First 4 000 chars of the serialization plus <code>...[truncated]</code></td></tr>
+</tbody>
+</table>
+
+<p>The Rust-only <code>BasicExecutor</code> does no compaction; it stores the raw tool result (and wraps errors as <code>{"ok": false, "error": "..."}</code>) <span class="src">crates/executor/src/basic.rs:237-300</span>.</p>
+
+<div class="callout surprise"><p class="callout-title">MCP <code>isError</code> is not <code>ok: false</code> in the registry envelope</p>
+<p><code>resultOk</code> only inspects a boolean <code>ok</code> field. An MCP <code>CallToolResult</code> with <code>"isError": true</code> contains no such field, so in the TS registry path its envelope says <code>ok: true</code>; the error is only visible inside <code>value</code> / <code>preview</code>. The Claude runtime-tool bridge, by contrast, checks both <code>ok === false</code> and <code>is_error === true</code> <span class="src">exoharness/typescript/harness/client-tools.ts:6-13</span>. Whether the model is misled depends on it reading the payload, not the envelope flag.</p></div>
+
+<h3 id="rust-dispatch">Rust path: <code>BasicExecutor</code> and <code>handle_request</code></h3>
+
+<p>In the Rust-only Basic harness the loop is: build the request (<code>shell</code> definition from <code>ConversationConfig.shell_program</code> + <code>ToolRuntime::definitions()</code> + client tool definitions), call the model, append the response events preceded by a <code>exo.basic.tool_round</code> marker, then <code>execute_tool_round</code> <span class="src">crates/executor/src/basic.rs:150-235</span>. For each call it runs <code>permissions::authorize</code>, then branches: client tool &rarr; <code>frontend_tools::execute</code>, otherwise <code>ToolRuntime::execute</code> <span class="src">crates/executor/src/basic.rs:237-280</span>.</p>
+
+<p>Which runtime sits underneath is decided in <code>ManagedExecutor::thread</code>: Basic and RLM harnesses get <code>McpToolRuntime::new(BasicToolRuntime, mcp.tools)</code>; the <code>Exo</code> harness swaps in <code>ExoToolRuntime</code> <span class="src">crates/executor/src/native/managed_executor.rs:66-105</span>. <code>BasicToolRuntime</code> executes only <code>shell</code>. <code>ExoToolRuntime</code> adds <code>schedule_sandbox_task</code>, <code>list_scheduled_tasks</code>, <code>cancel_scheduled_task</code>, <code>delete_scheduled_task</code>, <code>list_conversation_events</code>, <code>get_sandbox_status</code>, <code>list_sandbox_snapshots</code>, <code>snapshot_sandbox</code>, <code>rewind_sandbox</code> <span class="src">crates/executor/src/native/harness_tool.rs:81-190</span>.</p>
+
+<div class="callout surprise"><p class="callout-title">Rust executes tools whose definitions it does not own</p>
+<p><code>ExoToolRuntime::definitions()</code> is not overridden, so it returns the trait default (empty). The model-facing schemas for the sandbox-control tools live in TypeScript (<code>examples/self-improving-agent/tools/sandbox-tools.ts</code>), registered through <code>hostTool()</code>, a bridge that forwards <code>execute</code> to <code>context.executeTool</code> with <code>authorization: "runtime"</code> <span class="src">examples/self-improving-agent/tools/host-tools.ts:23-37</span>. Adding a Rust-backed tool is therefore two edits in two languages: a <code>match</code> arm in <code>ExoToolRuntime::execute</code> and a TS definition.</p></div>
+
+<h2 id="ts-tools">TypeScript tools</h2>
+
+<h3 id="tool-shape">Shape of a tool</h3>
+
+<p>A <code>Tool</code> separates the model-facing <em>definition</em> from <em>initialization parameters</em> (host-side configuration, never shown to the model) and a handler factory <span class="src">exoharness/typescript/harness/tools.ts:41-49</span>:</p>
+
+<figure class="code">
+  <figcaption><strong>The tool contract: definition + initialization schema + <code>initialize()</code> returning a handler</strong> <span class="src">exoharness/typescript/harness/tools.ts:21-49</span></figcaption>
+  <pre><code class="language-ts">export interface ToolHandler {
+  execute(
+    args: JsonObject,
+    execution: ToolExecutionContext,
+  ): Promise&lt;ToolResult&gt;;
+}
+
+export interface ToolInstance {
+  definition: ToolDefinition;
+  source: HarnessToolSource;
+  handler: ToolHandler;
+  authorization?: "runtime";
+}
+
+// ...
+export interface Tool {
+  definition: ToolDefinition;
+  initializationParameters: JsonValue;
+  initialization?: JsonObject;
+  initialize(
+    args: JsonObject,
+    initialization: ToolInitializationContext,
+  ): Promise&lt;ToolHandler&gt; | ToolHandler;
+}</code></pre>
+</figure>
+
+<p><code>initializeTool</code> validates before a tool can be registered: name matches <code>/^[A-Za-z0-9_-]+$/</code> and &le; 64 chars, non-empty description, <code>parameters.type === "object"</code> with <code>additionalProperties: false</code>; the initialization arguments are checked against <code>initializationParameters</code> by a small built-in JSON-schema subset; the returned handler must have <code>execute</code> (a handler with <code>invoke</code> gets a pointed error) <span class="src">exoharness/typescript/harness/tools.ts:266-329</span>, <span class="src">exoharness/typescript/harness/tools.ts:388-399</span>. For <code>source === "agent"</code> it also applies <em>strict-mode</em> validation: every key in <code>properties</code> must be in <code>required</code>, optional params must be typed nullable, recursively <span class="src">exoharness/typescript/harness/tools.ts:331-386</span>.</p>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: reject strict-mode violations at install time</p>
+<p>The model runtime sends every tool with provider strict mode on, so one non-strict schema makes the model API reject <em>every</em> turn. The comment on <code>validateStrictToolParameters</code> explains the placement: it runs in <code>manage_tool</code> (reject the install) and again at registration (skip just the broken tool and keep the turn alive) <span class="src">exoharness/typescript/harness/tools.ts:331-336</span>. Note the asymmetry: Rust MCP tool definitions are sent with <code>strict: Some(false)</code> <span class="src">crates/executor/src/mcp.rs:28</span>, since third-party schemas cannot be expected to satisfy it.</p></div>
+
+<h3 id="sources">Three TS sources and how they load</h3>
+
+<table>
+<thead><tr><th><code>HarnessToolSource</code></th><th>Origin</th><th>Loader</th></tr></thead>
+<tbody>
+<tr><td><code>built_in</code></td><td>Code in <code>built-in-tools.ts</code> / <code>skill-tools.ts</code></td><td><code>registerBuiltInTools(registry, context, names)</code> <span class="src">exoharness/typescript/harness/built-in-tools.ts:33-54</span></td></tr>
+<tr><td><code>library</code></td><td>Paths in agent definition <code>tools: [./tools.ts]</code>, delivered as <code>agentConfig.typescript.toolModulePaths</code></td><td><code>registerLibraryToolModulePath</code>; module may default-export a <code>Tool</code>, a <code>ToolModuleEntry</code>, a <code>ToolModule</code> or an array; also tries <code>toolModule</code>, <code>tool</code>, <code>tools</code> exports <span class="src">exoharness/typescript/harness/tool-modules.ts:200-219</span></td></tr>
+<tr><td><code>agent</code></td><td>Tools the agent wrote itself: manifest-installed (<code>.exo/tools/</code>) or legacy files (<code>.exo/agent-tools/*.ts</code>)</td><td><code>registerInstalledTools</code> / <code>registerLegacyAgentToolsFromDirectoryIfExists</code> <span class="src">exoharness/typescript/harness/tool-modules.ts:114-154</span></td></tr>
+</tbody>
+</table>
+
+<p>The default registry (<code>createDefaultToolRegistry</code>) registers built-in <code>shell</code>, then library modules, then installed tools, then &mdash; only if <code>enableAgentToolCreation</code> (agent-definition <code>tool_creation</code>) is set &mdash; the legacy directory <span class="src">exoharness/typescript/model-runtime/turn-loop.ts:54-85</span>. Tool names are unique per registry: a second <code>register</code> with the same name throws <span class="src">exoharness/typescript/harness/tools.ts:60-67</span>.</p>
+
+<h3 id="registry">The workspace tool registry (<code>.exo/tools</code>)</h3>
+
+<p>Agent-installed tools are an on-disk package registry with a lockfile. A source directory holds <code>exo-tool.json</code> with exactly <code>{schemaVersion, id, module}</code>; ids must match <code>^tool:[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$</code> <span class="src">exoharness/typescript/harness/tool-registry.ts:366-389</span>. Sources are either workspace-relative <code>local</code> paths (symlink-resolved and required to stay inside the workspace) or <code>git</code> with a pinned 40&ndash;64 hex commit that is re-verified with <code>rev-parse HEAD</code> after checkout <span class="src">exoharness/typescript/harness/tool-registry.ts:233-275</span>, <span class="src">exoharness/typescript/harness/tool-registry.ts:284-339</span>.</p>
+
+<ol class="steps">
+<li>Copy/clone into <code>.exo/tools/.staging/candidate-*</code>, read the manifest, check the module path stays inside the source root.</li>
+<li><strong>Validate by actually loading the module</strong> (<code>loadAgentTool</code> with the proposed initialization) and reject names of built-in tools <span class="src">exoharness/typescript/harness/built-in-tools.ts:381-391</span>.</li>
+<li>Under a cross-process lock file (<code>registry.lock</code>, <code>O_EXCL</code>, stolen after 60 s, 10 s acquire timeout) re-read the lockfile, re-validate the other installs, and reject duplicate <em>model-facing tool names</em> across different ids <span class="src">exoharness/typescript/harness/tool-registry.ts:108-136</span>, <span class="src">exoharness/typescript/harness/tool-registry.ts:432-483</span>.</li>
+<li>Move into <code>store/&lt;id&gt;/&lt;uuid&gt;</code>, atomically write <code>tools.lock.json</code> (temp file + rename), then delete the replaced store directory. Installing an existing id is an upsert.</li>
+</ol>
+
+<p>The lockfile is validated on read, including that each <code>installPath</code> lies under <code>store/</code> <span class="src">exoharness/typescript/harness/tool-registry.ts:517-528</span>. A broken installed tool is logged and skipped rather than failing the turn <span class="src">exoharness/typescript/harness/tool-modules.ts:127-132</span>.</p>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: secrets by reference in persisted tool config</p>
+<p>Agent tool <code>initialization</code> is persisted in the lockfile, so any string value that is exactly <code>"${NAME}"</code> is resolved from the host environment each time the tool loads; a missing variable is a load error, and everything else passes through <span class="src">exoharness/typescript/harness/tool-modules.ts:261-296</span>. The <code>manage_tool</code> description tells the model to use this form instead of literal secrets <span class="src">exoharness/typescript/harness/built-in-tools.ts:191-195</span>. Only <code>agent</code>-source tools get the expansion; library tools receive their initialization verbatim <span class="src">exoharness/typescript/harness/tool-modules.ts:244-259</span>.</p></div>
+
+<div class="callout warn"><p class="callout-title">Trust model</p>
+<p>Tool modules run in the harness process with the full <code>TurnContext</code>: they can start sandbox processes, read events, write artifacts. There is no capability sandbox for the module itself; <code>exoharness/docs/tools.md:16</code> says so explicitly. The conversation sandbox only constrains what a tool does <em>through</em> <code>shell</code> / <code>startSandboxProcess</code> (<code>sandbox-process.ts</code> wraps that process handle as web streams).</p></div>
+
+<h2 id="builtins">Built-in tools</h2>
+
+<p>"Built-in" means different things at each layer, so this table lists what the code actually registers and where.</p>
+
+<table>
+<thead><tr><th>Tool</th><th>Layer</th><th>Schema (arguments)</th><th>Registered by default?</th></tr></thead>
+<tbody>
+<tr><td><code>shell</code></td><td>TS definition, Rust execution</td><td><code>{command: string}</code>; description <code>Run a shell command using ${shellProgram}.</code> <span class="src">exoharness/typescript/harness/built-in-tools.ts:84-100</span></td><td>Yes, only when <code>conversationConfig.shellProgram</code> is set <span class="src">exoharness/typescript/harness/built-in-tools.ts:56-62</span></td></tr>
+<tr><td><code>inspect_tools</code></td><td>TS</td><td><code>{source: "active"|"installed", operation: "list"|"get", toolId: string|null}</code> <span class="src">exoharness/typescript/harness/built-in-tools.ts:114-141</span></td><td>No (opt-in by name)</td></tr>
+<tr><td><code>manage_tool</code></td><td>TS</td><td><code>{action: "install"|"remove", toolId, source: local|git|null, initialization: JSON string|null}</code> <span class="src">exoharness/typescript/harness/built-in-tools.ts:143-206</span></td><td>No</td></tr>
+<tr><td><code>install_agent_tool</code>, <code>uninstall_agent_tool</code></td><td>TS (legacy)</td><td>install takes <code>name</code>, <code>moduleSource</code>, <code>initialization</code> <span class="src">exoharness/typescript/harness/built-in-tools.ts:393-449</span></td><td>Only if <code>enableAgentToolCreation</code></td></tr>
+<tr><td><code>install_skill</code>, <code>list_skills</code>, <code>use_skill</code>, <code>read_skill_file</code>, <code>uninstall_skill</code></td><td>TS</td><td>See <a href="#skills">Skills</a></td><td>No; only the self-improving-agent example registers them</td></tr>
+<tr><td><code>schedule_sandbox_task</code>, <code>snapshot_sandbox</code>, <code>rewind_sandbox</code>, &hellip;</td><td>Rust execution; TS definitions in examples</td><td>camelCase args such as <code>snapshotId</code>, <code>scope</code> <span class="src">crates/executor/src/native/harness_tool.rs:205-275</span></td><td>Only with the <code>Exo</code> harness + example library</td></tr>
+<tr><td><code>repl_execute</code>, <code>subquery</code>, <code>subquery_variable</code></td><td>Rust, RLM harness only</td><td><code>repl_execute {code}</code>; <code>subquery {prompt, target_var}</code>; <code>subquery_variable {variable_name, question, target_var}</code> <span class="src">crates/executor/src/native/rlm.rs:687-750</span></td><td>RLM harness</td></tr>
+</tbody>
+</table>
+
+<h3 id="shell">The <code>shell</code> tool end to end</h3>
+
+<p>The TS side defines the schema and a handler that forwards to Rust. The Rust side parses <code>ShellToolArguments {command}</code>, ensures a sandbox exists, runs <code>[shell_program, "-lc", command]</code> and drains stdout / stderr / exit code into <code>ShellToolResult</code> <span class="src">crates/executor/src/shell_tool.rs:33-54</span>, <span class="src">crates/executor/src/executor_types.rs:376-383</span>. Under the Exo harness, <code>execute_exo_shell_tool</code> picks the sandbox: the conversation sandbox if one is attached (or scope is <code>Conversation</code>), otherwise the shared agent sandbox <span class="src">crates/executor/src/native/harness_tool.rs:826-854</span>. The shell program is part of <code>ConversationConfig</code>; if it is unset, <code>shell</code> is simply not exposed. There is no timeout or output cap in <code>read_shell_process</code>; the cap comes from TS result compaction.</p>
+
+<h3 id="js-repl">The JS "repl" is an RLM internal, not a general tool</h3>
+
+<p><code>harness_js_repl.rs</code> embeds the Boa JavaScript engine. <code>JsReplState::execute</code> builds a fresh <code>BoaContext</code> <em>per call</em>, re-injects the persisted globals (JSON-roundtripped), defines <code>context</code>, <code>getMessages(role)</code>, <code>print</code> and a <code>Final</code> variable, evals the code, then serializes surviving JSON-safe globals back <span class="src">crates/executor/src/native/harness_js_repl.rs:27-111</span>. State persists only as JSON values: functions and non-serializable objects are silently dropped between calls. It is used solely by the RLM executor (<code>rlm.rs</code>), where setting <code>Final</code> ends the turn.</p>
+
+<div class="callout surprise"><p class="callout-title">RLM turns do not use canonical tool events for internal tools</p>
+<p>RLM records its own tools as custom events <code>rlm_tool_call</code> / <code>rlm_tool_result</code> <span class="src">crates/executor/src/native/rlm.rs:163</span>. Only client tools get real <code>tool_requested</code> / <code>tool_result</code> events there, because those are the ones external consumers must see. Policies still apply: RLM calls <code>authorize</code> for every tool, but with <code>tool_call_id: None</code> (see <a href="#approvals">approvals</a> for why that matters).</p></div>
+
+<div class="callout surprise"><p class="callout-title">Docs vs code: the "default" built-in tools</p>
+<p><code>exoharness/docs/tools.md:102-108</code> says the default Responses harness registers <code>shell</code>, <code>inspect_tools</code> and <code>manage_tool</code>. In the code <code>defaultBuiltInToolNames</code> returns <code>["shell"]</code>, plus the two legacy tools when <code>enableAgentToolCreation</code> is on <span class="src">exoharness/typescript/model-runtime/turn-loop.ts:78-87</span>. Only the example harness profiles (<code>examples/self-improving-agent/profiles/bootstrap.ts</code>, <code>practical.ts</code>) list all three names. Likewise <code>exoharness/docs/design/tool-support.md</code> proposes <code>tool_policy_decision</code> / <code>tool_invocation_*</code> events; none exist in code. Approvals were built as <code>agent_runtime.approval_*</code> events instead.</p></div>
+
+<h2 id="client-tools">Client tools</h2>
+
+<p>A client tool is declared by the HTTP caller on each turn request as <code>frontend_tools</code> (<code>name</code>, <code>description</code>, <code>parameters</code>, and a <code>defer_loading</code> flag) <span class="src">crates/managed-agents/src/http/protocol.rs:129-139</span>. The executor merges them into <code>AgentConfig.frontend_tools</code> <span class="src">crates/executor/src/managed_agents/service.rs:109-112</span>, appends their definitions to every model request (<code>frontend_tools::definitions</code>), and rejects empty names or names that collide with runtime tools <span class="src">crates/executor/src/frontend_tools.rs:39-52</span>.</p>
+
+<p>Execution is a durable rendezvous on the thread's event log:</p>
+
+<ol class="steps">
+<li>The model's <code>tool_requested</code> event is committed first. <code>frontend_tools::execute</code> asserts that exactly this request is already persisted ("client tool call must be persisted before execution") <span class="src">crates/executor/src/frontend_tools.rs:151-170</span>.</li>
+<li>It scans the turn's events for a matching <code>agent_runtime.frontend_tool_response</code>; if none, it subscribes with <code>watch_events</code> from the last seen event and blocks. A <code>TurnEnded</code> while waiting is an error <span class="src">crates/executor/src/frontend_tools.rs:171-192</span>.</li>
+<li>The application posts <code>{session_id, tool_call_id, result}</code> to <code>.../turn/TURN_ID/frontend-tool-result</code> <span class="src">crates/managed-agents/src/http/protocol.rs:279-284</span>. <code>LocalProvider::frontend_tool_result</code> requires the caller to be the one who started the turn, takes a provider-wide lock, and calls <code>frontend_tools::respond</code> <span class="src">crates/executor/src/provider.rs:331-364</span>.</li>
+<li><code>respond</code> verifies the call is still pending, belongs to a declared client tool in the saved <code>TurnWork</code>, and appends the response event. Re-posting an identical result returns the existing event id; a different result is rejected ("client tool already has a different result") <span class="src">crates/executor/src/frontend_tools.rs:194-250</span>.</li>
+</ol>
+
+<p>The result is <code>frontend_tool_success {output, model_input?}</code> or <code>frontend_tool_error {output, error{type: execution_error|user_rejected|aborted, message}}</code> <span class="src">crates/managed-agents/src/http/protocol.rs:174-200</span>. Errors become <code>{ok:false, output, error}</code> tool results. The optional <code>model_input</code> (text or base64 data-URL images) is fed to the model as an extra <em>user</em> message alongside the tool result: history materialization re-injects it as a user message when rebuilding the prompt <span class="src">crates/executor/src/message_history.rs:24</span> (RLM does so inline via <code>model_input_for_call</code>); the Claude bridge converts it to MCP content blocks <span class="src">exoharness/typescript/harness/client-tools.ts:31-69</span>.</p>
+
+<div class="callout surprise"><p class="callout-title">Client tools hide inside the "MCP" and "runtime" plumbing</p>
+<p>For TS harnesses the client tool is just another entry in <code>context.tools</code>, so the Responses loop registers it as a pass-through <code>authorization: "runtime"</code> instance; its <code>execute</code> calls <code>context.executeTool</code>, which in Rust ends up in <code>frontend_tools::execute</code> and parks until the HTTP caller answers <span class="src">crates/executor/src/typescript_runtime.rs:204-219</span>. For Claude Code, client and Exo runtime tools are exposed to the Claude Agent SDK as one in-process MCP server named <code>exo_runtime</code>, with synthetic call ids <code>claude-runtime-&lt;uuid&gt;</code> and hand-written <code>tool_requested</code> / <code>tool_result</code> events <span class="src">exoharness/typescript/harness/claude-runtime-tools.ts:22-100</span>. That server name is reserved: a user MCP server with that name is rejected.</p></div>
+
+<div class="callout warn"><p class="callout-title">Parsed but not wired</p>
+<p><code>defer_loading</code> defaults to <code>true</code> in the wire type but nothing outside tests reads it. <code>auto_approve_tools</code> is accepted by the HTTP type but the local runtime rejects any request that sets it <span class="src">crates/executor/src/managed_agents/service.rs:93-104</span>. The docs also list "tool declarations in agent frontmatter" as planned <span class="src">website/docs-src/agent-definition.md:514-515</span>; today <code>tools:</code> in frontmatter is a list of module paths (<code>Vec&lt;PathBuf&gt;</code>) <span class="src">crates/managed-agents/src/lib.rs:57</span>.</p></div>
+
+<h2 id="mcp">MCP servers</h2>
+
+<h3 id="mcp-config">Declaration</h3>
+
+<p>MCP servers are declared in the agent definition as a tagged enum: <code>type: url</code> (explicit URL) or <code>type: provider</code> (URL resolved at runtime by a <code>McpServerResolver</code>; the default resolver refuses) <span class="src">crates/managed-agents/src/mcp.rs:8-30</span>, <span class="src">crates/managed-agents/src/mcp.rs:79-108</span>. Each has <code>allowed_tools</code> (allow-list), <code>blocked_tools</code>, and flattened per-server permission fields. Names are restricted to <code>[A-Za-z0-9_-]</code> and unique; URLs must be http(s) with no userinfo or fragment <span class="src">crates/mcp/src/config.rs:37-72</span>.</p>
+
+<h3 id="mcp-connect">Connecting</h3>
+
+<p><code>crates/mcp</code> is a thin layer over the <code>rmcp</code> crate. There is exactly one transport: <strong>streamable HTTP</strong> (<code>StreamableHttpClientTransport</code>) <span class="src">crates/mcp/src/native.rs:87-99</span>. No stdio servers, no SSE-only legacy transport. Redirects are disabled outright (<code>Policy::none()</code>), connect timeout 30 s, initialization 60 s, tool discovery 60 s, each tool call 300 s <span class="src">crates/mcp/src/native.rs:57-106</span>. <code>McpConnector</code> is a trait so hosts can substitute their own HTTP clients (DNS pinning, destination policy) via <code>connect_with_http_clients</code> <span class="src">crates/mcp/src/client.rs:178-196</span>.</p>
+
+<p><code>McpToolSet::connect_servers</code> connects every server concurrently, lists tools, fails if an <code>allowed_tools</code>/<code>blocked_tools</code> entry names a tool the server does not have, filters, and refuses duplicate exposed names across servers <span class="src">crates/mcp/src/client.rs:214-283</span>. On the Exo side <code>connect_mcp</code> wraps this: it loads the vault selection, resolves the agent's servers, builds <code>VaultMcpCredentials</code>, and connects <span class="src">crates/executor/src/managed_mcp.rs:14-60</span>. Callers whose principal starts with <code>adapter-</code> (Slack etc.) use <code>connect_available</code>, which silently omits servers that need auth when <em>no</em> credential was selected, but still errors if a supplied credential is rejected <span class="src">crates/mcp/src/client.rs:167-176</span>.</p>
+
+<p>Two thread-level guards pin the MCP world once a thread starts. <code>validate_configuration</code> errors with "MCP configuration changed; start a new thread" if the agent's server list differs from what the thread connected with <span class="src">crates/executor/src/managed_mcp.rs:63-71</span>. And <code>configure_thread</code> appends a custom <code>mcp_tools</code> event holding the tool inventory (only when it changed from the last such event), making the exposed tool set part of the durable history <span class="src">crates/executor/src/managed_mcp.rs:75-107</span>.</p>
+
+<h3 id="mcp-names">Tool-name namespacing</h3>
+
+<figure class="code">
+  <figcaption><strong>Exposed name: <code>exo_mcp__server__tool</code>, falling back to truncate + SHA-256 when it would not be a legal 64-char function name</strong> <span class="src">crates/mcp/src/client.rs:334-357</span></figcaption>
+  <pre><code class="language-rust">fn exposed_name(server: &amp;str, tool: &amp;str) -&gt; String {
+    let full = format!("exo_mcp__{server}__{tool}");
+    if full.len() &lt;= 64
+        &amp;&amp; full
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        &amp;&amp; !server.contains("__")
+    {
+        return full;
+    }
+    let readable: String = full
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(39)
+        .collect();
+    let hash = Sha256::digest(format!("{server}\0{tool}").as_bytes());
+    format!("{readable}__{:x}", hash)[..64].to_string()
+}</code></pre>
+</figure>
+
+<p>The hash input is <code>server \0 tool</code>, so two distinct pairs cannot collide by concatenation (<code>a__b</code>+<code>c</code> vs <code>a</code>+<code>b__c</code>), which is also why a server name containing <code>__</code> always takes the hashed path. The model sees the exposed name and a description with an appended line <code>MCP server: S; tool: T</code> <span class="src">crates/executor/src/mcp.rs:24-37</span>. Native harnesses translate their own naming back: Claude's <code>mcp__server__tool</code> maps to <code>exposedName</code>, other Claude tools become <code>claude.&lt;Name&gt;</code>; Codex built-in MCP resource tools become <code>codex.&lt;name&gt;</code> <span class="src">exoharness/typescript/harness/native-mcp.ts:3-31</span>. Policies are keyed by those exact strings: a test shows a policy key <code>Bash</code> fails validation against an inventory that names the tool <code>claude.Bash</code> <span class="src">crates/managed-agents/src/permissions.rs:87-95</span>.</p>
+
+<h3 id="mcp-credentials">Credentials and OAuth</h3>
+
+<p>Credentials never appear in the agent definition. They are resolved from <a href="egress-and-vaults.html">vaults</a> by <strong>URL match</strong>:</p>
+
+<ol class="steps">
+<li>At first thread start <code>VaultSelection::from_vaults</code> walks the thread's vaults (last vault wins first) and, for each MCP server URL, finds secrets whose credential policy <em>permits</em> that URL as a destination, preferring secrets whose allow-list names it exactly. Two equally specific matches in one vault is an error: "narrow their policies to select one credential" <span class="src">crates/managed-agents/src/vaults.rs:49-86</span>.</li>
+<li>The binding (<code>server_name</code>, destination, optional <code>SecretReference</code>) is saved as a thread artifact (<code>managed-agents/vault[/principal].json</code>). It can never change afterwards: "cannot change an existing thread's vault selection" <span class="src">crates/managed-agents/src/vaults.rs:13-19</span>, <span class="src">crates/managed-agents/src/vaults.rs:123-139</span>.</li>
+<li>On every HTTP request the transport asks <code>McpCredentialProvider::resolve</code> for a bearer token (<code>CredentialClient</code> overrides rmcp's own auth header) <span class="src">crates/mcp/src/auth.rs:40-88</span>. If the server answers 401 / AuthRequired, <code>send_authenticated</code> calls <code>refresh</code> and retries <em>once</em>, but only if the refreshed token differs <span class="src">crates/mcp/src/client.rs:113-136</span>.</li>
+<li><code>VaultMcpCredentials::credential</code> tags each token with <code>vault:secret:revision</code>. On refresh it only refreshes the vault secret if the rejected token is still the current revision (so concurrent callers do not double-refresh), and returns <code>None</code> for non-refreshable secrets <span class="src">crates/managed-agents/src/vaults.rs:219-267</span>.</li>
+<li>Authentication failures are annotated with an actionable message naming the server, URL, selected vaults and secret ids <span class="src">crates/managed-agents/src/vaults.rs:176-218</span>.</li>
+</ol>
+
+<p><strong>OAuth acquisition is not in the MCP crate.</strong> It happens in the CLI (<code>exo vault ... --url MCP_URL</code>): <code>prepare_mcp_login</code> uses rmcp's <code>AuthorizationManager</code> for standard discovery, falling back to <code>exo_mcp::probe_auth_challenge</code> (an unauthenticated connect that captures the <code>WWW-Authenticate</code> challenge) <span class="src">crates/cli/src/vaults/login.rs:162-187</span>, <span class="src">crates/mcp/src/native.rs:108-126</span>. The browser flow lives in <code>crates/cli/src/oauth.rs</code> with a 300 s window; the resulting token response is stored with an <code>OAuthRefresh</code> record (token endpoint, client id/secret, scopes, resource) so the vault can refresh it later <span class="src">crates/cli/src/vaults/login.rs:189-240</span>. A GitHub-style device flow and token import (<code>--token-env</code>) exist as alternatives.</p>
+
+<h3 id="mcp-two-paths">Two execution paths for MCP calls</h3>
+
+<table>
+<thead><tr><th></th><th>Host path (Basic, RLM, TypeScript/Exo "Responses" harnesses)</th><th>Native path (Codex, Claude Code)</th></tr></thead>
+<tbody>
+<tr><td>Who connects</td><td>The Rust host: <code>McpToolSet</code> with real bearer tokens</td><td>The native CLI <em>inside the sandbox</em></td></tr>
+<tr><td>How tools reach the model</td><td><code>McpToolRuntime::definitions()</code> &rarr; <code>context.tools</code></td><td>Server list passed in <code>context.mcpServers</code>; harness configures the native client (<code>enabled_tools</code>, <code>required: true</code>) <span class="src">exoharness/typescript/codex/harness.ts:886-901</span></td></tr>
+<tr><td>Credential</td><td>Token held by the host process</td><td>Only a placeholder env var <code>EXO_MCP_&lt;secret_id&gt;</code> is given to the sandbox (<code>bearer_token_env_var</code>); the <a href="egress-and-vaults.html">egress proxy</a> substitutes the real token on the wire <span class="src">crates/executor/src/mcp_types.rs:18-20</span></td></tr>
+<tr><td>Sandbox prerequisites</td><td>none</td><td>Networking enabled, host allow-listed, HTTPS on port 443 for credentialed servers <span class="src">crates/executor/src/sandbox_policy.rs:188-242</span></td></tr>
+<tr><td>Approval</td><td>Rust <code>authorize</code> inside <code>execute_tool</code></td><td>Codex raises an MCP elicitation, matched against the pending call by server, message and exact arguments, then <code>authorizeTool</code> is called <span class="src">exoharness/typescript/codex/mcp-approval.ts:9-41</span>; Codex runs with <code>default_tools_approval_mode: "prompt"</code></td></tr>
+</tbody>
+</table>
+
+<p>Routing inside the host path is the decorator shown earlier: if the exposed name is one of the MCP tools, call the server; otherwise delegate to the inner runtime.</p>
+
+<figure class="code">
+  <figcaption><strong>MCP is a runtime decorator: owned names go to the server, everything else falls through</strong> <span class="src">crates/executor/src/mcp.rs:127-146</span></figcaption>
+  <pre><code class="language-rust">async fn execute(
+    &amp;self,
+    agent: &amp;dyn AgentHandle,
+    conversation: &amp;dyn ConversationHandle,
+    turn: Option&lt;&amp;dyn TurnHandle&gt;,
+    agent_config: &amp;AgentConfig,
+    config: &amp;ConversationConfig,
+    request: &amp;ToolRequest,
+) -&gt; Result&lt;ToolResult&gt; {
+    if self.mcp.has_tool(&amp;request.function_name) {
+        let result = self
+            .mcp
+            .call(&amp;request.function_name, request.arguments.clone())
+            .await?;
+        return Ok(serde_json::to_value(result)?);
+    }
+    self.inner
+        .execute(agent, conversation, turn, agent_config, config, request)
+        .await
+}</code></pre>
+</figure>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: credential selection is pinned and destination-checked per thread</p>
+<p>Instead of resolving a secret at call time by name, Exo resolves it once at thread start against the server's URL, stores the (server, URL, secret) triple, and on every later start checks that the agent's MCP destinations still match exactly; a rotated URL or edited server list fails with "start a new thread" <span class="src">crates/managed-agents/src/vaults.rs:88-107</span>. Token rotation and revocation still work because only the secret <em>reference</em> is pinned, and the revision is looked up per request.</p></div>
+
+<h2 id="approvals">Permissions and approvals</h2>
+
+<h3 id="policy">The policy model</h3>
+
+<p>There are exactly two policies: <code>always_allow</code> and <code>always_ask</code> (<code>deny_unknown_fields</code>, so <code>{"type":"auto"}</code> or extra keys fail to parse) <span class="src">crates/managed-agents/src/permissions.rs:5-16</span>. They are configured in agent frontmatter as top-level <code>permission_policy</code>, per-tool <code>tool_policies</code>, and per-MCP-server blocks. Resolution differs by tool kind:</p>
+
+<figure class="code">
+  <figcaption><strong>Built-ins fall back to the global default; MCP tools fall back to <code>always_ask</code></strong> <span class="src">crates/managed-agents/src/permissions.rs:37-66</span></figcaption>
+  <pre><code class="language-rust">pub fn for_mcp_tool(&amp;self, tool: &amp;exo_mcp::McpTool) -&gt; PermissionPolicy {
+    let server = self.mcp_servers.get(&amp;tool.server_name);
+    self.tool_policies
+        .get(&amp;tool.name)
+        .copied()
+        .or_else(|| server.and_then(|s| s.tool_policies.get(&amp;tool.tool_name).copied()))
+        .or_else(|| server.and_then(|s| s.permission_policy))
+        .unwrap_or(PermissionPolicy::AlwaysAsk {})
+}
+
+// ...
+pub fn for_tool(&amp;self, name: &amp;str) -&gt; PermissionPolicy {
+    self.tool_policies
+        .get(name)
+        .copied()
+        .unwrap_or(self.permission_policy)
+}</code></pre>
+</figure>
+
+<div class="callout surprise"><p class="callout-title">The global <code>permission_policy</code> does not apply to MCP tools</p>
+<p>Because <code>for_mcp_tool</code> never consults <code>self.permission_policy</code>, setting the agent default to <code>always_allow</code> still leaves every MCP tool at <code>always_ask</code> unless the MCP server block (or a tool-specific entry) says otherwise. The test <code>builtin_tools_default_to_allow_and_mcp_tools_default_to_ask</code> pins this <span class="src">crates/managed-agents/src/permissions.rs:136-153</span>, and the user docs state it <span class="src">website/docs-src/agent-definition.md:96</span>. Per-tool MCP keys may use either the exposed name (top-level <code>tool_policies</code>) or the server's raw tool name (inside the server block). <code>prepare_conversation</code> rejects policies naming unknown servers or tools <span class="src">crates/executor/src/mcp.rs:99-125</span>.</p></div>
+
+<p>Not every harness can honor every policy. The TS runner calls <code>validateToolPolicies(..., nativeToolApprovals=false)</code> for any harness that does not declare <code>nativeToolApprovals: true</code>; that variant throws on a default <code>always_ask</code> ("cannot enforce always_ask for all native tools") and on policies naming unknown tools <span class="src">exoharness/typescript/harness/runner.ts:302-312</span>, <span class="src">exoharness/typescript/harness/index.ts:450-466</span>.</p>
+
+<h3 id="authorize">The gate: <code>permissions::authorize</code></h3>
+
+<p>Every execution path (Basic, TypeScript runtime requests, RLM) calls the same function with the resolved policy. Approvals are plain <strong>events on the turn</strong>, not in-memory state:</p>
+
+<ul>
+<li><code>agent_runtime.approval_requested</code> with <code>{approval_id (UUIDv7), tool_call_id?, round?, request}</code> <span class="src">crates/executor/src/permissions.rs:14-25</span></li>
+<li><code>agent_runtime.approval_response</code> with <code>{approval_id, approved, allowed_tool_name?}</code> <span class="src">crates/executor/src/permissions.rs:27-32</span></li>
+</ul>
+
+<figure class="code">
+  <figcaption><strong>Allow-fast-path, session-wide "allow for this tool", then persist a request and wait on the event log</strong> <span class="src">crates/executor/src/permissions.rs:124-286</span></figcaption>
+  <pre><code class="language-rust">pub async fn authorize(
+    thread: &amp;dyn ThreadHandle,
+    turn: &amp;dyn TurnHandle,
+    policy: PermissionPolicy,
+    tool_call_id: Option&lt;&amp;str&gt;,
+    round: Option&lt;u32&gt;,
+    resuming_approval: bool,
+    request: &amp;ToolRequest,
+    stream: ExecutorStreamMode&lt;'_&gt;,
+) -&gt; Result&lt;()&gt; {
+    if !resuming_approval &amp;&amp; matches!(policy, PermissionPolicy::AlwaysAllow {}) {
+        return Ok(());
+    }
+    // ... on resume: load saved request/response events for this tool_call_id + round ...
+    if existing.is_none() {
+        for event in approval_events(thread, EventQuery {
+                session_id: Some(turn.record().session_id), ..Default::default() }).await? {
+            // any earlier approved response with allowed_tool_name == this function
+            if response.approved
+                &amp;&amp; response.allowed_tool_name.as_deref() == Some(&amp;request.function_name)
+            {
+                return Ok(());
+            }
+        }
+    }
+    // ... else append approval_requested (or reuse the saved one) ...
+    let mut events = thread.watch_events(Bound::Excluded(after)).await?;
+    // emit ExecutionStreamEvent::ApprovalRequested to the live stream
+    while let Some(event) = events.next().await {
+        // match approval_response with our approval_id:
+        //   ensure!(response.approved, "tool call denied by the user: {}", ...); return Ok(())
+        // TurnEnded =&gt; bail!("turn ended while waiting for tool approval")
+    }
+    bail!("event stream closed while waiting for tool approval")
+}</code></pre>
+</figure>
+
+<p><strong>Who can approve.</strong> A client posts <code>{session_id, approval_id, approved, allow_for_tool}</code> to <code>.../turn/TURN_ID/approval-response</code> <span class="src">crates/managed-agents/src/http/protocol.rs:270-277</span>. The provider requires that the authenticated caller be the principal recorded on the turn's <code>TurnStarted</code> event, that the turn is currently active in this process, and serializes responses behind a mutex <span class="src">crates/executor/src/provider.rs:283-326</span>, <span class="src">crates/executor/src/permissions.rs:288-307</span>. <code>respond</code> refuses an approval id that is not currently pending, and refuses "denied but allow for tool" <span class="src">crates/executor/src/permissions.rs:94-122</span>. The REPL / TUI turns <code>ApprovalRequested</code> stream events into <code>y</code> / <code>n</code> / <code>a</code> prompts (<code>a</code> = <code>allow_for_tool</code>) <span class="src">crates/cli/src/tui_app.rs:949-956</span>; the managed-adapter design specifies Slack approvals as buttons that identify the pending approval, turn and session, only the author of the originating message may press them, and a chat "yes" must never count <span class="src">docs/managed-adapters.md:398-403</span>.</p>
+
+<p><strong>Scope of "allow for tool".</strong> The grant is the response event's <code>allowed_tool_name</code>, matched against any later request of that <em>function name</em> within the same <em>session</em> (not the turn, not the thread), regardless of arguments.</p>
+
+<h3 id="persist-resume">Persistence and resume across disconnects</h3>
+
+<p>Because the request/response pair lives in the event log, the HTTP client can disconnect, the process can restart, and the decision still lands:</p>
+
+<ol class="steps">
+<li>The waiting <code>authorize</code> call subscribes to the thread's event stream. A late <code>approval_response</code> from any connection resolves it. A reconnecting client re-derives pending approvals with <code>pending_from_events</code> (requests minus responses; a <code>TurnEnded</code> clears all) <span class="src">crates/executor/src/permissions.rs:69-92</span>.</li>
+<li>If the process dies mid-wait, recovery (<code>load_turn_progress</code>) rereads the turn: which round was committed (<code>exo.basic.tool_round</code>), which tool calls have no result, and whether the first unresolved call has a matching saved approval (same <code>tool_call_id</code>, <code>round</code> and identical <code>request</code>) <span class="src">crates/executor/src/basic.rs:319-427</span>.</li>
+<li>That sets <code>resume_first_approval</code>; <code>authorize</code> then runs in resume mode: it does <em>not</em> short-circuit on <code>always_allow</code>, requires the saved request to exist ("cannot safely resume tool call without its pending approval"), checks the request is byte-equal, and either returns the saved decision or re-emits <code>ApprovalRequested</code> and waits again <span class="src">crates/executor/src/permissions.rs:137-197</span>.</li>
+<li>Remaining calls in the saved round are executed in order; the model is not re-called for that round.</li>
+</ol>
+
+<div class="callout surprise"><p class="callout-title">Resumable approvals exist only for the Basic harness</p>
+<p>Resume requires <code>tool_call_id</code> and <code>round</code> to be passed into <code>authorize</code>, and only <code>basic.rs</code> does that. The TypeScript runtime request path passes <code>None, None, false</code> <span class="src">crates/executor/src/typescript_runtime.rs:182-193</span> and RLM does the same. So <code>can_resume_pending_approval</code> is <code>true</code> only for <code>AgentHarnessKind::Basic</code> <span class="src">crates/executor/src/native/managed_executor.rs:132-134</span>. For a TS harness, a pending approval in the log is orphaned after a restart: the replayed call creates a <em>new</em> approval (new id), after prior session-level "allow for tool" grants are checked.</p></div>
+
+<h2 id="reconcile">Unresolved tool-call reconciliation</h2>
+
+<p><strong>The problem.</strong> A turn is durable but a tool call is not transactional. If the host dies between <code>tool_requested</code> and <code>tool_result</code>, the call may or may not have had its side effect (a shell command, a ticket update). Blindly re-executing is unsafe; silently dropping it leaves the model's history inconsistent.</p>
+
+<p><strong>The rule.</strong> On recovery an <em>unresolved</em> call (<code>tool_requested</code> with no <code>tool_result</code>) is only tolerated if Exo can prove re-entering it is safe. Otherwise the turn fails with "cannot safely resume unresolved tool call". Each executor advertises capabilities <span class="src">crates/executor/src/harness_executor.rs:92-100</span>:</p>
+
+<table>
+<thead><tr><th>Capability</th><th>Meaning</th><th>True for</th></tr></thead>
+<tbody>
+<tr><td><code>can_resume_pending_approval</code></td><td>Replaying a call that is parked at an unanswered approval is safe (nothing has executed yet)</td><td>Basic only <span class="src">crates/executor/src/native/managed_executor.rs:132</span></td></tr>
+<tr><td><code>can_reconcile_unresolved_tool_call</code></td><td>The harness itself can establish what happened to in-flight calls</td><td>TypeScript harnesses that set <code>reconcileUnresolvedToolCalls: true</code> (Codex) <span class="src">exoharness/typescript/codex/harness.ts:354</span>; Rust side: <code>config.harness == TypeScript</code></td></tr>
+<tr><td><code>can_suspend_turn</code></td><td>The turn can be paused (e.g. server idle / shutdown) and resumed later</td><td>Basic, TypeScript</td></tr>
+</tbody>
+</table>
+
+<figure class="code">
+  <figcaption><strong>The Rust-side safety check before a recovering turn restarts</strong> <span class="src">crates/executor/src/harness_adapter.rs:390-405</span></figcaption>
+  <pre><code class="language-rust">if let Some((round, tool_call_id, request)) = pending.first() {
+    let pending_approval = executor.can_resume_pending_approval(&amp;work.agent_config)
+        &amp;&amp; approvals.iter().any(|approval| {
+            approval.tool_call_id.as_deref() == Some(tool_call_id.as_str())
+                &amp;&amp; approval.round == *round
+                &amp;&amp; round.is_some()
+                &amp;&amp; approval.request == *request
+                &amp;&amp; !responses.contains(&amp;approval.approval_id)
+        });
+    anyhow::ensure!(
+        pending_approval
+            || crate::frontend_tools::contains(&amp;work.agent_config, &amp;request.function_name),
+        "cannot safely resume unresolved tool call `{tool_call_id}` (`{}`) for turn {}",
+        request.function_name,
+        work.turn.record().id
+    );
+}</code></pre>
+</figure>
+
+<p>Two kinds of unresolved call are always considered safe: one parked at an unanswered approval (nothing ran) and a client tool (re-awaiting the same response event is idempotent). This check is skipped (<code>!reconciles_tools</code>) for executors that reconcile themselves <span class="src">crates/executor/src/harness_adapter.rs:191-195</span>. For those, the TS runner double-checks: on <code>init.recovering</code> it requires the harness to export <code>resumeTurn</code>, and unless it declared <code>reconcileUnresolvedToolCalls</code> it scans the turn for requested-minus-resulted ids and refuses <span class="src">exoharness/typescript/harness/runner.ts:251-273</span>, <span class="src">exoharness/typescript/harness/runner.ts:313-327</span>.</p>
+
+<p>Reconciliation itself is harness-specific. Codex's recovery compares unresolved Exo tool ids against the native Codex thread snapshot and refuses if a matching item is missing or still <code>inProgress</code> (<code>assertNativeToolSafety</code>); Claude Code and Pi currently fail an interrupted turn outright <span class="src">website/docs-src/architecture/harnesses.md:96-100</span>. Suspension timing follows the same split: a reconciling harness can be suspended immediately, others wait for a "suspension boundary" between tool calls <span class="src">crates/executor/src/harness_adapter.rs:244-256</span>. Details of each adapter are on <a href="native-harnesses.html">Native harnesses</a>.</p>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: recovery by log projection, with fail-closed default</p>
+<p>No separate "in-flight" table exists. Recovery is a pure function of the event log (<code>tool_requested</code>, <code>tool_result</code>, round marker, approval events) and the default answer to anything ambiguous is to fail the turn with an explanatory error. Capabilities are opt-in per harness, so a new harness is safe by default.</p></div>
+
+<h2 id="skills">Skills</h2>
+
+<p>Skills follow the agentskills.io format: a <code>SKILL.md</code> with YAML frontmatter (<code>name</code>, <code>description</code>) and a markdown body, plus optional bundled text files. They are implemented as five TS built-in tools plus a prompt-injection helper in <code>skill-tools.ts</code>, with three-stage progressive disclosure:</p>
+
+<ol class="steps">
+<li><strong>Catalog every turn.</strong> <code>skillsInstruction(context)</code> reads <code>skills/index.json</code> and returns a developer message listing <code>- name: description</code> with the standing order to call <code>use_skill</code> before a matching task; <code>null</code> if none installed <span class="src">exoharness/typescript/harness/skill-tools.ts:507-535</span>.</li>
+<li><strong>Body on demand.</strong> <code>use_skill(name)</code> returns <code>{name, description, skillMd, files: [paths]}</code> (paths only).</li>
+<li><strong>Files on demand.</strong> <code>read_skill_file(name, path)</code> returns one bundled file.</li>
+</ol>
+
+<table>
+<thead><tr><th>Tool</th><th>Arguments</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>install_skill</code></td><td><code>{skillMd: string, files: [{path, contents}]|null}</code></td><td>Name comes from frontmatter: <code>^[a-z0-9]+(-[a-z0-9]+)*$</code>, &le; 64 chars, <code>index</code> reserved; description 1&ndash;1024 chars; SKILL.md &le; 100k chars, files &le; 200k chars each, &le; 64 files, relative <code>/</code>-paths with no <code>..</code> <span class="src">exoharness/typescript/harness/skill-tools.ts:20-32</span>, <span class="src">exoharness/typescript/harness/skill-tools.ts:214-324</span></td></tr>
+<tr><td><code>list_skills</code></td><td>none</td><td>Catalog with timestamps</td></tr>
+<tr><td><code>use_skill</code></td><td><code>{name}</code></td><td>Stage 2</td></tr>
+<tr><td><code>read_skill_file</code></td><td><code>{name, path}</code></td><td>Stage 3</td></tr>
+<tr><td><code>uninstall_skill</code></td><td><code>{name}</code></td><td>Removes the index entry only; old artifact versions remain</td></tr>
+</tbody>
+</table>
+
+<p><strong>Storage.</strong> Skills are <em>agent artifacts</em> (<code>skills/index.json</code> and <code>skills/&lt;name&gt;.json</code>), not sandbox files, so they survive sandbox rewinds and are shared across the agent's conversations <span class="src">exoharness/typescript/harness/skill-tools.ts:20</span>, <span class="src">exoharness/typescript/harness/skill-tools.ts:63-69</span>. Latest version wins (<code>readLatestArtifactJson</code> sorts by version). Frontmatter parsing is a deliberately minimal top-level <code>key: value</code> scanner, not a YAML parser; nested fields are preserved in <code>skillMd</code> but never interpreted <span class="src">exoharness/typescript/harness/skill-tools.ts:120-147</span>.</p>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: publish-after-write and degrade-on-read</p>
+<p><code>install_skill</code> writes the content artifact before publishing the index entry, so a listed skill always has readable content <span class="src">exoharness/typescript/harness/skill-tools.ts:299-304</span>. On the read side, prompt assembly runs every model round, so a corrupt index does not throw; it emits a developer message telling the model skills are temporarily unavailable, while the <em>write</em> path still throws so nothing overwrites the corrupt artifact <span class="src">exoharness/typescript/harness/skill-tools.ts:507-528</span>.</p></div>
+
+<div class="callout warn"><p class="callout-title">Skills are a library, not a platform feature</p>
+<p>No default harness calls <code>registerSkillTools</code> or <code>skillsInstruction</code>; the only users are the self-improving-agent example (<code>examples/self-improving-agent/harness.ts:130</code>, <code>profiles/practical.ts:32</code>). "Skills in agent definitions" is an unchecked item in the planned list <span class="src">website/docs-src/agent-definition.md:533</span>. Install is read-modify-write on the index with no compare-and-swap: concurrent installs from two conversations can lose an update (an in-code TODO) <span class="src">exoharness/typescript/harness/skill-tools.ts:95-98</span>. "Discovery" is therefore only the index artifact; there is no filesystem scan or registry fetch (the design doc lists both as future work).</p></div>
+
+<h2 id="summary">Where things live</h2>
+
+<table>
+<thead><tr><th>Concern</th><th>Code</th></tr></thead>
+<tbody>
+<tr><td>TS tool contract, registry, compaction</td><td><span class="src">exoharness/typescript/harness/tools.ts</span></td></tr>
+<tr><td>Module loading, env refs</td><td><span class="src">exoharness/typescript/harness/tool-modules.ts</span></td></tr>
+<tr><td>On-disk registry / lockfile</td><td><span class="src">exoharness/typescript/harness/tool-registry.ts</span></td></tr>
+<tr><td>Built-in TS tools</td><td><span class="src">exoharness/typescript/harness/built-in-tools.ts</span></td></tr>
+<tr><td>Skills</td><td><span class="src">exoharness/typescript/harness/skill-tools.ts</span></td></tr>
+<tr><td>Default Responses turn loop and registry assembly</td><td><span class="src">exoharness/typescript/model-runtime/turn-loop.ts</span></td></tr>
+<tr><td>Rust approval gate</td><td><span class="src">crates/executor/src/permissions.rs</span></td></tr>
+<tr><td>Rust client-tool rendezvous</td><td><span class="src">crates/executor/src/frontend_tools.rs</span></td></tr>
+<tr><td>MCP client, naming, retry</td><td><span class="src">crates/mcp/src/client.rs</span>, <span class="src">crates/mcp/src/native.rs</span>, <span class="src">crates/mcp/src/auth.rs</span></td></tr>
+<tr><td>MCP vault credentials</td><td><span class="src">crates/managed-agents/src/vaults.rs</span></td></tr>
+<tr><td>Policy types</td><td><span class="src">crates/managed-agents/src/permissions.rs</span></td></tr>
+</tbody>
+</table>
+
+</main>
+<aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/wiki.js"></script>
+</body>
+</html>

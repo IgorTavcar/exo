@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Managed agents &amp; adapters · Exo internals</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav id="nav"></nav>
+<main>
+<header>
+  <div class="kicker">Runtime internals</div>
+  <h1>Managed agents &amp; adapters</h1>
+  <p class="lede">An Exo "managed agent" is a Markdown file whose YAML frontmatter plus body is parsed into one strict serde struct, stored as a versioned artifact on an ordinary exoharness agent, and served through a single route table. Adapters (today: only Slack) are long-lived clients of that same API that turn chat events into durable inbox records, threads and turns.</p>
+</header>
+
+<h2 id="overview">Overview and crate map</h2>
+
+<p>Everything in this page hangs off one idea: a managed agent is <em>data</em> (<code>AgentDefinition</code>) stored next to an agent record, and every runtime behavior (harness choice, MCP servers, permissions, adapters) is re-derived from that data. There is no separate "managed agent" table, no content hash and no version number of its own; the exoharness artifact store provides the history.</p>
+
+<pre class="diagram">
+  agent.md --parse--&gt; AgentDefinition        (serde, deny_unknown_fields)
+     |                       |
+     | exo run FILE          | to_json(): flat JSON, no source/path
+     | exo agent create|update
+     v                       v
+  AgentNameArgs         artifact "managed-agents/agent.json"
+  (name -&gt; slug)         (agent-scoped; latest version wins)
+     |                       |
+     v                       +--&gt; configure_agent():  AgentConfig per agent
+  Runtime::create_/          +--&gt; configure_thread(): ConversationConfig per thread
+  update_managed_agent       +--&gt; each turn: permissions re-read from definition
+                             +--&gt; AdapterService::desired(): adapters[]
+</pre>
+
+<table>
+<thead><tr><th>Piece</th><th>Where</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><code>exo-managed-agents</code> crate</td><td><span class="src">crates/managed-agents/src/lib.rs</span></td><td>Definition type, parser, <code>AgentBackend</code> trait, thread open/list helpers, artifact path constant.</td></tr>
+<tr><td>Frontmatter parser</td><td><span class="src">crates/managed-agents/src/frontmatter.rs</span></td><td>YAML to <code>AgentFrontmatter</code> with path-aware diagnostics.</td></tr>
+<tr><td>Typed sub-schemas</td><td><span class="src">crates/managed-agents/src/mcp.rs</span>, <span class="src">crates/managed-agents/src/permissions.rs</span>, <span class="src">crates/managed-agents/src/adapters.rs</span></td><td>MCP server entries, permission policies, adapter variants.</td></tr>
+<tr><td>Wire protocol + client</td><td><span class="src">crates/managed-agents/src/http/protocol.rs</span>, <span class="src">crates/managed-agents/src/http/client.rs</span>, <span class="src">crates/managed-agents/src/http/sse.rs</span></td><td>Request/response bodies, <code>RuntimeClient</code>, SSE framing (<code>event: exo_event</code>, 10s heartbeat).</td></tr>
+<tr><td>Route table + service</td><td><span class="src">crates/executor/src/managed_agents/http.rs</span>, <span class="src">crates/executor/src/managed_agents/service.rs</span></td><td>One transport-independent route table shared by the native Actix server and hosted workers.</td></tr>
+<tr><td>Local provider glue</td><td><span class="src">crates/executor/src/managed_agents.rs</span>, <span class="src">crates/executor/src/managed_agents/config.rs</span></td><td><code>impl AgentBackend for LocalProvider</code>: definition to <code>AgentConfig</code>/<code>ConversationConfig</code>.</td></tr>
+<tr><td>Adapters</td><td><span class="src">crates/executor/src/managed_agents/adapters/</span></td><td><code>AdapterService</code>, Slack connection, durable inbox/outbox store, access policy.</td></tr>
+<tr><td>Managed executor</td><td><span class="src">crates/executor/src/native/managed_executor.rs</span>, <span class="src">crates/executor/src/managed_mcp.rs</span></td><td>Per-thread cache of (harness executor + connected MCP tool set).</td></tr>
+<tr><td>CLI</td><td><span class="src">crates/cli/src/managed_agents.rs</span>, <span class="src">crates/cli/src/serve.rs</span></td><td>File vs saved-agent resolution, upsert-on-run, <code>--serve</code> wiring.</td></tr>
+</tbody>
+</table>
+
+<p>Harness behavior itself (Codex, Claude Code, Pi, TypeScript modules) is covered in <a href="harnesses.html">Harnesses</a>; MCP client mechanics in <a href="tools-and-mcp.html">Tools &amp; MCP</a>; vault/credential substitution in <a href="egress-and-vaults.html">Egress &amp; vaults</a>. This page covers how the definition reaches them.</p>
+
+<h2 id="schema">The agent-definition schema</h2>
+
+<p>The file must begin with <code>---\n</code>, contain a closing <code>---</code> line, and have a non-empty body. The BOM and CRLF are normalized first (<span class="src">crates/managed-agents/src/lib.rs:70-95</span>). The body, trimmed, becomes <code>instructions</code>; a literal <code>---</code> inside the body is fine because only the first closing delimiter ends the frontmatter (the test at <span class="src">crates/managed-agents/src/tests.rs:181-195</span> parses a body containing <code>---</code>).</p>
+
+<figure class="code">
+  <figcaption><strong>The frontmatter struct: every key is a typed field, unknown keys are errors</strong> <span class="src">crates/managed-agents/src/frontmatter.rs:13-33</span></figcaption>
+  <pre><code class="language-rust">#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, bound(deserialize = "R: Deserialize&lt;'de&gt;"))]
+pub(super) struct AgentFrontmatter&lt;R = exoharness::resources::ResourceDefinition&gt; {
+    #[serde(default)]
+    pub(super) resources: Vec&lt;R&gt;,
+    pub(super) name: Option&lt;String&gt;,
+    pub(super) harness: String,
+    pub(super) model: AgentModelConfig,
+    #[serde(default)]
+    pub(super) permission_policy: permissions::PermissionPolicy,
+    #[serde(default)]
+    pub(super) tool_policies: std::collections::BTreeMap&lt;String, permissions::PermissionPolicy&gt;,
+    #[serde(default)]
+    pub(super) mcp_servers: Vec&lt;mcp::McpServerDefinition&gt;,
+    #[serde(default)]
+    pub(super) tools: Vec&lt;PathBuf&gt;,
+    #[serde(default)]
+    pub(super) tool_creation: bool,
+    #[serde(default)]
+    pub(super) adapters: Vec&lt;adapters::AdapterDefinition&gt;,
+}</code></pre>
+</figure>
+
+<p>The struct is generic over the resource type <code>R</code> because of a serde limitation called out in a comment: flattened tagged enums lose their leaf paths in error messages, so the parser first deserializes a literal <code>ResourceInput</code> and then builds the real <code>ResourceDefinition</code> (<span class="src">crates/managed-agents/src/frontmatter.rs:78-125</span>).</p>
+
+<h3 id="schema-top">Top-level keys</h3>
+<table>
+<thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Validated / consumed at</th></tr></thead>
+<tbody>
+<tr><td><code>harness</code></td><td>string, required, non-empty</td><td>none</td><td>Non-empty: <span class="src">crates/managed-agents/src/lib.rs:97-106</span>. Resolved in <code>resolve_harness</code>: <code>basic</code>, <code>rlm</code>, <code>codex</code>, <code>claude-code</code>, <code>cursor</code>/<code>cursor-sdk</code>, <code>pi</code>, <code>typescript</code>/<code>exo</code> (require <code>model.module</code>), or a path ending <code>.ts .tsx .js .mjs .cjs</code>; anything else is "unknown harness" (<span class="src">crates/executor/src/managed_agents/config.rs:130-199</span>).</td></tr>
+<tr><td><code>model</code></td><td>object, required</td><td>none</td><td><code>AgentModelConfig</code>, see below.</td></tr>
+<tr><td><code>name</code></td><td>string, optional</td><td>none</td><td>Display name only; CLI picks <code>--name</code>, then this, then the file stem (<span class="src">crates/cli/src/managed_agents.rs:43-60</span>). Not part of any identity key.</td></tr>
+<tr><td><code>permission_policy</code></td><td><code>{type: always_allow|always_ask}</code></td><td><code>always_allow</code></td><td>Default for built-in tools only (<span class="src">crates/managed-agents/src/permissions.rs:12-16</span>, <span class="src">crates/managed-agents/src/permissions.rs:61-66</span>).</td></tr>
+<tr><td><code>tool_policies</code></td><td>map tool name to policy</td><td><code>{}</code></td><td>Exact exposed tool names (<code>shell</code>, <code>pi.bash</code>, <code>claude.Bash</code>, <code>exo_mcp__server__tool</code>); validated against the active inventory by <code>validate_tool_names</code> (<span class="src">crates/managed-agents/src/permissions.rs:47-59</span>).</td></tr>
+<tr><td><code>mcp_servers</code></td><td>list of <code>type: url</code> | <code>type: provider</code></td><td><code>[]</code></td><td>Names validated by <code>exo_mcp::validate_server_names</code>; <code>url</code> variants fully validated at parse time (<span class="src">crates/managed-agents/src/mcp.rs:69-77</span>).</td></tr>
+<tr><td><code>resources</code></td><td>list of <code>directory</code> | <code>git</code></td><td><code>[]</code></td><td><code>validate_resources</code> (overlapping mount paths, credentials in URLs, <code>file://</code> are rejected in tests at <span class="src">crates/managed-agents/src/tests.rs:27-43</span>).</td></tr>
+<tr><td><code>tools</code></td><td>list of <strong>paths</strong> to TypeScript modules</td><td><code>[]</code></td><td>Requires a TypeScript harness; paths resolved against the agent file (<span class="src">crates/executor/src/managed_agents/config.rs:301-323</span>).</td></tr>
+<tr><td><code>tool_creation</code></td><td>bool</td><td><code>false</code></td><td>Becomes <code>enable_agent_tool_creation</code> (<span class="src">crates/executor/src/managed_agents/config.rs:341</span>).</td></tr>
+<tr><td><code>adapters</code></td><td>list of <code>type: slack</code></td><td><code>[]</code></td><td><code>adapters::validate</code> (<span class="src">crates/managed-agents/src/adapters.rs:69-107</span>).</td></tr>
+<tr><td>(body)</td><td>Markdown</td><td>required, non-empty</td><td>Becomes <code>instructions</code>, converted to a system message (<span class="src">crates/executor/src/managed_agents.rs:57-59</span>).</td></tr>
+</tbody>
+</table>
+
+<h3 id="schema-model"><code>model</code></h3>
+<table>
+<thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>name</code></td><td>string, required</td><td>Upstream model name; <code>--model</code> overrides per thread. Empty is rejected (<span class="src">crates/executor/src/managed_agents/config.rs:324-327</span>).</td></tr>
+<tr><td><code>credential</code></td><td>string, optional</td><td>Name of a secret in one of the thread's vaults (never a value).</td></tr>
+<tr><td><code>base_url</code></td><td>string, optional</td><td>Custom endpoint; also used to compute the credential's expected destination (<span class="src">crates/executor/src/managed_agents/config.rs:101-122</span>).</td></tr>
+<tr><td><code>module</code></td><td>path, optional</td><td>Harness module for <code>typescript</code>/<code>exo</code>; joined to the agent file's directory.</td></tr>
+<tr><td><code>reasoning_effort</code></td><td>string, optional</td><td>Rejected for any harness except <code>codex</code> (<span class="src">crates/executor/src/managed_agents/config.rs:328-335</span>, again at <span class="src">crates/executor/src/managed_agents/config.rs:256-258</span>).</td></tr>
+<tr><td><code>max_output_tokens</code></td><td>i64, optional</td><td>Parsed and copied into <code>AgentConfig</code>; docs say the bundled coding harnesses ignore it (<span class="src">website/docs-src/agent-definition.md:62-64</span>).</td></tr>
+<tr><td><code>max_tool_round_trips</code></td><td>u32, optional</td><td>Basic-harness loop limit; the hosted Worker refuses it with Codex (<span class="src">crates/worker-runtime/src/execution.rs:70-73</span>).</td></tr>
+<tr><td><code>braintrust</code></td><td><code>{org_name?, project: {kind: name|id, value}}</code></td><td>Tracing config (<span class="src">crates/managed-agents/src/lib.rs:426-437</span>).</td></tr>
+</tbody>
+</table>
+<p>The full struct is <span class="src">crates/managed-agents/src/lib.rs:29-40</span>. Note that sandbox image, provider and networking are <em>not</em> definition fields: <code>AgentSandboxConfig</code> exists in <code>lib.rs</code> but a <code>sandbox:</code> key in frontmatter is a parse error (<span class="src">crates/managed-agents/src/tests.rs:203-206</span>). Sandbox choice belongs to environments and threads.</p>
+
+<h3 id="schema-nested">Nested schemas</h3>
+<table>
+<thead><tr><th>Block</th><th>Fields</th><th>Source</th></tr></thead>
+<tbody>
+<tr><td><code>mcp_servers[]</code> <code>type: url</code></td><td><code>name</code>, <code>url</code>, <code>allowed_tools?</code>, <code>blocked_tools=[]</code>, plus flattened <code>permission_policy?</code> and <code>tool_policies={}</code></td><td><span class="src">crates/managed-agents/src/mcp.rs:8-30</span></td></tr>
+<tr><td><code>mcp_servers[]</code> <code>type: provider</code></td><td>same minus <code>url</code>; the host's <code>McpServerResolver</code> supplies the URL</td><td><span class="src">crates/managed-agents/src/mcp.rs:79-109</span></td></tr>
+<tr><td><code>resources[]</code></td><td><code>name</code>, <code>type</code> (<code>directory</code>|<code>git</code>), <code>mount_path?</code>, <code>mode</code> (<code>ro</code>|<code>rw</code>, default <code>rw</code>), <code>path?</code>, <code>url?</code>, <code>checkout?</code>, <code>credential?</code>. Directory resources reject <code>url/checkout/credential</code> and require <code>path</code>.</td><td><span class="src">crates/managed-agents/src/frontmatter.rs:80-125</span></td></tr>
+<tr><td><code>adapters[]</code> <code>type: slack</code></td><td><code>name?</code> (default <code>slack</code>), <code>vault</code> (required), <code>turn_vaults=[]</code>, <code>transport</code> (<code>socket</code>|<code>http</code>, default <code>socket</code>), <code>trigger</code> (<code>mentions_only</code>|<code>all_messages</code>), <code>allowed_channels?</code>, <code>allowed_users?</code>, <code>direct_messages=true</code>, <code>allow_slack_connect=false</code>, <code>use_sender_vault=false</code></td><td><span class="src">crates/managed-agents/src/adapters.rs:7-67</span></td></tr>
+</tbody>
+</table>
+
+<div class="callout warn"><p class="callout-title">Planned vs implemented (checked against the structs)</p>
+<p><strong>Custom tool declarations.</strong> <span class="src">website/docs-src/agent-definition.md:99-125</span> shows <code>tools:</code> as a list of <code>{name, description, parameters}</code> objects. The Rust field is <code>tools: Vec&lt;PathBuf&gt;</code> (<span class="src">crates/managed-agents/src/frontmatter.rs:28</span>), so that YAML would fail to parse today. The docs do flag it as "Planned"; HTTP clients instead pass <code>frontend_tools</code> on each turn (<span class="src">crates/managed-agents/src/http/protocol.rs:241</span>).<br>
+<strong>Thread/turn <code>overrides</code></strong> (<span class="src">website/docs-src/agent-definition.md:247-280</span>) do not exist as a type; only individual turn options do (<span class="src">crates/managed-agents/src/http/protocol.rs:220-250</span>).<br>
+<strong>Other adapters.</strong> The docs mention Discord, WhatsApp, Signal and IRC (<span class="src">website/docs-src/agent-definition.md:172</span>); <code>AdapterDefinition</code> has exactly one variant, <code>Slack</code> (<span class="src">crates/managed-agents/src/adapters.rs:9-11</span>), and <code>website/docs-src/adapters/custom.md</code> is a stub.</p></div>
+
+<h2 id="parsing">From Markdown to a validated definition</h2>
+
+<ol class="steps">
+  <li><strong>Split.</strong> <code>AgentDefinition::parse</code> strips BOM and CRLF, requires a leading <code>---\n</code>, finds the first line equal to <code>---</code>, and keeps the original text in a <code>OnceLock&lt;String&gt;</code> (<span class="src">crates/managed-agents/src/lib.rs:70-95</span>).</li>
+  <li><strong>Deserialize with locations.</strong> <code>frontmatter::parse</code> runs <code>serde_path_to_error</code> over <code>serde_yaml_ng</code>; on failure it builds a <code>Diagnostic</code> with the field path, line:column and a source excerpt with a caret (<span class="src">crates/managed-agents/src/frontmatter.rs:127-222</span>). A test pins the output: <code>agent.md:4:9: invalid agent frontmatter at model.name</code> (<span class="src">crates/managed-agents/src/tests.rs:399-412</span>).</li>
+  <li><strong>Validate.</strong> <code>validate()</code> checks non-empty <code>harness</code>/<code>model.name</code>/<code>instructions</code>, MCP names and URLs, resources, and adapters (<span class="src">crates/managed-agents/src/lib.rs:97-111</span>). The same <code>validate()</code> runs on every JSON path, including the HTTP create (<span class="src">crates/executor/src/managed_agents/service.rs:438</span>) and update (<span class="src">crates/executor/src/managed_agents/service.rs:540</span>).</li>
+  <li><strong>Serialize.</strong> <code>to_json()</code> emits a flat object (<code>#[serde(skip)]</code> on <code>source</code> and <code>path</code>), so the stored artifact and the HTTP bodies carry no frontmatter wrapper (<span class="src">crates/managed-agents/src/lib.rs:63-66</span>, <span class="src">crates/managed-agents/src/tests.rs:425-449</span>). <code>source()</code> returns the original Markdown if it was parsed from one, otherwise regenerates it from the struct (<span class="src">crates/managed-agents/src/lib.rs:151-156</span>); regenerated YAML loses comments and ordering.</li>
+</ol>
+
+<div class="callout surprise"><p class="callout-title">Strictness is the compatibility policy</p>
+<p>Every layer carries <code>deny_unknown_fields</code>: the frontmatter, <code>AgentModelConfig</code>, <code>PermissionPolicy</code> (even <code>{type: always_allow, ask: true}</code> fails, <span class="src">crates/managed-agents/src/permissions.rs:98-104</span>), MCP entries (an embedded <code>token:</code> or <code>url:</code> on a <code>provider</code> server fails, <span class="src">crates/managed-agents/src/tests.rs:111-125</span>), and the stored JSON. The docs state the reason: a typo or an unimplemented feature must not silently change how the agent runs (<span class="src">exoharness/docs/managed-agents.md:19-21</span>).</p></div>
+
+<div class="callout surprise"><p class="callout-title">A leftover shim: two stored shapes are accepted</p>
+<p><code>from_json</code> deserializes an <em>untagged</em> enum of <code>Flat(AgentDefinition)</code> or <code>Nested { frontmatter, instructions }</code> (<span class="src">crates/managed-agents/src/lib.rs:113-132</span>), and a test asserts that old nested artifacts are read and re-exported flat (<span class="src">crates/managed-agents/src/tests.rs:451-464</span>). The website docs say there is no <code>frontmatter</code> wrapper at all (<span class="src">website/docs-src/agent-definition.md:41-43</span>); that is true of what is <em>written</em>, not of what is <em>read</em>. This reads as support for artifacts saved before the flattening commit.</p></div>
+
+<h2 id="identity">Stored agent, identity and versions</h2>
+
+<p>There is no content-hash identity. A managed agent is an ordinary exoharness agent (UUIDv7 <code>id</code>, unique <code>slug</code>, display <code>name</code>) with one agent-scoped artifact at a fixed path:</p>
+
+<figure class="code">
+  <figcaption><strong>The whole "version store": latest artifact version at one path</strong> <span class="src">crates/managed-agents/src/lib.rs:21-23</span>, <span class="src">crates/managed-agents/src/lib.rs:261-268</span></figcaption>
+  <pre><code class="language-rust">/// An empty latest artifact means no saved definition, allowing a rejected first
+/// upload to be rolled back without deleting artifact history.
+pub const AGENT_DEFINITION_PATH: &amp;str = "managed-agents/agent.json";
+
+pub async fn definition_version(agent: &amp;dyn AgentHandle) -&gt; Result&lt;Option&lt;ArtifactVersion&gt;&gt; {
+    Ok(agent
+        .list_artifacts()
+        .await?
+        .into_iter()
+        .filter(|artifact| artifact.path == AGENT_DEFINITION_PATH)
+        .max_by_key(|artifact| artifact.version))
+}</code></pre>
+</figure>
+
+<p>Creation and update are both "write an artifact, then run backend configuration, then compensate on failure":</p>
+<ul>
+  <li><strong>Create</strong> (<span class="src">crates/managed-agents/src/lib.rs:163-196</span>): <code>new_agent</code> with the slug/name, then <code>configure_agent</code> and <code>write_artifact</code>; if either fails the half-made agent is deleted again.</li>
+  <li><strong>Update</strong> (<span class="src">crates/executor/src/harness_executor.rs:1042-1087</span>): remember the previous definition, write the new artifact, call <code>provider.configure_agent</code>; on failure, <em>write the previous definition back as a new artifact version</em> (or empty bytes if there was none) rather than deleting history. This is why an empty latest artifact means "no definition" (<span class="src">crates/managed-agents/src/lib.rs:281-283</span>).</li>
+  <li><strong>Upsert from the CLI</strong> (<span class="src">crates/cli/src/managed_agents.rs:193-222</span>): <code>exo run FILE.md</code> resolves a slug, then <code>update_managed_agent</code> if the agent exists, else <code>create_managed_agent</code>. A string is treated as a file if it ends in <code>.md</code> or has more than one path component (<span class="src">crates/cli/src/managed_agents.rs:96-101</span>); everything else is a saved-agent name or ID.</li>
+</ul>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: rollback by appending, not deleting</p>
+<p>Because the definition is just the latest artifact version, a failed update restores the old one as a <em>new</em> version, and a failed first upload is neutralized by an empty artifact. The artifact history stays append-only, and "current" is always <code>max_by_key(version)</code>. The adapter supervisor reuses the same pair <code>(artifact_id, version)</code> as a cache key (<span class="src">crates/executor/src/managed_agents/adapters/definitions.rs:21-50</span>), so reloading is a single list call, not a parse, in the steady state.</p></div>
+
+<div class="callout surprise"><p class="callout-title">"Identity" in this crate means a person, not an agent</p>
+<p><span class="src">crates/managed-agents/src/identity.rs</span> defines <code>IdentityRecord {id, email, vault}</code>, <code>SlackIdentityPin</code> and <code>IdentityCommand::{BindVault, BindSlack, UnbindSlack, TrustSlack}</code>: the mapping from a human (email, Slack workspace+user) to a private vault. It is exposed at <code>POST /exo/identity/manage</code> (<span class="src">crates/executor/src/native/http_service.rs:192</span>) and consumed by adapters; see <a href="#adapter-identity">below</a>. The agent itself is identified only by its random id and slug.</p></div>
+
+<h2 id="runtime-config">Turning the definition into runtime config</h2>
+
+<p><code>impl AgentBackend for LocalProvider</code> (<span class="src">crates/executor/src/managed_agents.rs:32-247</span>) is where the definition meets the executor. Three hooks matter:</p>
+
+<h3 id="configure-agent"><code>configure_agent</code>: operator gate, then <code>AgentConfig</code></h3>
+<p>When the provider has a <code>caller</code> (authenticated server, adapters), any definition that is not a plain stock configuration requires the operator permission: a harness outside <code>basic | rlm | codex | claude-code | cursor | cursor-sdk | pi</code>, or non-empty <code>tools</code>, or <code>tool_creation</code>, or any <code>adapters</code> (<span class="src">crates/executor/src/managed_agents.rs:43-52</span>). Rationale is visible in what those fields mean: they load arbitrary TypeScript or open outbound chat connections on the host. The adapter caller's policy always refuses <code>check_operator</code> (<span class="src">crates/executor/src/managed_agents/adapters/access.rs:107-109</span>). The config itself comes from <code>agent_config_with_modules</code> (<span class="src">crates/executor/src/managed_agents/config.rs:275-360</span>); resources are resolved relative to the agent file's directory and relative paths require a local file (<span class="src">crates/executor/src/managed_agents.rs:60-72</span>).</p>
+
+<h3 id="configure-thread"><code>configure_thread</code></h3>
+<p>Runs on every open/resume (<span class="src">crates/managed-agents/src/lib.rs:355-399</span> calls it, deleting a just-created thread if it fails). It merges, in order: the agent config, a per-thread model override (<code>--model</code>), harness override (resolved with the operator check at <span class="src">crates/executor/src/managed_agents/config.rs:207-213</span>), environment (which fixes sandbox provider and image, <span class="src">crates/executor/src/managed_agents.rs:151-180</span>), resource mount-overlap validation, and finally <code>configure_managed_thread</code> on the executor, which connects MCP servers and returns the tool count the CLI prints (<span class="src">crates/executor/src/managed_agents.rs:200-203</span>).</p>
+
+<h3 id="turn-permissions">Per-turn refresh of permissions</h3>
+<p>For saved agents, <code>thread_config.permissions = definition.permissions()</code> is re-read from the stored definition on every turn that is not a recovery (<span class="src">crates/executor/src/harness_executor.rs:689-692</span>), and again in <code>configure_thread</code> (<span class="src">crates/executor/src/managed_agents.rs:132-134</span>). Editing a policy therefore applies to existing threads on their next turn, which the docs state at <span class="src">exoharness/docs/managed-agents.md:338-341</span>.</p>
+
+<h2 id="http-api">The hosted-agent HTTP API</h2>
+
+<p>All routes live under <code>RUNTIME_PATH = "/exo"</code> (<span class="src">crates/managed-agents/src/http.rs:9</span>). One function, <code>route()</code>, matches on <code>(method, path-segments)</code> and is shared by the native Actix server and hosted workers; each host implements the small <code>Platform</code> trait (account id, streaming on/off, previews, cancel, frontend-tool results) (<span class="src">crates/executor/src/managed_agents/http.rs:11-47</span>, <span class="src">crates/executor/src/managed_agents/http.rs:105-306</span>). A path that matches under a different method yields 405 via the <code>routes!</code> macro (<span class="src">crates/executor/src/managed_agents/http.rs:119-136</span>).</p>
+
+<table>
+<thead><tr><th>Route</th><th>Handler / semantics</th></tr></thead>
+<tbody>
+<tr><td><code>GET /identity</code></td><td>Returns <code>{account_id}</code> from <code>Platform</code>.</td></tr>
+<tr><td><code>GET|PUT /environment</code>, <code>DELETE /environment/{name}</code></td><td>Environment definitions; writes need a full-provider service (<code>require_full_provider</code>, 403 on a single-agent server).</td></tr>
+<tr><td><code>GET /agent[?slug=]</code>, <code>POST /agent</code></td><td>List/filter by slug; raw create of an agent record without a definition.</td></tr>
+<tr><td><code>POST /agent/managed</code></td><td>Body <code>{name, slug, definition}</code>; validates then <code>create_managed_agent</code> (<span class="src">crates/executor/src/managed_agents/service.rs:432-445</span>).</td></tr>
+<tr><td><code>GET|DELETE /agent/{id}</code>, <code>PUT /agent/{id}/definition</code></td><td>Definition replace goes through <code>update_managed_agent</code> under a process-wide <code>definition_updates</code> mutex (<span class="src">crates/executor/src/managed_agents/service.rs:535-548</span>).</td></tr>
+<tr><td><code>GET|POST /agent/{id}/artifact</code>, <code>GET .../artifact/read</code></td><td><code>POST</code> accepts <em>only</em> <code>managed-agents/agent.json</code> (<span class="src">crates/executor/src/managed_agents/service.rs:519-533</span>).</td></tr>
+<tr><td><code>GET|POST /agent/{id}/thread</code></td><td>List (default limit 100) / create via <code>open_managed_thread</code> (<span class="src">crates/executor/src/managed_agents/service.rs:40-80</span>).</td></tr>
+<tr><td><code>GET|DELETE /agent/{id}/thread/{t}</code>, <code>PUT .../environment</code>, <code>POST .../fork</code>, <code>GET .../previews</code></td><td>Thread lifecycle, fork at latest event, preview endpoint from the <code>Platform</code>.</td></tr>
+<tr><td><code>GET .../thread/{t}/event</code>, <code>GET .../event/watch</code></td><td>Paged events (<code>after</code>, <code>limit</code> default 100, <code>direction</code>, <code>event_type</code> CSV); watch is SSE merging durable events with transient progress (<span class="src">crates/executor/src/managed_agents/service.rs:812-826</span>).</td></tr>
+<tr><td><code>POST .../thread/{t}/turn</code></td><td>Admits a turn and answers <strong>202</strong> with <code>{agent, thread, turn, harness}</code>; admission runs on a spawned host task so it survives a disconnected requester (<span class="src">crates/executor/src/managed_agents/http.rs:246-274</span>).</td></tr>
+<tr><td><code>GET .../turn/{id}</code>, <code>POST .../cancel</code>, <code>POST .../approval-response</code>, <code>POST .../frontend-tool-result</code></td><td>Status <code>{active}</code>; cancel; approval decision; client-executed tool result (unsupported on the local runtime, 501).</td></tr>
+<tr><td><code>/vault</code>, <code>/agent/{a}/vault</code>, <code>/agent/{a}/thread/{t}/vault</code> (+ <code>/{v}/secret[/{s}]</code>)</td><td>Same handlers at three scopes; see <a href="egress-and-vaults.html">Egress &amp; vaults</a>.</td></tr>
+<tr><td><code>POST /request</code></td><td>Raw exoharness store RPC, only when <code>Platform::exposes_store_protocol()</code> (account-admin; off by default, <span class="src">crates/executor/src/managed_agents/http.rs:14-17</span>, <span class="src">crates/executor/src/managed_agents/http.rs:139-145</span>).</td></tr>
+<tr><td><code>POST /identity/manage</code></td><td>Operator-only vault/Slack-pin binding (<span class="src">crates/executor/src/native/http_service.rs:252-274</span>).</td></tr>
+<tr><td><code>POST /adapter/{name}</code>, <code>POST /agent/{agent}/adapter/{name}</code></td><td>Slack webhooks. Registered <em>outside</em> the authorizing scope; they authenticate by Slack signature, not bearer token (<span class="src">crates/executor/src/native/http_service.rs:177-196</span>).</td></tr>
+</tbody>
+</table>
+
+<div class="callout"><p class="callout-title">Is it Anthropic- or OpenAI-compatible? No.</p>
+<p>It is Exo's own REST+SSE protocol. A search of the managed-agents crate and the docs finds no claim of compatibility with either vendor's agent or Responses API (the only "Anthropic" hit in the docs is a vault secret for Claude Code). What is shared is vocabulary: <code>permission_policy: {type: always_allow | always_ask}</code>, MCP entries with <code>type: url</code>, <code>allowed_tools</code>, and an event-stream/session model. Treat that as resemblance, not emulation. The one place a hosted-agent product is named is an unexplained "CMA" in the planned list (<span class="src">website/docs-src/agent-definition.md:536</span>).</p></div>
+
+<h3 id="http-semantics">Semantics worth knowing</h3>
+<ul>
+  <li><strong>The protocol is a superset of what local supports.</strong> <code>SubmitTurnBody</code> carries <code>parent</code>, <code>endpoint_name</code>, <code>reasoning_effort</code>, <code>auto_approve_tools</code>, <code>page_scope</code>, <code>reset_history</code> and <code>delivery_callback</code>; <code>prepare_turn</code> rejects all of them with <code>UnsupportedRequest</code> (HTTP 501) on the local runtime (<span class="src">crates/executor/src/managed_agents/service.rs:95-107</span>). Same for <code>CreateThreadBody</code>'s <code>thread_id</code>, <code>visibility</code> and <code>source</code> (<span class="src">crates/executor/src/managed_agents/service.rs:45-54</span>). The shapes are shared with a hosted runtime that does honor them.</li>
+  <li><strong>Error mapping.</strong> A typed <code>RequestError</code> carries its status; <code>UnsupportedRequest</code> is 501; <em>any other error is 400</em>, not 500 (<span class="src">crates/executor/src/managed_agents/service.rs:170-178</span>).</li>
+  <li><strong>Flat turn options.</strong> <code>SubmitTurnBody</code> flattens <code>TurnOptions</code> (<code>attention: wake|interrupt|...</code>, <code>idempotency_key</code>); a test pins this wire shape (<span class="src">crates/managed-agents/src/http/protocol.rs:253-267</span>). The idempotency key is what makes a retried POST return the same turn.</li>
+  <li><strong>Live chunks are not durable.</strong> <code>forward_progress</code> republishes model chunks and status messages on a <code>broadcast</code> channel as synthetic <code>Event</code>s; <code>watch_events</code> subscribes <em>before</em> loading durable history and <code>select</code>s the two streams. Lagged receivers silently skip chunks (<span class="src">crates/executor/src/managed_agents/service.rs:767-844</span>, with a test at <span class="src">crates/executor/src/managed_agents/service.rs:851-889</span>).</li>
+  <li><strong>Single-agent scoping.</strong> <code>exo run FILE --serve</code> builds <code>Service {agent_id: Some(id)}</code>; every <code>agent()</code> lookup for another id is 404 and mutations that are global are 403 (<span class="src">crates/executor/src/managed_agents/service.rs:180-202</span>).</li>
+  <li><strong>Doctor is client-only here.</strong> <code>RuntimeClient::diagnose_agent</code> calls <code>agent/{id}/doctor</code> and turns a 404 into an empty list (<span class="src">crates/managed-agents/src/http/client.rs:155-178</span>); the shared route table has no such route.</li>
+</ul>
+
+<h2 id="permissions">Permissions and approvals</h2>
+
+<p>Two policy values only: <code>always_allow</code> and <code>always_ask</code> (<span class="src">crates/managed-agents/src/permissions.rs:5-16</span>). The interesting part is the resolution order, which differs for built-in and MCP tools:</p>
+
+<figure class="code">
+  <figcaption><strong>MCP tools fall through to always_ask; built-ins fall through to the agent default</strong> <span class="src">crates/managed-agents/src/permissions.rs:37-66</span></figcaption>
+  <pre><code class="language-rust">    pub fn for_mcp_tool(&amp;self, tool: &amp;exo_mcp::McpTool) -&gt; PermissionPolicy {
+        let server = self.mcp_servers.get(&amp;tool.server_name);
+        self.tool_policies
+            .get(&amp;tool.name)
+            .copied()
+            .or_else(|| server.and_then(|s| s.tool_policies.get(&amp;tool.tool_name).copied()))
+            .or_else(|| server.and_then(|s| s.permission_policy))
+            .unwrap_or(PermissionPolicy::AlwaysAsk {})
+    }
+    // ...
+    pub fn for_tool(&amp;self, name: &amp;str) -&gt; PermissionPolicy {
+        self.tool_policies
+            .get(name)
+            .copied()
+            .unwrap_or(self.permission_policy)
+    }</code></pre>
+</figure>
+
+<table>
+<thead><tr><th>Tool kind</th><th>Lookup order</th><th>Final default</th></tr></thead>
+<tbody>
+<tr><td>Built-in / registered tool</td><td>top-level <code>tool_policies[name]</code></td><td>top-level <code>permission_policy</code> (default <code>always_allow</code>)</td></tr>
+<tr><td>MCP tool</td><td>top-level <code>tool_policies[exposed_name]</code>, then <code>mcp_servers[s].tool_policies[original_name]</code>, then <code>mcp_servers[s].permission_policy</code></td><td><code>always_ask</code>; the agent-level default does <em>not</em> apply (test at <span class="src">crates/managed-agents/src/permissions.rs:136-153</span>)</td></tr>
+</tbody>
+</table>
+
+<p>The MCP wrapper chooses between the two at call time: <code>McpToolRuntime::permission_policy</code> looks up the tool in its connected tool set and delegates to <code>for_mcp_tool</code> only if found (<span class="src">crates/executor/src/mcp.rs:41-50</span>).</p>
+
+<h3 id="approval-flow">Approval flow is event-sourced</h3>
+<p><code>permissions::authorize</code> (<span class="src">crates/executor/src/permissions.rs:124-286</span>) never holds state in memory:</p>
+<ol class="steps">
+  <li>If the policy is <code>always_allow</code> and this is not an approval resume, return.</li>
+  <li>Otherwise scan the turn's events for an existing <code>agent_runtime.approval_requested</code> matching the same <code>tool_call_id</code> and <code>round</code>; require the saved request to equal the new one (<span class="src">crates/executor/src/permissions.rs:150-166</span>).</li>
+  <li>If an <code>approval_response</code> exists: approved means continue, denied means the tool call errors "tool call denied by the user" (<span class="src">crates/executor/src/permissions.rs:187-197</span>).</li>
+  <li>With no existing request, check session-wide allowances: any approved response in this <em>session</em> whose <code>allowed_tool_name</code> equals the function name auto-approves (<span class="src">crates/executor/src/permissions.rs:198-222</span>).</li>
+  <li>Else append <code>approval_requested</code> (id = fresh UUIDv7), emit <code>ExecutionStreamEvent::ApprovalRequested</code> to any live observer, and <code>watch_events</code> from that event until a matching response or <code>TurnEnded</code> (<span class="src">crates/executor/src/permissions.rs:223-285</span>).</li>
+</ol>
+<p>A client answers with <code>POST .../approval-response {session_id, approval_id, approved, allow_for_tool}</code>; <code>respond()</code> checks that the approval is actually pending for that turn and session, rejects "denied but allow for tool", and writes an <code>approval_response</code> event (<span class="src">crates/executor/src/permissions.rs:94-122</span>). Because the pending set is recomputed from events (<code>pending_from_events</code>, <span class="src">crates/executor/src/permissions.rs:69-92</span>), a restarted server resumes waiting turns correctly for harnesses that support it; <code>ManagedExecutor</code> advertises resume only for <code>Basic</code> (<span class="src">crates/executor/src/native/managed_executor.rs:132-134</span>).</p>
+
+<div class="callout surprise"><p class="callout-title">Downgrading a policy does not revoke an allowance</p>
+<p>"Allow for tool" is stored as an <code>allowed_tool_name</code> on a response event and honored for the rest of that session. Per-turn policy refresh applies the new definition, but a session-wide allowance already granted still short-circuits <code>always_ask</code>; the docs admit this (<span class="src">exoharness/docs/managed-agents.md:346-348</span>).</p></div>
+
+<p>Per-harness enforcement caveats (Codex and Cursor reject native <code>always_ask</code> they cannot enforce; Claude Code uses a native <code>PreToolUse</code> hook; custom harnesses must call <code>context.authorizeTool</code>) are in <span class="src">exoharness/docs/managed-agents.md:350-361</span> and belong to <a href="native-harnesses.html">Native harnesses</a>. The hosted Worker is stricter still: Codex there requires <code>always_allow</code> and empty <code>tool_policies</code> (<span class="src">crates/worker-runtime/src/execution.rs:63-69</span>).</p>
+
+<h2 id="adapters">Adapters</h2>
+
+<p>An adapter is <strong>not</strong> a harness feature and not a tool. It is a supervised client of the managed-agent API that lives in the server process: it owns the external connection and delivery, while the provider owns threads, sandboxes, vault selection and execution. A harness never sends a Slack message; replies are delivered from the event stream (<span class="src">docs/managed-adapters.md:8-14</span>).</p>
+
+<pre class="diagram">
+ Slack (Socket Mode ws | HTTP webhook)
+        |  push event / block action
+        v
+  SlackConnection::push        filters: bots, allowed_users, DM/channel, Slack
+        |                      Connect, mention/tracked-thread --&gt; IncomingMessage
+        v
+  AdapterService::accept       ack only AFTER durable write: inbox/{sha256(id)}
+        |                      + queue "eyes" reaction (Outbox::Reaction)
+        v   (2s tick / Notify)
+  process() -&gt; submit()        Route -&gt; thread (slug slack-{sha256}) -&gt; caller Runtime
+        |                      -&gt; start_turn(session=inbox.accepted, idempotency key)
+        v
+  drain_stream()               ExecutionStreamEvent -&gt; Progress -&gt; SlackStreamChunk
+        |                      cursor + renderer state committed in ONE outbox object
+        v
+  deliver_one()                chat.startStream/appendStream/stopStream; approvals
+                               as Block Kit buttons; backoff retries in Outbox
+</pre>
+
+<h3 id="adapter-service"><code>AdapterService</code>: a reconcile loop plus a work loop</h3>
+<ul>
+  <li><strong>Started by the server.</strong> <code>exo run ... --serve</code> constructs it, hands a reference to the HTTP service for webhooks, and runs it beside the Actix server (<span class="src">crates/cli/src/serve.rs:82-91</span>, <span class="src">crates/cli/src/serve.rs:127-129</span>). <code>--adapters-only</code> runs supervision without HTTP but refuses HTTP-transport Slack adapters (<span class="src">crates/cli/src/serve.rs:91-95</span>).</li>
+  <li><strong>Desired state is polled.</strong> Every 2s <code>reconcile()</code> lists all agents, loads each definition through the version-keyed <code>DefinitionCache</code>, and diffs against running <code>Deployment</code>s (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:304-376</span>, <span class="src">crates/executor/src/managed_agents/adapters/mod.rs:377-413</span>). A definition that fails to load keeps already-running deployments alive instead of tearing them down (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:342-361</span>). The docs list the polling as an open performance item (<span class="src">docs/managed-adapters.md:422-435</span>).</li>
+  <li><strong>Deployment id</strong> = <code>sha256("{agent_id}/{adapter_name}")</code> (<span class="src">crates/executor/src/managed_agents/adapters/store.rs:316-318</span>). Renaming an adapter is therefore a new deployment with new routes; removing one shuts the connection and keeps threads.</li>
+  <li><strong>Fingerprint.</strong> A deployment restarts when <code>digest((definition, [(secret_id, revision)...]))</code> changes (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:440-453</span>), so rotating a bot token in the vault reconnects without touching the agent file. Credentials are read from the adapter's own <code>vault</code> with the owner's authority, never from thread vaults, and the global vault is forbidden (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:428-434</span>, <span class="src">crates/managed-agents/src/adapters.rs:86-89</span>).</li>
+  <li><strong>Everything durable.</strong> Inbox, outbox, routes, decisions and caller authorities are JSON objects in provider storage under <code>adapters/v1/{deployment}/...</code> (<span class="src">crates/executor/src/managed_agents/adapters/store.rs:316-333</span>). A cached pending-set index avoids rescanning history and is invalidated by a <code>WriteGuard</code> if a write is cancelled mid-flight (<span class="src">crates/executor/src/managed_agents/adapters/store.rs:170-247</span>).</li>
+</ul>
+
+<h3 id="adapter-mapping">Event to turn mapping (Slack)</h3>
+
+<p>The conversation key decides which Exo thread a message lands in; it is computed in <code>SlackConnection::push</code> after all admission filters have passed:</p>
+
+<figure class="code">
+  <figcaption><strong>Slack message to normalized IncomingMessage: the conversation key is workspace/channel/root-ts</strong> <span class="src">crates/executor/src/managed_agents/adapters/slack.rs:322-343</span></figcaption>
+  <pre><code class="language-rust">        let root = thread_ts.as_ref().unwrap_or(&amp;ts).0.clone();
+        let conversation = if direct &amp;&amp; thread_ts.is_none() {
+            format!("{}/{}", self.team.0, channel.0)
+        } else {
+            format!("{}/{}/{root}", self.team.0, channel.0)
+        };
+        let input = IncomingMessage {
+            id: format!("{}/{}/{}", self.team.0, channel.0, ts.0),
+            account: self.account.clone(),
+            conversation,
+            sender: sender.0.clone(),
+            text,
+            channel: channel.0,
+            message_ts: ts.0,
+            reply_ts: if direct &amp;&amp; thread_ts.is_none() {
+                None
+            } else {
+                Some(root)
+            },
+            direct,
+            external,
+        };</code></pre>
+</figure>
+
+<table>
+<thead><tr><th>Slack situation</th><th>Conversation key</th><th>Reply goes to</th></tr></thead>
+<tbody>
+<tr><td>Channel message or mention</td><td><code>team/channel/root_ts</code> (root = <code>thread_ts</code> or the message's own <code>ts</code>)</td><td>That Slack thread</td></tr>
+<tr><td>Top-level DM</td><td><code>team/channel</code> (one Exo thread per DM)</td><td>The DM, unthreaded</td></tr>
+<tr><td>DM reply thread</td><td><code>team/channel/root_ts</code> (a separate Exo thread)</td><td>That reply thread</td></tr>
+</tbody>
+</table>
+
+<p>Admission filters, in order (<span class="src">crates/executor/src/managed_agents/adapters/slack.rs:196-356</span>): ignore bot messages, subtypes, hidden and edited events; ignore the bot's own user; apply <code>allowed_users</code>; call <code>conversations.info</code> to learn <code>is_ext_shared</code> (fail closed if absent); drop Slack Connect unless <code>allow_slack_connect</code> <em>and</em> the channel is listed; apply <code>direct_messages</code> / <code>allowed_channels</code>; in <code>mentions_only</code> mode require an <code>@mention</code> or an already-tracked route (so follow-ups in a thread the bot joined need no new mention).</p>
+
+<p>Then <code>submit()</code> maps the route to a thread and starts the turn:</p>
+
+<figure class="code">
+  <figcaption><strong>Deterministic thread per route; one session and one idempotency key per Slack message</strong> <span class="src">crates/executor/src/managed_agents/adapters/mod.rs:673-683</span>, <span class="src">crates/executor/src/managed_agents/adapters/mod.rs:769-794</span></figcaption>
+  <pre><code class="language-rust">        let thread_id = match self.store.get::&lt;Route&gt;(&amp;route_key).await? {
+            Some(Route {
+                thread: Some(thread),
+            }) =&gt; thread,
+            _ => {
+                let slug = format!("slack-{}", digest(&amp;route_key));
+                let existing = exo_managed_agents::list_threads(agent.as_ref())
+                    .await?
+                    .into_iter()
+                    .find(|thread| thread.record().slug == slug);
+                // ... create via agent.new_thread(NewThreadRequest { slug: Some(slug), .. }) if absent,
+                // then persist Route { thread: Some(id) } under the admission lock
+        // ...
+        let input = format!(
+            "[{} user {}]\n{}",
+            deployment.definition.kind(),
+            inbox.message.sender,
+            inbox.message.text
+        );
+        let (turn, stream) = runtime
+            .start_turn(
+                agent,
+                thread,
+                SendRequest {
+                    input: vec![crate::harness_helpers::user_message(&amp;input)],
+                    session_id: Some(inbox.accepted),
+                },
+                true,
+                None,
+                TurnOptions {
+                    idempotency_key: Some(format!(
+                        "adapter:{}/{}",
+                        deployment.id, inbox.message.id
+                    )),
+                    retain_receipt: true,
+                    ..Default::default()
+                },
+            )
+            .await?;</code></pre>
+</figure>
+
+<ul>
+  <li><strong>Thread identity is a slug, not a lock.</strong> Two racing first messages cannot create two threads because the thread slug is <code>slack-{sha256(route_key)}</code> and lookup is by slug; a per-route in-process <code>Weak&lt;Mutex&gt;</code> serializes the rest (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:237-246</span>, <span class="src">crates/executor/src/managed_agents/adapters/mod.rs:670-717</span>). The route key is <code>sha256(account/conversation)</code> (<span class="src">crates/executor/src/managed_agents/adapters/store.rs:322-327</span>); <code>account</code> is <code>team_id/bot_user_id</code>, so replacing the bot account starts new namespaces.</li>
+  <li><strong>The input is plain text with a speaker tag</strong> (<code>[slack user U123]</code>). The model sees who spoke; no structured Slack metadata is passed.</li>
+  <li><strong>Each message is its own session</strong> (<code>session_id = inbox.accepted</code>, a UUIDv7). That has a consequence for approvals: Slack always sends <code>allow_for_tool: false</code> (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:1378-1383</span>), and "allow for session" would be scoped to that single message anyway.</li>
+  <li><strong>Exactly-once admission</strong> comes from the idempotency key <code>adapter:{deployment}/{message id}</code> plus <code>retain_receipt</code>; on restart <code>submit</code> sees <code>inbox.turn</code> and calls <code>watch_turn(thread, turn, inbox.cursor)</code> to resume streaming instead of resubmitting (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:759-768</span>).</li>
+  <li><strong>Per-sender isolation without per-sender threads.</strong> The vaults for a turn come from the caller's <code>Runtime</code> (see below), not from the thread. <code>turn_vaults</code> are attached to the thread (shared) but a sender's private vault never is (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:739-758</span>; policy comment at <span class="src">docs/managed-adapters.md:217-218</span>).</li>
+</ul>
+
+<h3 id="adapter-output">Output: streaming, receipts, retry</h3>
+<p><code>drain_stream</code> polls the turn's <code>ExecutionStream</code> (up to 4096 events without awaiting, via <code>now_or_never</code>), feeds each event through <code>Progress::event</code> to produce <code>SlackStreamChunk</code>s (text deltas in 4000-char chunks, task cards for tool calls, "Waiting for your approval", "Paused", "Responding"), and writes the chunks <em>and</em> the new observer cursor into one <code>Outbox::Stream</code> object as a <code>StreamReceipt</code> (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:810-901</span>, <span class="src">crates/executor/src/managed_agents/adapters/progress.rs:22-83</span>). If saving the inbox fails afterwards, <code>restore_receipt</code> reads the cursor back from the outbox (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:637-656</span>), which is what stops a restart from replaying or double-posting. Delivery (<code>deliver_one</code>) uses Slack's native streaming API (<code>chat.startStream</code> / <code>appendStream</code> / <code>stopStream</code>), marks a delivery permanently failed on <code>invalid_thread_ts | thread_not_found | message_not_found</code>, honors <code>Retry-After</code>, and otherwise backs off <code>2^attempts</code> seconds capped at 2^8 (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:1161-1260</span>, <span class="src">crates/executor/src/managed_agents/adapters/slack.rs:437-561</span>).</p>
+
+<p>Error handling for the observer: transient errors schedule a reconnect with delay <code>min(2^attempts, 60)</code> s; a <code>serde_json</code> error five times in a row (<code>INVALID_PROGRESS_RETRY_LIMIT</code>) stops delivery with "Updates unavailable" but leaves the turn intact (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:29</span>, <span class="src">crates/executor/src/managed_agents/adapters/mod.rs:930-975</span>); a failed turn posts "Turn failed: ..." instead of a fabricated answer (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:903-928</span>).</p>
+
+<h3 id="adapter-approvals">Approvals through Slack</h3>
+<p>An <code>ApprovalRequested</code> stream event becomes an <code>Outbox::Approval</code> with Approve/Deny buttons whose <code>action_id</code>s are <code>exo_approve</code> / <code>exo_deny</code> and whose <code>value</code> is the outbox id (<span class="src">crates/executor/src/managed_agents/adapters/slack.rs:529-551</span>). A click arrives as a <code>BlockActions</code> interaction, and <code>accept_decision</code> enforces: the message belongs to this account and channel and matches the stored Slack message ts; <strong>only the sender of the message that started the turn</strong> may answer; the identity grant (if any) is still valid; the decision is idempotent and cannot flip (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:1261-1327</span>). The decision is persisted as a <code>Decision</code> record and applied later by <code>apply_decision</code> through the same <code>respond_to_pending_approval</code> an HTTP client uses (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:1356-1405</span>). Typing "yes" in chat is never treated as approval.</p>
+
+<h3 id="adapter-identity">Authority, access policy and sender vaults</h3>
+<p>Each unique <code>(deployment, agent, thread, adapter, sender context, identity grant)</code> is an <code>Authority</code>; its JSON hash is the caller principal <code>adapter-{sha256}</code> (<span class="src">crates/executor/src/managed_agents/adapters/access.rs:172-177</span>). <code>AdapterService::caller_runtime</code> builds and caches (5-minute idle prune) a <code>Runtime</code> whose exoharness handle is wrapped in an <code>AdapterPolicy</code> (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:152-215</span>). That policy is re-evaluated on every access check against the <em>current</em> stored definition:</p>
+<ul>
+  <li>sender still in <code>allowed_users</code>; external (Slack Connect) senders only if <code>allow_slack_connect</code> and the channel is explicitly listed; DM vs channel rules (<span class="src">crates/executor/src/managed_agents/adapters/access.rs:62-82</span>);</li>
+  <li>resources are limited to this agent (and, for thread scope, this thread) (<span class="src">crates/executor/src/managed_agents/adapters/access.rs:94-104</span>); operator operations and vault creation are refused (<span class="src">crates/executor/src/managed_agents/adapters/access.rs:107-111</span>, <span class="src">crates/executor/src/managed_agents/adapters/access.rs:158-160</span>);</li>
+  <li>vault visibility: the global vault; the sender's personal vault, renamed to <code>personal</code> in what the thread sees; and only those <code>turn_vaults</code> named on this adapter, never the adapter's own transport vault (<span class="src">crates/executor/src/managed_agents/adapters/access.rs:113-157</span>); <code>default_vault</code> is the sender's vault if granted, else global (<span class="src">crates/executor/src/managed_agents/adapters/access.rs:161-169</span>).</li>
+</ul>
+<p>The sender's private vault comes from an <code>IdentityGrant</code> resolved only when <code>use_sender_vault: true</code>. <code>resolve_slack</code> prefers an explicit <code>(workspace, user)</code> pin; otherwise it requires the workspace to be explicitly trusted and an exact, unique, case-insensitive email match against known principals; grants carry a <code>revision</code> hash of (principal, pin, trusted) so any change invalidates queued work with <code>IdentityAccessChanged</code> (<span class="src">crates/executor/src/native/remote/identity.rs:206-297</span>). Queued input whose access was removed completes with "Access removed" rather than running under another context (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:603-612</span>).</p>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: authority-as-principal</p>
+<p>Instead of threading a sender through a shared runtime, the adapter mints a caller whose principal is a hash of everything that determines its authority, persists that authority, and installs a policy object that re-checks it against live config on every access. Revocation is then just a config change: the next check fails, and in-flight records complete with <code>AccessRemoved</code>. Recovery after restart is <code>recover_caller(principal)</code> reading the stored authority back (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:144-151</span>).</p></div>
+
+<div class="callout surprise"><p class="callout-title">MCP failures are tolerated only for adapter callers</p>
+<p><code>connect_mcp</code> picks <code>connect_available_with_connector</code> (skip servers that cannot authenticate) when the thread's caller principal starts with <code>"adapter-"</code>, otherwise <code>connect_with_connector</code> (fail the thread) (<span class="src">crates/executor/src/managed_mcp.rs:36-49</span>). A string-prefix check carries a real behavioral difference: a Slack user without a personal Notion token still gets an agent, minus the Notion tools.</p></div>
+
+<h3 id="adapter-http">Webhooks</h3>
+<p>For <code>transport: http</code> the webhook is built in, never configured: <code>POST /exo/adapter/{name}</code> on a single-agent server or <code>POST /exo/agent/{agent}/adapter/{name}</code> (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:115-136</span>). <code>slack_webhook</code> verifies the Slack signature with the vault's <code>signing-secret</code>, answers <code>url_verification</code> challenges, and dispatches form-encoded interactions or JSON events to the same code as Socket Mode (<span class="src">crates/executor/src/managed_agents/adapters/mod.rs:1448-1539</span>). If the secret is not yet in the vault the endpoint answers only the URL challenge, which lets you register the URL before creating the app. A signature error is 401; a payload parse error is 400; anything else is 503 so Slack retries (<span class="src">crates/executor/src/native/http_service.rs:232-241</span>).</p>
+
+<h2 id="executor">Managed executor vs the native executor</h2>
+
+<p>"Native" is the Rust-side machinery (<code>BasicExecutor</code>, <code>RlmExecutor</code>, <code>TypeScriptExecutor</code>); <code>ManagedExecutor</code> is the <code>HarnessExecutor</code> that the local provider installs (<span class="src">crates/executor/src/native/constructors.rs:60-70</span>). It does not run turns itself. It is a per-thread factory and cache:</p>
+<ol class="steps">
+  <li><strong>Connect MCP first.</strong> On first use for a thread, <code>connect_mcp</code> loads the saved definition, resolves <code>mcp_servers</code> (it always passes the no-op resolver <code>()</code>, so <code>type: provider</code> entries fail here with "this provider does not supply a built-in MCP server"; a host that supplies a resolver must call <code>resolve_mcp_servers</code> itself), computes or loads the thread's <code>VaultSelection</code>, and connects (<span class="src">crates/executor/src/managed_mcp.rs:14-60</span>).</li>
+  <li><strong>Validate the thread.</strong> Non-local sandboxes may not mount host secret paths; with <code>LocalProcess</code> sandboxes, vault-backed MCP credentials or multiple vaults are refused because the process could read host credentials (<span class="src">crates/executor/src/native/managed_executor.rs:279-306</span>).</li>
+  <li><strong>Pick the executor</strong> from <code>AgentHarnessKind</code>: <code>Basic</code> to <code>BasicExecutor</code>, <code>Rlm</code> to <code>RlmExecutor</code>, <code>TypeScript</code> to <code>TypeScriptExecutor</code> (Codex/Claude Code/Pi are TypeScript modules), <code>Exo</code> to <code>TypeScriptExecutor</code> with <code>ExoToolRuntime</code> (<span class="src">crates/executor/src/native/managed_executor.rs:73-102</span>). Each gets <code>McpToolRuntime</code> wrapped around its tool runtime so MCP tools and their approval policies appear uniformly.</li>
+  <li><strong>Guard drift.</strong> Every call revalidates that the resolved MCP server list still equals the connected one, otherwise "MCP configuration changed; start a new thread" (<span class="src">crates/executor/src/managed_mcp.rs:63-73</span>). A thread's vault selection is saved as an artifact and cannot be changed (<span class="src">crates/managed-agents/src/vaults.rs:123-138</span>).</li>
+  <li><strong>Record the tool inventory.</strong> <code>configure_thread</code> appends an <code>mcp_tools</code> custom event whenever the inventory differs from the last one, so the thread log shows which tools the model could see (<span class="src">crates/executor/src/managed_mcp.rs:75-107</span>).</li>
+</ol>
+
+<p>Capabilities are declared per harness kind: resume pending approval only for <code>Basic</code>; suspend a turn for <code>Basic</code> and <code>TypeScript</code>; reconcile an unresolved tool call only for <code>TypeScript</code> (<span class="src">crates/executor/src/native/managed_executor.rs:132-145</span>). The hosted counterpart <code>WorkerExecutor</code> shares the same <code>ExecutorCache</code> and <code>PreparedMcp</code> but its <code>worker_agent_config</code> refuses anything beyond <code>basic</code>/<code>codex</code>, custom tools, adapters, tool creation and Braintrust, and requires <code>model.credential</code> (<span class="src">crates/worker-runtime/src/execution.rs:45-80</span>).</p>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: bind credentials to MCP destinations, pin them per thread</p>
+<p><code>VaultSelection::from_vaults</code> maps each MCP server to a secret by asking whether the secret's destination policy permits the server URL, preferring an exact destination match, scanning attached vaults from last to first (later vaults override earlier ones), and erroring if two secrets in one vault tie. The result is saved on the thread; if the server URL later changes, validation fails instead of sending a credential somewhere new (<span class="src">crates/managed-agents/src/vaults.rs:49-111</span>). See <a href="egress-and-vaults.html">Egress &amp; vaults</a> for the proxy side.</p></div>
+
+<h2 id="cli">CLI and examples</h2>
+<ul>
+  <li><code>exo run FILE.md</code> upserts then opens a thread; <code>exo agent create</code> requires a new slug, <code>exo agent update</code> an existing one, and <code>get</code>/<code>doctor</code> inspect (<span class="src">crates/cli/src/main.rs:611-640</span>). Slugs come from <code>slugify(name)</code> unless <code>--slug</code> is given (<span class="src">crates/cli/src/managed_agents.rs:53</span>); new thread slugs are 1 to 128 chars of ASCII alphanumerics, <code>-</code> and <code>_</code>, and a UUID-shaped unknown reference is "not found" rather than a new thread name (<span class="src">crates/cli/src/managed_agents.rs:16-31</span>).</li>
+  <li><code>check_model_credentials</code> pre-flights <code>model.credential</code>: found in a thread vault, has a destination policy, and the policy permits the model endpoint, else it prints the exact <code>exo vault secret update ... --allow-origin</code> fix (<span class="src">crates/cli/src/managed_agents.rs:329-383</span>).</li>
+  <li>Examples in <span class="src">exoharness/examples/managed-agents/</span>: <code>support-analyst.md</code> (minimal: <code>harness</code>, <code>model.name</code>, <code>model.credential</code>, body), <code>repo-analyst.md</code> (DeepWiki MCP), <code>notion-analyst.md</code> (OAuth vault + MCP), <code>fastapi-developer.md</code> (a git resource mounted at <code>/workspace</code>), <code>pi-assistant.md</code> (<code>permission_policy: always_ask</code>), <code>coder.md</code>, <code>exo-developer.md</code> (private git resource with <code>credential: github</code>), <code>github-analyst.md</code> (GitHub MCP), <code>assistant.md</code> (<code>harness: basic</code>). The README there walks through the Notion OAuth flow.</li>
+</ul>
+
+<h2 id="doc-code">Docs versus code: discrepancies found</h2>
+<table>
+<thead><tr><th>Doc claim</th><th>What the code does</th></tr></thead>
+<tbody>
+<tr><td><span class="src">website/docs-src/adapters/slack.md:425</span> lists a Slack option <code>vaults</code> (default <code>[]</code>) for "named vaults available to agent turns".</td><td>The field is <code>turn_vaults</code> (<span class="src">crates/managed-agents/src/adapters.rs:53-54</span>), as <span class="src">docs/managed-adapters.md:202-210</span> says. Because <code>SlackAdapter</code> is <code>deny_unknown_fields</code>, copying the website table's <code>vaults:</code> key fails to parse.</td></tr>
+<tr><td><span class="src">exoharness/docs/managed-agents.md:250-262</span> describes <code>adapters: [support-slack]</code> with per-attachment <code>adapterType</code>, <code>workerCommand</code>, <code>stateDir</code>, <code>secretEnv</code>.</td><td>Stale. Adapters are typed inline variants (<code>type: slack</code>) with no worker command; <span class="src">docs/managed-adapters.md:417</span> notes the old self-agent workers were removed. A list of strings no longer parses.</td></tr>
+<tr><td><span class="src">website/docs-src/agent-definition.md:99-125</span>: <code>tools:</code> accepts declaration objects.</td><td><code>Vec&lt;PathBuf&gt;</code> only; flagged "Planned" in the doc, so this is accurate but easy to miss in the example block.</td></tr>
+<tr><td><span class="src">website/docs-src/agent-definition.md:172</span>: "Slack and Discord require an explicit credential vault. WhatsApp and Signal use linked-device profiles."</td><td>No such variants exist (<span class="src">crates/managed-agents/src/adapters.rs:9-11</span>). Only Slack, and it never falls back to <code>global</code>.</td></tr>
+<tr><td><span class="src">website/docs-src/agent-definition.md:41-43</span>: JSON has no <code>frontmatter</code> wrapper.</td><td>True for output; <code>from_json</code> still accepts the nested form on read (<span class="src">crates/managed-agents/src/lib.rs:113-132</span>).</td></tr>
+<tr><td><span class="src">docs/managed-adapters.md:243-244</span> suggests subscribing to <code>channel_shared</code>/<code>channel_unshared</code> to invalidate cached status.</td><td>The code does not cache: it calls <code>conversations.info</code> for every non-DM message (<span class="src">crates/executor/src/managed_agents/adapters/slack.rs:261-290</span>). Correct, but costs one Web API call per channel message.</td></tr>
+</tbody>
+</table>
+
+</main>
+<aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/wiki.js"></script>
+</body>
+</html>

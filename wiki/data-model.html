@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data model &amp; event log · Exo internals</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav id="nav"></nav>
+<main>
+<header>
+  <div class="kicker">Start</div>
+  <h1>Data model &amp; event log</h1>
+  <p class="lede">Everything durable in Exo is either a small JSON record (agent, thread) or an entry in a per-thread, append-only event log keyed by UUIDv7. Sessions and turns are not stored objects at all: they are ids stamped onto events. This page walks the types, the on-disk layout, the write/ordering rules, forking, watching, and how an interrupted turn is represented.</p>
+</header>
+
+<h2 id="mental-model">The mental model in one screen</h2>
+
+<p>The reference implementation of the <code>exoharness</code> traits is <code>BasicExoHarness</code> (<span class="src">crates/exoharness/src/basic.rs</span>). It stores everything through a tiny key/value trait (<code>Storage</code>) and exposes four handle traits that mirror the hierarchy: <code>ExoHarness</code> &rarr; <code>AgentHandle</code> &rarr; <code>ThreadHandle</code> &rarr; <code>TurnHandle</code> (<span class="src">crates/exoharness/src/types.rs:46-74</span>, <span class="src">crates/exoharness/src/types.rs:173-295</span>, <span class="src">crates/exoharness/src/types.rs:299-305</span>). The legacy name &ldquo;conversation&rdquo; is a type alias for &ldquo;thread&rdquo; throughout (<span class="src">crates/exoharness/src/types.rs:297</span>, <span class="src">crates/exoharness/src/types.rs:384-388</span>).</p>
+
+<table>
+<thead><tr><th>Concept</th><th>Persisted as</th><th>Identity</th><th>Where defined</th></tr></thead>
+<tbody>
+<tr><td><b>Agent</b></td><td><code>agents/&lt;id&gt;/record.json</code> (<code>AgentRecord</code>: id, slug, name, vaults) plus agent-level artifacts and sandboxes</td><td><code>AgentId = Uuid7</code></td><td><span class="src">crates/exoharness/src/types.rs:309-315</span></td></tr>
+<tr><td><b>Thread</b></td><td><code>…/conversations/&lt;id&gt;/record.json</code> (<code>ThreadRecord</code>: environment, vaults, slug, name) + <code>events/</code> + artifacts + sandboxes + <code>turn_queue.json</code></td><td><code>ThreadId = Uuid7</code></td><td><span class="src">crates/exoharness/src/types.rs:326-335</span></td></tr>
+<tr><td><b>Session</b></td><td>No record. A <code>SessionId</code> is minted with <code>Uuid7::now()</code>; the only trace is <code>session_id</code> on events and a <code>SessionStarted</code>/<code>SessionEnded</code> marker</td><td><code>SessionId = Uuid7</code></td><td><span class="src">crates/exoharness/src/basic.rs:1654-1682</span></td></tr>
+<tr><td><b>Turn</b></td><td>No record. A <code>TurnRecord { id, session_id }</code> is allocated by the <em>caller</em> before execution; a turn is whatever events carry its <code>turn_id</code>, bracketed by <code>TurnStarted</code> &hellip; <code>TurnEnded</code></td><td><code>TurnId = Uuid7</code></td><td><span class="src">crates/exoharness/src/types.rs:390-394</span></td></tr>
+<tr><td><b>Event</b></td><td>One JSON object per append (or one per batch)</td><td><code>EventId = Uuid7</code> (doubles as cursor and as <code>created_at</code>)</td><td><span class="src">crates/exoharness/src/types.rs:547-557</span></td></tr>
+<tr><td><b>Artifact</b></td><td><code>artifacts/&lt;artifact_id&gt;/&lt;version&gt;.json</code> + <code>.bin</code>, scoped to an agent or a thread; every write also logs <code>ArtifactWritten</code> for threads</td><td><code>ArtifactId = Uuid7</code> + <code>version: u64</code></td><td><span class="src">crates/exoharness/src/types.rs:738-752</span></td></tr>
+<tr><td><b>Snapshot</b></td><td>Sandbox state, not log state; the log only records <code>SandboxSnapshotted { sandbox_id, snapshot_id }</code></td><td><code>SnapshotId = Uuid7</code>, <code>SnapshotKind::{Filesystem, Full}</code></td><td><span class="src">crates/exoharness/src/types.rs:76-83</span></td></tr>
+</tbody>
+</table>
+
+<pre class="diagram">
+ Agent ──────────────── record.json, slug marker, agent artifacts/sandboxes
+   │
+   └─ Thread ─────────── record.json (commit marker), turn_queue.json
+        │
+        ├─ events/ ───── append-only, UUIDv7-named objects   &lt;-- the source of truth
+        │     │
+        │     │  event.session_id ──&gt; "session"  (just a tag)
+        │     └─ event.turn_id    ──&gt; "turn"     (just a tag, TurnStarted .. TurnEnded)
+        │
+        ├─ artifacts/ ── versioned blobs (path -&gt; id, version++)
+        └─ sandboxes/ ── provider state; lifecycle mirrored into events
+</pre>
+
+<p>The conceptual docs (<span class="src">website/docs-src/architecture/data-model.md</span>) describe sessions and turns as first-class concepts. In the code they are purely a labelling scheme on the log; there is no session table to query and no turn status column. Everything below follows from that.</p>
+
+<h2 id="ids">Identifiers: UUIDv7 everywhere</h2>
+
+<p>Every id except sandbox/process/tool-call ids is a <code>Uuid7</code> newtype around <code>uuid::Uuid</code> created by <code>Uuid::now_v7()</code> (<span class="src">crates/exoharness/src/uuid7.rs:8-15</span>). The type aliases are in <span class="src">crates/exoharness/src/types.rs:1540-1553</span>; <code>SandboxId</code>, <code>SandboxProcessId</code> and <code>ToolCallId</code> are plain <code>String</code>s.</p>
+
+<p>Because UUIDv7 sorts by creation time, the project leans on that three ways:</p>
+<ul>
+<li><b>Ordering and cursors.</b> Events are ordered by <code>EventId</code> comparison; <code>EventQuery.cursor</code>, <code>watch_events(Bound&lt;EventId&gt;)</code>, <code>up_to_inclusive</code> and thread-list pagination all take event ids. There is no separate sequence number.</li>
+<li><b>Derived timestamps.</b> <code>Event.created_at</code> is set from <code>id.timestamp()</code> at append time, and <code>HasUuid7Id::created_at()</code> is a default method (<span class="src">crates/exoharness/src/uuid7.rs:60-66</span>, <span class="src">crates/exoharness/src/basic.rs:2475</span>).</li>
+<li><b>File names.</b> Event objects are named by id (see <a href="#layout">layout</a>), so a directory listing is already a sorted log and the head can be recovered without opening any file.</li>
+</ul>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: the id is the cursor, the clock and the filename</p>
+<p>One field does triple duty, which removes a whole class of consistency bugs (sequence numbers vs. timestamps vs. keys). The thread &ldquo;recency&rdquo; used for listing is literally <code>latest_event_id.unwrap_or(thread.id)</code>, so a thread bubbles to the top of the list by appending any event (<span class="src">crates/exoharness/src/basic.rs:1375-1377</span>). The cost: ordering across processes is only as good as their clocks, and ids are re-minted on fork (see <a href="#fork">Forking</a>).</p></div>
+
+<h2 id="event-envelope">The event envelope and <code>EventData</code></h2>
+
+<figure class="code">
+<figcaption><strong>Event envelope: tagged enum, session/turn are optional tags</strong> <span class="src">crates/exoharness/src/types.rs:547-566</span></figcaption>
+<pre><code class="language-rust">#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+    pub id: EventId,
+    #[serde(alias = "conversation_id")]
+    pub thread_id: ThreadId,
+    pub session_id: Option&lt;SessionId&gt;,
+    pub turn_id: Option&lt;TurnId&gt;,
+    pub created_at: DateTimeUtc,
+    pub data: EventData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EventData {
+    #[serde(alias = "conversation_created")]
+    ThreadCreated {
+        slug: String,
+        name: String,
+    },
+    // ...</code></pre>
+</figure>
+
+<p>Serialization is plain internally-tagged serde (<code>"type": "turn_started"</code>), with <code>#[serde(alias = ...)]</code> so logs written under the old &ldquo;conversation&rdquo; names still load while new writes use &ldquo;thread&rdquo; (<span class="src">crates/exoharness/src/types.rs:1636-1693</span>). <code>EventData::kind()</code> maps every variant to an <code>EventKind</code> string; <code>EventKind::matches</code> canonicalises the four legacy names so a filter on <code>conversation_created</code> still hits <code>thread_created</code> (<span class="src">crates/exoharness/src/types.rs:468-483</span>, <span class="src">crates/exoharness/src/types.rs:694-724</span>). <code>EventKind</code> is a transparent <code>Cow&lt;'static, str&gt;</code> so <code>EventData::Custom { event_type, .. }</code> kinds are filterable with <code>EventKind::custom(..)</code> (<span class="src">crates/exoharness/src/types.rs:427-466</span>).</p>
+
+<h3 id="event-table">All 24 variants</h3>
+<p>Extracted from the enum at <span class="src">crates/exoharness/src/types.rs:566-692</span> (the <code>kind</code> string equals the snake_case wire tag). &ldquo;Emitted by&rdquo; was checked by grepping constructors.</p>
+
+<table>
+<thead><tr><th>Variant</th><th><code>type</code> / kind</th><th>Fields</th><th>Emitted by</th></tr></thead>
+<tbody>
+<tr><td><code>ThreadCreated</code></td><td><code>thread_created</code></td><td>slug, name</td><td><code>new_conversation</code> <span class="src">crates/exoharness/src/basic.rs:1125</span></td></tr>
+<tr><td><code>ThreadUpdated</code></td><td><code>thread_updated</code></td><td>slug?, name?</td><td><b>Nothing.</b> Defined and mapped in <code>kind()</code>, never constructed in the Rust tree</td></tr>
+<tr><td><code>ThreadDeleted</code></td><td><code>thread_deleted</code></td><td>&mdash;</td><td><code>delete_conversation</code> <span class="src">crates/exoharness/src/basic.rs:1238</span>, immediately before the thread prefix is deleted</td></tr>
+<tr><td><code>ThreadForked</code></td><td><code>thread_forked</code></td><td>source_thread_id, up_to_inclusive?</td><td><code>fork</code> <span class="src">crates/exoharness/src/basic.rs:2095</span></td></tr>
+<tr><td><code>SessionStarted</code></td><td><code>session_started</code></td><td>&mdash;</td><td><code>start_session</code>, or <code>begin_turn</code> when <code>new_session</code> <span class="src">crates/exoharness/src/basic.rs:1666</span>, <span class="src">crates/exoharness/src/basic.rs:1727</span></td></tr>
+<tr><td><code>SessionEnded</code></td><td><code>session_ended</code></td><td>&mdash;</td><td><code>end_session</code> <span class="src">crates/exoharness/src/basic.rs:1679</span></td></tr>
+<tr><td><code>TurnStarted</code></td><td><code>turn_started</code></td><td>user_id? (caller principal)</td><td><code>begin_turn</code> <span class="src">crates/exoharness/src/basic.rs:1729</span></td></tr>
+<tr><td><code>TurnEnded</code></td><td><code>turn_ended</code></td><td>&mdash;</td><td><code>TurnHandle::finish</code> <span class="src">crates/exoharness/src/basic.rs:2415</span></td></tr>
+<tr><td><code>Messages</code></td><td><code>messages</code></td><td>messages (lingua <code>Message</code>s), response_id?, usage? (boxed <code>UsageRecord</code>)</td><td><code>begin_turn</code> (the user input) and executors (<span class="src">crates/executor/src/model_events.rs:14-20</span>)</td></tr>
+<tr><td><code>ToolRequested</code></td><td><code>tool_requested</code></td><td>tool_call_id, response_id?, request{function_name, arguments, namespace?}</td><td>executors <span class="src">crates/executor/src/model_events.rs:22</span></td></tr>
+<tr><td><code>ToolResult</code></td><td><code>tool_result</code></td><td>tool_call_id, result (JSON <code>Value</code>)</td><td>executors/harness runtime <span class="src">crates/executor/src/basic.rs:309</span></td></tr>
+<tr><td><code>LinguaStreamChunk</code></td><td><code>lingua_stream_chunk</code></td><td>chunk (<code>UniversalStreamChunk</code>)</td><td><b>Never persisted.</b> Synthesised with a fresh <code>Uuid7</code> onto a broadcast channel for live subscribers <span class="src">crates/executor/src/managed_agents/service.rs:768-790</span></td></tr>
+<tr><td><code>Error</code></td><td><code>error</code></td><td>message, metadata?</td><td><code>finalize_turn</code> <span class="src">crates/executor/src/shared.rs:6-27</span>, queue failure path <span class="src">crates/executor/src/turn_queue.rs:814-841</span></td></tr>
+<tr><td><code>ArtifactWritten</code></td><td><code>artifact_written</code></td><td>artifact_id, path, version</td><td>thread/turn <code>write_artifact</code> <span class="src">crates/exoharness/src/basic.rs:2149</span>, <span class="src">crates/exoharness/src/basic.rs:2365</span></td></tr>
+<tr><td><code>SandboxCreated</code></td><td><code>sandbox_created</code></td><td>sandbox_id, name?, provider, image, default_workdir, mounts, durable_file_systems, resources?, tcp_ports, policy?, enable_networking, idle_seconds</td><td><span class="src">crates/exoharness/src/basic/sandboxes.rs:990</span></td></tr>
+<tr><td><code>SandboxStarted</code></td><td><code>sandbox_started</code></td><td>sandbox_id, snapshot_id?</td><td><span class="src">crates/exoharness/src/basic/sandboxes.rs:1004</span></td></tr>
+<tr><td><code>SandboxStopped</code></td><td><code>sandbox_stopped</code></td><td>sandbox_id</td><td><span class="src">crates/exoharness/src/basic/sandboxes.rs:429</span></td></tr>
+<tr><td><code>SandboxAttached</code></td><td><code>sandbox_attached</code></td><td>sandbox_id, attachment, default_workdir</td><td><span class="src">crates/exoharness/src/basic/sandboxes.rs:1049</span></td></tr>
+<tr><td><code>SandboxDetached</code></td><td><code>sandbox_detached</code></td><td>sandbox_id, attachment</td><td><span class="src">crates/exoharness/src/basic/sandboxes.rs:526</span></td></tr>
+<tr><td><code>SandboxSnapshotted</code></td><td><code>sandbox_snapshotted</code></td><td>sandbox_id, snapshot_id</td><td><span class="src">crates/exoharness/src/basic/sandboxes.rs:1418</span></td></tr>
+<tr><td><code>SandboxProcessStarted</code></td><td><code>sandbox_process_started</code></td><td>sandbox_id, process_id, name?, command, cwd?, mode, stdin, output, lifecycle, status, provider_state?</td><td><span class="src">crates/exoharness/src/basic/sandboxes.rs:1211</span></td></tr>
+<tr><td><code>SandboxProcessStateUpdated</code></td><td><code>sandbox_process_state_updated</code></td><td>sandbox_id, process_id, status, provider_state?</td><td><span class="src">crates/exoharness/src/basic/sandboxes.rs:2484</span></td></tr>
+<tr><td><code>SandboxProcessEvent</code></td><td><code>sandbox_process_event</code></td><td>sandbox_id, process_id, event (<code>SandboxProcessEvent</code>)</td><td><span class="src">crates/exoharness/src/basic/sandboxes.rs:2437</span></td></tr>
+<tr><td><code>Custom</code></td><td>the <code>event_type</code> string</td><td>event_type, payload (<code>Value</code>)</td><td>runtime and harnesses; see <a href="#custom-events">custom events</a></td></tr>
+</tbody>
+</table>
+
+<p>The sandbox variants are covered in <a href="sandboxes.html">Sandboxes</a>; this page only cares that they live in the same log and obey the same ordering rules.</p>
+
+<div class="callout surprise"><p class="callout-title">Surprise: two &ldquo;event&rdquo; variants never reach the log</p>
+<p><code>ThreadUpdated</code> has no producer at all, and <code>LinguaStreamChunk</code> is produced only as a transient <code>Event</code> with a throw-away id for HTTP/SSE watchers (<span class="src">crates/executor/src/managed_agents/service.rs:768-790</span>). A test asserts the persisted history contains no stream chunks (<span class="src">crates/executor/src/native/http_tests.rs:545-551</span>). Likewise <code>runtime_status</code> custom events are progress-only. The persistent log is therefore smaller than the type suggests, and streamed text is reconstructed from the final <code>Messages</code> event, not from chunks.</p></div>
+
+<h3 id="custom-events">Custom events the runtime itself defines</h3>
+<p><code>Custom</code> is how the runtime layers its own bookkeeping on the log without growing the substrate. The strings in use (all verified as constants):</p>
+<table>
+<thead><tr><th><code>event_type</code></th><th>Purpose</th><th>Defined</th></tr></thead>
+<tbody>
+<tr><td><code>exo.runtime.turn_work</code></td><td>Serialized <code>TurnWork</code> (agent config, thread config, <code>SendRequest</code>) committed <em>in the same batch</em> as <code>TurnStarted</code>, so an interrupted turn can be re-run</td><td><span class="src">crates/executor/src/harness_executor.rs:37-72</span></td></tr>
+<tr><td><code>exo.runtime.turn_completed</code></td><td>Marker that the harness finished but <code>TurnEnded</code> was not yet written</td><td><span class="src">crates/executor/src/harness_executor.rs:38</span>, <span class="src">crates/executor/src/harness_executor.rs:826-852</span></td></tr>
+<tr><td><code>agent_runtime.approval_requested</code> / <code>approval_response</code></td><td>Tool approval round-trip</td><td><span class="src">crates/executor/src/permissions.rs:14-15</span></td></tr>
+<tr><td><code>agent_runtime.frontend_tool_response</code></td><td>Client-supplied results for frontend tools; folded into prompt history</td><td><span class="src">crates/executor/src/frontend_tools.rs:14</span></td></tr>
+<tr><td><code>conversation_model_config</code></td><td>Per-thread model override</td><td><span class="src">crates/executor/src/harness_helpers.rs:19</span></td></tr>
+<tr><td><code>runtime_status</code></td><td>Transient &ldquo;preparing&hellip;&rdquo; messages (not persisted)</td><td><span class="src">crates/executor/src/executor_types.rs:329</span></td></tr>
+<tr><td><code>sandbox_provider_state</code></td><td>Provider-specific sandbox state replayed from the log after a harness reload</td><td><span class="src">crates/exoharness/src/basic/sandboxes.rs:22</span></td></tr>
+<tr><td><code>rebuild_and_restart_exo</code></td><td>Host-originated record of a self-update outcome</td><td><span class="src">crates/executor/src/native/conversation_events.rs:22</span></td></tr>
+</tbody>
+</table>
+
+<h2 id="layout">What is stored where</h2>
+
+<h3 id="storage-trait">The storage abstraction</h3>
+<p><code>Storage</code> is a byte store with five required methods, <code>put(key, bytes, blob)</code>, <code>get</code>, <code>list_after(prefix, after)</code>, <code>delete</code>, <code>copy</code>, plus defaulted <code>list</code> and <code>list_directories</code> (<span class="src">crates/exoharness/src/storage.rs:11-40</span>). Its doc comment states the contract: mutations are serialised by the harness, and the host must provide read-after-write consistency. <code>BasicObjectStore</code> wraps it with JSON helpers; every JSON write is <code>serde_json::to_vec_pretty</code>, and payloads over 64 KiB are flagged <code>blob = true</code> as a placement hint for hosts (<span class="src">crates/exoharness/src/storage.rs:46-107</span>).</p>
+
+<table>
+<thead><tr><th>Backend</th><th>Where</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Local filesystem</td><td><code>object_store::local::LocalFileSystem</code> rooted at the Exo home <span class="src">crates/exoharness/src/storage/native.rs:13-20</span></td><td>The default for the CLI and server; <code>_blob</code> hint ignored</td></tr>
+<tr><td>In-memory</td><td><code>object_store::memory::InMemory</code> <span class="src">crates/exoharness/src/storage/native.rs:10-12</span></td><td>Tests and ephemeral runs (<code>BasicExoHarness::in_memory</code>)</td></tr>
+<tr><td>Host-provided</td><td><code>HostStorage</code> forwards the five required operations as RPCs to the embedding host <span class="src">crates/worker-runtime/src/host.rs:179-229</span></td><td>The hosted worker runtime (<code>BasicExoHarness::hosted</code>, used from <span class="src">crates/worker-runtime/src/lib.rs:96</span>); the thread-object queue persists under the single key <code>turn_queue</code> with an alarm flag <span class="src">crates/worker-runtime/src/turn_queue.rs:1-62</span></td></tr>
+</tbody>
+</table>
+
+<div class="callout surprise"><p class="callout-title">Surprise: no SQLite in the data path</p>
+<p>The workspace manifest declares <code>sqlx</code> with the sqlite/postgres features (<span class="src">Cargo.toml:66-72</span>), but no crate in the tree references it and nothing in <code>exoharness</code>'s store uses it. Durable state is JSON files under an object-store abstraction; queries such as &ldquo;events of type X in turn Y&rdquo; are directory listings plus filename-range pruning plus in-memory filtering (<a href="#reading">Reading events</a>).</p></div>
+
+<h3 id="tree">Key layout</h3>
+<pre class="diagram">
+&lt;root&gt;/
+  environments/&lt;name&gt;.json                 named EnvironmentDefinition  (basic.rs:415-440)
+  bindings/&lt;id&gt;.json                       global bindings              (basic.rs:360)
+  agents/
+    by-slug/&lt;encoded-slug&gt;.slug            -&gt; agent id (O(1) uniqueness)  (basic.rs:339-358)
+    &lt;agent_id&gt;/
+      record.json                            AgentRecord
+      artifacts/&lt;artifact_id&gt;/&lt;v&gt;.json|.bin  agent-scope artifacts
+      sandboxes/&lt;sandbox_id&gt;.json          agent-scope sandboxes
+      conversations/&lt;thread_id&gt;/
+        record.json                          ThreadRecord (written LAST on create/fork)
+        events/&lt;id&gt;.json                     one event
+        events/&lt;first&gt;_&lt;last&gt;.batch.json     many events, one object
+        artifacts/…  bindings/…  sandboxes/…
+        title.json                           derived-name cache
+        turn_queue.json                      durable turn queue for this thread
+        caller.json                          last active principal
+  sessions/&lt;agent&gt;/&lt;thread&gt;.lock            flock leases (local process ownership)
+  resources/{snapshots,threads,locks}/       filesystem resources (plain std::fs)
+  vaults/  cache/  durable-filesystems/  master.key
+</pre>
+<p>Path construction is centralised in <code>owner_dir(ResourceScope)</code> (<span class="src">crates/exoharness/src/basic.rs:322-337</span>); the scope enum <code>Global | Agent{..} | Thread{..}</code> is also the unit of access checks and process ownership (<span class="src">crates/exoharness/src/types.rs:23-44</span>). Vaults, secrets and egress are covered in <a href="egress-and-vaults.html">Egress &amp; vaults</a>.</p>
+
+<h3 id="event-objects">Event objects: single and batch</h3>
+<p>A single appended event becomes <code>events/&lt;event_id&gt;.json</code>. Several events appended together become one <code>events/&lt;first&gt;_&lt;last&gt;.batch.json</code> holding <code>{"events":[...]}</code> (<code>StoredEventBatch</code>, <span class="src">crates/exoharness/src/basic.rs:80-83</span>, <span class="src">crates/exoharness/src/basic.rs:158-162</span>). The range lives in the <em>file name</em>, so listing keys is enough to find which objects can contain an id, to compute the head, and to prune pagination. In memory, <code>EventBatchIndex</code> keeps batches sorted by <code>first</code> with a running <code>max_last</code> so <code>get_event(id)</code> can binary-search the right object (<span class="src">crates/exoharness/src/basic.rs:85-156</span>).</p>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: atomic multi-event commit via one object put</p>
+<p>&ldquo;One object put commits the whole batch.&rdquo; Rather than build a transaction layer over a dumb key/value store, a multi-event append is a single PUT of a batch object; the inclusive id range in its name makes it self-indexing (<span class="src">crates/exoharness/src/basic.rs:2490-2497</span>). <code>begin_turn</code> uses this to commit <code>SessionStarted + TurnStarted + turn_work + input messages</code> as one unit, which is exactly what recovery relies on.</p></div>
+
+<h2 id="write-path">The write path: ordering, locking, head tracking</h2>
+
+<h3 id="append">One function appends everything</h3>
+<p>Every event written by the thread, turn and sandbox handles funnels through <code>append_events_to_conversation</code> (<span class="src">crates/exoharness/src/basic.rs:2446-2505</span>). It mints ids with <code>Uuid7::now()</code> in order, writes either one object or one batch, publishes the events to in-process subscribers, and updates the in-memory record's head. Note what it does <em>not</em> do: it does not rewrite <code>record.json</code> (a test pins this, <span class="src">crates/exoharness/src/basic_tests.rs:1163-1165</span>).</p>
+
+<figure class="code">
+<figcaption><strong>Append: mint ids, one PUT, then notify</strong> <span class="src">crates/exoharness/src/basic.rs:2446-2505</span></figcaption>
+<pre><code class="language-rust">async fn append_events_to_conversation(
+    inner: &amp;BasicExoHarnessInner,
+    conversation_dir: &amp;Path,
+    conversation_id: ConversationId,
+    session_id: Option&lt;SessionId&gt;,
+    turn_id: Option&lt;TurnId&gt;,
+    expected_head: Option&lt;EventId&gt;,
+    data: Vec&lt;EventData&gt;,
+    record: &amp;mut ConversationRecord,
+) -&gt; Result&lt;AddEventsResult&gt; {
+    if data.is_empty() {
+        bail!("cannot append zero events");
+    }
+    if let Some(expected_head) = expected_head {
+        ensure_conversation_head(
+            record.latest_event_id,
+            Some(expected_head),
+            session_id,
+            turn_id,
+        )?;
+    }
+    let mut events = Vec::with_capacity(data.len());
+    for data in data {
+        let id = Uuid7::now();
+        let event = Event {
+            id,
+            thread_id: conversation_id,
+            session_id,
+            turn_id,
+            created_at: id.timestamp().expect("uuid7 timestamp"),
+            data,
+        };
+        events.push(event);
+    }
+    let first_event_id = events.first().expect("at least one event").id;
+    let latest_event_id = events.last().expect("at least one event").id;
+    let key = if events.len() == 1 {
+        conversation_dir
+            .join("events")
+            .join(format!("{latest_event_id}.json"))
+    } else {
+        event_batch_path(conversation_dir, first_event_id, latest_event_id)
+    };
+    if events.len() == 1 {
+        inner.storage.put_json(&amp;key, &amp;events[0]).await?;
+    } else {
+        // One object put commits the whole batch. The filename bounds let
+        // get_event skip unrelated batches without a separate index write.
+        let batch = StoredEventBatch { events };
+        inner.storage.put_json(&amp;key, &amp;batch).await?;
+        events = batch.events;
+    }
+    let event_ids = events.iter().map(|event| event.id).collect();
+    notify_subscribers(inner, conversation_id, &amp;key, events);
+    record.latest_event_id = Some(latest_event_id);
+    Ok(AddEventsResult {
+        event_ids,
+        latest_event_id,
+    })
+}</code></pre>
+</figure>
+
+<h3 id="head">Where the &ldquo;head&rdquo; actually comes from</h3>
+<p>The head (<code>latest_event_id</code>) of a thread is <em>derived from the object keys</em>, not read from <code>record.json</code>. <code>load_conversation_record</code> loads the record and then overwrites <code>latest_event_id</code> with the max id parsed out of the <code>events/</code> listing (<span class="src">crates/exoharness/src/basic.rs:2820-2832</span>, <span class="src">crates/exoharness/src/basic.rs:2887-2902</span>). The comment on <code>refresh_conversation_record</code> states the rule: &ldquo;The event log is authoritative if a crash preceded the metadata write&rdquo; (<span class="src">crates/exoharness/src/basic.rs:2846</span>). Thread titles follow the same pattern: a derived <code>title.json</code> cache with a <code>checked_through</code> watermark, recomputed from the first user message when absent (<span class="src">crates/exoharness/src/basic.rs:2835-2885</span>, <span class="src">crates/exoharness/src/basic.rs:3042-3070</span>).</p>
+
+<h3 id="serialization">Serialisation layers</h3>
+<p>Writes are ordered by stacked locks, from outermost to innermost:</p>
+<ol class="steps">
+<li><b>Process ownership lease</b> (<code>claim_local_scope</code>): when the harness was built <code>with_local_sessions(root)</code>, the first operation on a thread takes an OS file lock <code>sessions/&lt;agent&gt;/&lt;thread&gt;.lock</code> via <code>try_lock</code>; a second process fails with &ldquo;thread &hellip; is owned by another local process; use its HTTP provider&rdquo;. The OS releases it on crash, and the new owner stops VMs the dead one left running (<span class="src">crates/exoharness/src/basic/sessions.rs:86-109</span>, <span class="src">crates/exoharness/src/basic/sessions.rs:181-219</span>).</li>
+<li><b>Resource locks</b>: a per-scope <code>RwLock</code> map; the documented order is &ldquo;agent resources, thread resources, then write_lock&rdquo; (<span class="src">crates/exoharness/src/basic.rs:213-250</span>).</li>
+<li><b><code>write_lock</code></b>: a single <code>AsyncMutex&lt;()&gt;</code> on the whole harness, held across the storage PUT and (for appends) the head load (<span class="src">crates/exoharness/src/basic.rs:199</span>). It serialises metadata writes for <em>all</em> agents and threads in the process.</li>
+</ol>
+
+<div class="callout surprise"><p class="callout-title">Surprise: the head check is unreachable in the reference implementation</p>
+<p><code>append_events_to_conversation</code> takes an <code>expected_head</code> and fails with <code>ConversationHeadMismatch</code> (&ldquo;turn is stale and cannot be resumed: conversation head advanced outside this turn&rdquo;, <span class="src">crates/exoharness/src/basic.rs:2507-2556</span>). But every caller passes the head it <em>just loaded under the same <code>write_lock</code></em>: <code>begin_turn</code> (<span class="src">crates/exoharness/src/basic.rs:1747</span>), <code>TurnHandle::add_events</code> (<span class="src">crates/exoharness/src/basic.rs:2307-2337</span>), <code>finish</code> (<span class="src">crates/exoharness/src/basic.rs:2380-2426</span>), <code>write_artifact</code>, and sandbox events (<span class="src">crates/exoharness/src/basic/sandboxes.rs:1305-1312</span>). <code>add_events</code> on a thread and <code>start/end_session</code> pass <code>None</code>. So the comparison is a record against itself and the error cannot fire (grep finds one call to <code>ensure_conversation_head</code>). A test is explicit that interleaved writes are allowed: <code>turn_artifact_write_allows_interleaved_conversation_writes</code> (<span class="src">crates/exoharness/src/basic_tests.rs:1178-1255</span>), and <code>record_host_event</code> notes it is safe because &ldquo;<code>BasicTurnHandle::add_events</code> re-reads the head under the write lock&rdquo; (<span class="src">crates/executor/src/native/conversation_events.rs:152-156</span>). The architecture docs say &ldquo;head tracking and write ordering stay inside the exoharness&rdquo; (<span class="src">website/docs-src/architecture/data-model.md:46-50</span>); in practice ordering is enforced by the lock stack plus per-thread turn serialisation upstream, not by optimistic concurrency.</p></div>
+
+<p>The one place that <em>does</em> use head tracking to decide behaviour is the asynchronous snapshot publication path. A turn handle keeps <code>BasicTurnState { latest_event_id, finished }</code>; when a snapshot completes, if the turn is finished or the thread head has moved past the turn's last event, the <code>SandboxSnapshotted</code> event is downgraded from a turn-scoped sink to a thread-scoped one (no <code>turn_id</code>), so it never lands inside a closed turn (<span class="src">crates/exoharness/src/basic/sandboxes.rs:546-585</span>, <span class="src">crates/exoharness/src/basic.rs:2282-2285</span>).</p>
+
+<h3 id="begin-finish">Turn lifecycle on the log</h3>
+<figure class="code">
+<figcaption><strong><code>begin_turn</code>: lease, lock, one batch containing session + turn + work + input</strong> <span class="src">crates/exoharness/src/basic.rs:1684-1774</span></figcaption>
+<pre><code class="language-rust">async fn begin_turn(&amp;self, request: BeginTurnRequest) -&gt; Result&lt;Arc&lt;dyn TurnHandle&gt;&gt; {
+    #[cfg(feature = "basic-backend")]
+    let _lease = self
+        .harness
+        .claim_local_scope(ResourceScope::Thread {
+            agent_id: self.agent_id,
+            thread_id: self.record.id,
+        })
+        .await?;
+    self.harness
+        .check(ResourceScope::Thread {
+            agent_id: self.agent_id,
+            thread_id: self.record.id,
+        })
+        .await?;
+    let _guard = self.harness.inner.write_lock.lock().await;
+    let mut record = self.load_record().await?;
+    let conversation_dir = self.conversation_dir();
+    // ... if the thread is untitled, derive a name from the first user message ...
+    let turn_record = request.turn;
+    let session_id = turn_record.session_id;
+    let mut events_to_append = Vec::new();
+    if request.new_session {
+        events_to_append.push(EventData::SessionStarted);
+    }
+    events_to_append.push(EventData::TurnStarted {
+        user_id: self.harness.caller.as_ref().map(|c| c.principal.clone()),
+    });
+    events_to_append.extend(request.initial_events);
+    if !request.input.is_empty() {
+        events_to_append.push(EventData::Messages {
+            messages: request.input,
+            response_id: None,
+            usage: None,
+        });
+    }
+
+    let add_result = append_events_to_conversation(
+        &amp;self.harness.inner,
+        &amp;conversation_dir,
+        self.record.id,
+        Some(session_id),
+        Some(turn_record.id),
+        record.latest_event_id,
+        events_to_append,
+        &amp;mut record,
+    )
+    .await?;
+    // ... returns a BasicTurnHandle seeded with BasicTurnState { latest_event_id, finished: false } ...</code></pre>
+</figure>
+
+<figure class="code">
+<figcaption><strong><code>finish</code> is idempotent and just appends <code>TurnEnded</code></strong> <span class="src">crates/exoharness/src/basic.rs:2380-2426</span></figcaption>
+<pre><code class="language-rust">async fn finish(&amp;self) -&gt; Result&lt;EventId&gt; {
+    // ... claim_local_scope lease, as in begin_turn ...
+    let _guard = self.harness.inner.write_lock.lock().await;
+    let finished_event_id = {
+        let state = self.state.lock().expect("turn state poisoned");
+        if state.finished {
+            Some(
+                state
+                    .latest_event_id
+                    .ok_or_else(|| anyhow!("turn has no latest event id"))?,
+            )
+        } else {
+            None
+        }
+    };
+    if let Some(event_id) = finished_event_id {
+        return Ok(event_id);
+    }
+    let mut record =
+        load_conversation_record(&amp;self.harness.inner.storage, &amp;self.conversation_dir).await?;
+    let expected_head = record.latest_event_id;
+    let add_result = append_events_to_conversation(
+        &amp;self.harness.inner,
+        &amp;self.conversation_dir,
+        self.conversation_id,
+        Some(self.record.session_id),
+        Some(self.record.id),
+        expected_head,
+        vec![EventData::TurnEnded],
+        &amp;mut record,
+    )
+    .await?;
+    let latest = add_result.latest_event_id;
+    {
+        let mut state = self.state.lock().expect("turn state poisoned");
+        state.latest_event_id = Some(latest);
+        state.finished = true;
+    }
+    Ok(latest)
+}</code></pre>
+</figure>
+
+<p>Two details worth noting. First, the caller supplies the <code>TurnRecord</code> (ids are allocated by the queue before execution, <span class="src">crates/executor/src/turn_queue.rs:402-405</span>), so a turn&rsquo;s identity exists before any event does and survives a crash between queue acceptance and <code>begin_turn</code>. Second, <code>TurnHandle</code> is only a facade: <code>turn_handle(record)</code> rebuilds one by scanning <em>all</em> events of the thread for that session+turn to recover <code>latest_event_id</code> and <code>finished</code>, failing with &ldquo;turn &hellip; was not found&rdquo; if there are none (<span class="src">crates/exoharness/src/basic.rs:1776-1813</span>). That is O(thread size), used only on recovery.</p>
+
+<h2 id="reading">Reading events: pagination and watch</h2>
+
+<h3 id="get-events">get_events</h3>
+<p><code>EventQuery</code> has six knobs: <code>cursor</code>, <code>direction</code> (<code>Asc</code>/<code>Desc</code>), <code>limit</code>, <code>session_id</code>, <code>turn_id</code>, <code>types</code> (<span class="src">crates/exoharness/src/types.rs:408-416</span>). The result is <code>{ events, cursor }</code> where <code>cursor</code> is simply the id of the last returned event &mdash; &ldquo;a resume position, even on the final page&rdquo; (<span class="src">crates/exoharness/src/basic.rs:1815-1831</span>). An empty page has <code>cursor: None</code>, so loops must stop on an empty page, as <code>materialize_conversation_messages</code> does (<span class="src">crates/executor/src/harness_helpers.rs:104-130</span>).</p>
+
+<p>The implementation (<span class="src">crates/exoharness/src/basic.rs:2718-2802</span>) lists every key under <code>events/</code>, parses <code>(first,last)</code> from each filename, drops objects that cannot intersect the cursor, orders objects by <code>first</code> (or by <code>last</code> reversed for <code>Desc</code>), loads up to 16 at a time (<code>buffered(16)</code>), filters events in memory by session/turn/kind/cursor, and stops loading once <code>limit</code> is satisfied and the next object lies strictly beyond. The cost per page is therefore one directory listing plus the objects touched; there is no secondary index.</p>
+
+<div class="callout warn"><p class="callout-title">Sharp edge: per-page cost is O(number of event objects)</p>
+<p>Because a thread&rsquo;s events are one file per append and every query starts with a full <code>list_keys</code>, a long-running thread pays a listing proportional to its object count on every call (including <code>load_conversation_record</code> on every write, <span class="src">crates/exoharness/src/basic.rs:2825-2830</span>). Batching (as <code>begin_turn</code> does) reduces object count; the in-process <code>EventBatchIndex</code> only helps <code>get_event</code>.</p></div>
+
+<h3 id="watch">watch_events</h3>
+<p><code>watch_events(Bound&lt;EventId&gt;)</code> returns a <code>Stream&lt;Item = Result&lt;Event&gt;&gt;</code> that first replays persisted events after the bound and then follows live appends. The design is &ldquo;persisted journal for catch-up, bounded broadcast for the hot path&rdquo;:</p>
+<ul>
+<li>Each thread gets a lazily created <code>tokio::sync::broadcast::channel(64)</code> (<span class="src">crates/exoharness/src/basic.rs:1855-1858</span>). <code>append_events_to_conversation</code> sends an <code>AppendedEvents { key, events }</code> after the PUT succeeds (<span class="src">crates/exoharness/src/basic.rs:2567-2593</span>).</li>
+<li><code>Bound::Unbounded</code> means <em>live-only from now</em>: it is rewritten to <code>Excluded(current head)</code> and the history scan is skipped. (<code>matches_bound</code> itself returns <code>false</code> for <code>Unbounded</code>, <span class="src">crates/exoharness/src/basic.rs:2624-2631</span>.)</li>
+<li>The subscription is created <em>before</em> listing keys, so appends racing the scan land in the receiver and are de-duplicated by comparing the batch key to <code>last_key</code>.</li>
+<li>If the receiver reports <code>Lagged</code>, the stream resubscribes, lists only keys after <code>last_key</code>, and replays them from storage: slow consumers cost storage reads, fast ones cost none (<span class="src">crates/exoharness/src/basic.rs:2595-2622</span>; the test <code>filesystem_live_watch_delivery_performs_no_storage_reads</code> pins the fast path, <span class="src">crates/exoharness/src/basic.rs:2636-2680</span>).</li>
+</ul>
+
+<figure class="code">
+<figcaption><strong>The watch loop: drain buffered events, then replay keys, then block on the broadcast</strong> <span class="src">crates/exoharness/src/basic.rs:1880-1932</span></figcaption>
+<pre><code class="language-rust">Ok(Box::pin(futures::stream::try_unfold(
+    watch,
+    |mut watch| async move {
+        loop {
+            if let Some(event) = watch.events.pop_front() {
+                watch.bound = Bound::Excluded(event.id);
+                return Ok(Some((event, watch)));
+            }
+            if let Some(key) = watch.keys.next() {
+                let mut events = load_event_object(&amp;watch.storage, &amp;key).await?;
+                events.retain(|event| matches_bound(event.id, &amp;watch.bound));
+                events.sort_by_key(|event| event.id);
+                watch.events = events.into();
+                continue;
+            }
+            match watch.rx.recv().await {
+                Ok(batch) =&gt; {
+                    if watch
+                        .last_key
+                        .as_ref()
+                        .is_some_and(|last| &amp;batch.key &lt;= last)
+                    {
+                        continue;
+                    }
+                    watch.last_key = Some(batch.key.clone());
+                    watch.events = batch
+                        .events
+                        .iter()
+                        .filter(|event| matches_bound(event.id, &amp;watch.bound))
+                        .cloned()
+                        .collect();
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) =&gt; {
+                    // Subscribe before listing: replay covers older batches,
+                    // and appends racing that scan remain in the live buffer.
+                    watch.rx = watch.rx.resubscribe();
+                    let (keys, last_key) = watch_keys(
+                        &amp;watch.storage,
+                        &amp;watch.directory,
+                        &amp;watch.bound,
+                        watch.last_key.as_deref(),
+                    )
+                    .await?;
+                    if last_key.is_some() {
+                        watch.last_key = last_key;
+                    }
+                    watch.keys = keys.into_iter();
+                }
+                Err(broadcast::error::RecvError::Closed) =&gt; return Ok(None),
+            }
+        }
+    },
+)))</code></pre>
+</figure>
+
+<div class="callout surprise"><p class="callout-title">Surprise: watch is in-process, and the plain HTTP transport has none</p>
+<p>The broadcast map lives in <code>BasicExoHarnessInner</code>, so another <em>process</em> appending to the same files is invisible to a live watcher. The generic <code>ExoHttpTransport::watch_events</code> default is <code>unsupported("watch_events")</code> (<span class="src">crates/exoharness/src/http/client.rs:57-64</span>); the runtime HTTP provider implements it over a dedicated watch endpoint that only accepts <code>Excluded</code> cursors (&ldquo;runtime HTTP event cursors are exclusive&rdquo;, <span class="src">crates/executor/src/native/http_provider.rs:601-616</span>). The same pairing &mdash; get_events cursor for catch-up, watch with <code>Excluded(last id)</code> for tailing &mdash; is how turn streams resume (<code>watch_turn</code>, <span class="src">crates/executor/src/harness_executor.rs:538-598</span>). See <a href="cli-and-server.html">CLI &amp; server</a> for the endpoints.</p></div>
+
+<h2 id="fork">Forking at the data level</h2>
+<p><code>ThreadHandle::fork(ForkThreadRequest { up_to_inclusive, slug, name })</code> is a physical copy, not a pointer into the parent&rsquo;s log. Under the agent-change lock, thread resource lock and <code>write_lock</code>, it loads every source event, drops those with <code>id &gt; up_to_inclusive</code>, creates a new thread id, copies the <code>bindings/</code> and <code>artifacts/</code> prefixes, then re-writes each event under a <em>fresh UUIDv7</em> with the new <code>thread_id</code>, and finally appends a <code>ThreadForked { source_thread_id, up_to_inclusive }</code> event and writes <code>record.json</code> last (<span class="src">crates/exoharness/src/basic.rs:1995-2120</span>).</p>
+
+<figure class="code">
+<figcaption><strong>Fork: filter, copy side prefixes, re-id every event, mark with <code>ThreadForked</code></strong> <span class="src">crates/exoharness/src/basic.rs:2037-2106</span></figcaption>
+<pre><code class="language-rust">let mut events = load_events(&amp;self.harness.inner.storage, &amp;self.conversation_dir()).await?;
+if let Some(limit) = request.up_to_inclusive {
+    events.retain(|event| event.id &lt;= limit);
+}
+let record = ConversationRecord {
+    environment: self.record.environment.clone(),
+    vaults: self.record.vaults.clone(),
+    id: Uuid7::now(),
+    slug: slug.clone(),
+    name: request.name.unwrap_or_default(),
+    latest_event_id: None,
+};
+self.harness
+    .claim(ResourceScope::Thread {
+        agent_id: self.agent_id,
+        thread_id: record.id,
+    })
+    .await?;
+let conversation_dir = agent.conversations_dir().join(record.id.to_string());
+self.harness
+    .inner
+    .storage
+    .copy_prefix(self.bindings_dir(), conversation_dir.join("bindings"))
+    .await?;
+self.harness
+    .inner
+    .storage
+    .copy_prefix(self.artifacts_dir(), conversation_dir.join("artifacts"))
+    .await?;
+let mut latest_event_id = None;
+for mut event in events {
+    let new_event_id = Uuid7::now();
+    event.id = new_event_id;
+    event.thread_id = record.id;
+    event.created_at = new_event_id.timestamp().expect("uuid7 timestamp");
+    latest_event_id = Some(new_event_id);
+    self.harness
+        .inner
+        .storage
+        .put_json(
+            conversation_dir
+                .join("events")
+                .join(format!("{}.json", event.id)),
+            &amp;event,
+        )
+        .await?;
+}
+// ... then append ThreadForked { source_thread_id, up_to_inclusive } and put record.json last ...</code></pre>
+</figure>
+
+<p>Consequences you can rely on or trip over:</p>
+<ul>
+<li><b>Ids are not stable across a fork.</b> The child&rsquo;s events have new <code>EventId</code>s, so a cursor into the parent is meaningless in the child, and <code>up_to_inclusive</code> is interpreted in the <em>parent&rsquo;s</em> id space. <code>session_id</code>, <code>turn_id</code>, <code>response_id</code> and <code>tool_call_id</code> are copied unchanged.</li>
+<li><b>Copied:</b> events (as individual files, losing the batching), thread-level <code>bindings/</code> and <code>artifacts/</code>, and the record&rsquo;s <code>environment</code> and <code>vaults</code>. <b>Not copied:</b> <code>sandboxes/</code>, <code>title.json</code> and <code>turn_queue.json</code>. Copied <code>SandboxCreated</code> events are history only; the fork does not own that sandbox. The conceptual doc says as much (&ldquo;Not automatically restored to the fork event&rdquo;); use sandbox snapshots (<a href="sandboxes.html">Sandboxes</a>) for filesystem restoration.</li>
+<li><b>Crash safety by commit marker.</b> Thread listing discovers threads by <code>record.json</code>, and fork/create write it last, so a crash mid-copy leaves an invisible directory rather than a half thread (<span class="src">crates/exoharness/src/basic.rs:1333-1350</span>).</li>
+<li><b>Not supported with filesystem resources:</b> <code>check_resource_fork</code> bails with &ldquo;forking a thread with filesystem resources is not supported yet&rdquo; (<span class="src">crates/exoharness/src/basic/native.rs:1408-1419</span>; same limitation as <span class="src">docs/resources.md</span>).</li>
+<li>Forking mid-turn copies an unfinished turn (<code>TurnStarted</code> without <code>TurnEnded</code>) into the child. History derivation tolerates that (<a href="#history">below</a>).</li>
+</ul>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: fork = replay-with-filter into a new log</p>
+<p>Because the log is the only truth and everything else is derived, a fork needs no copy-on-write machinery: filter by a cursor, rewrite ids, add a provenance event. The cost is O(history); the benefit is that every thread is independently deletable and every id is local to its log.</p></div>
+
+<h2 id="artifacts">Artifacts</h2>
+<p>An artifact is addressed by <code>path</code>; the first write of a path allocates an <code>ArtifactId</code>, later writes to the same path reuse it and bump <code>version</code> (<span class="src">crates/exoharness/src/basic.rs:2922-2962</span>). Metadata (<code>{version}.json</code>, an <code>ArtifactVersion</code>) and bytes (<code>{version}.bin</code>) are separate objects; a legacy format with contents embedded in the JSON is still read (<span class="src">crates/exoharness/src/basic.rs:2964-2982</span>, test <span class="src">crates/exoharness/src/basic_tests.rs:1341</span>). <code>read_artifact</code> picks the requested version or the max. Agents and threads each have their own artifact namespace; thread and turn writes also append <code>ArtifactWritten</code> to the log (with the turn&rsquo;s ids when written through a <code>TurnHandle</code>), agent-level writes do not (<span class="src">crates/exoharness/src/basic.rs:1262-1270</span>).</p>
+
+<h2 id="turns">Turns, the durable queue, and interrupted turns</h2>
+
+<h3 id="queue-model">Queue data model</h3>
+<p>Turn admission is split from execution. <code>exoharness::turn_coordinator</code> defines the contract: <code>TurnAdmission::{enqueue, cancel}</code> and <code>TurnQueue::{claim, get, peek, start, set_suspended, acknowledge, release_if_idle, pending_threads}</code> (<span class="src">crates/exoharness/src/turn_coordinator.rs:91-177</span>). The shipped implementation is <code>StoredTurnCoordinator</code>, generic over a <code>TurnQueueStore</code> that only has <code>load</code>/<code>save</code>/<code>pending_threads</code> (<span class="src">crates/exoharness/src/turn_coordinator/stored.rs:40-45</span>). Its state is one value per thread:</p>
+<pre class="diagram">
+TurnQueueState&lt;Work&gt; {
+   pending:      VecDeque&lt;QueuedTurn{ turn: TurnRecord, work, principal, started, control }&gt;
+   receipts:     Vec&lt;TurnReceipt{ principal, key, turn, expires_at }&gt;   // idempotency, 24h
+   acknowledged: Option&lt;TurnId&gt;                                          // makes ack repeatable
+}
+control: Run | Cancel | Suspend            attention: Wake | Interrupt
+</pre>
+<p>On the local backend it is serialised to <code>turn_queue.json</code> in the thread directory, the whole file rewritten per mutation, under the thread resource lock and refusing if <code>record.json</code> is gone (<span class="src">crates/exoharness/src/basic/turn_queue.rs:49-92</span>); <code>pending_threads</code> is a scan of <code>turn_queue.json</code> files for a non-suspended head (<span class="src">crates/exoharness/src/basic/turn_queue.rs:94-115</span>). On the hosted path the same state lives under the single key <code>turn_queue</code> and each save carries an alarm flag so the host wakes the thread object (<span class="src">crates/worker-runtime/src/turn_queue.rs:35-52</span>).</p>
+
+<h3 id="serialization-queue">Per-thread serialisation</h3>
+<ul>
+<li><b>One head runs at a time.</b> <code>claim(thread)</code> returns a <code>TurnLease</code> only if no live lease exists; ownership is a <code>Weak&lt;()&gt;</code> identity compared with <code>Arc::ptr_eq</code>, so a dropped lease releases the thread implicitly (<span class="src">crates/exoharness/src/turn_coordinator/stored.rs:257-266</span>, <span class="src">crates/exoharness/src/turn_coordinator/stored.rs:58-100</span>). <code>TurnQueueLocks</code> maps <code>TurnThread</code> to a weak <code>ThreadState</code> with an async mutex; entries disappear when unused.</li>
+<li><b>FIFO with cooperative control.</b> <code>enqueue</code> appends; <code>Interrupt</code> attention cancels the same principal&rsquo;s <em>claimed or started</em> head atomically before appending (never an unclaimed one) (<span class="src">crates/exoharness/src/turn_coordinator/stored.rs:165-238</span>). Cancel/suspend flip <code>control</code> and push through a <code>watch</code> channel to the running turn.</li>
+<li><b>Idempotent admission.</b> Duplicate = same turn id already pending, or same <code>(principal, idempotency_key)</code> receipt within 24h (or forever with <code>retain_receipt</code>). Duplicates never interrupt and return the original <code>TurnRecord</code>. The shared admission contract is executable (<span class="src">crates/exoharness/src/contract_tests.rs:31-133</span>).</li>
+<li><b>Execution loop.</b> The executor&rsquo;s <code>run_queue</code> peeks the head, <code>start</code>s it (setting <code>started = true</code> and persisting before any journal event exists), runs it, checks the journal, and only then <code>acknowledge</code>s (pops the head and records <code>acknowledged</code>) (<span class="src">crates/executor/src/turn_queue.rs:581-704</span>).</li>
+</ul>
+
+<div class="callout surprise"><p class="callout-title">Surprise: durable by choice, in-memory by default</p>
+<p><code>LocalProvider::with_host</code> installs <code>StoredTurnCoordinator::in_memory()</code>; durability requires <code>.with_turn_coordinator(...)</code> (<span class="src">crates/executor/src/provider.rs:131-155</span>). The CLI wires <code>state.turn_coordinator()</code> (file-backed) and the worker runtime a host-backed one (<span class="src">crates/cli/src/providers.rs:90-93</span>, <span class="src">crates/worker-runtime/src/lib.rs:120</span>). A test documents the default: after a restart an in-memory queue recovers nothing from the journal (<span class="src">crates/executor/src/turn_queue/tests.rs:585-612</span>). Also note <code>TurnQueueStore</code> is documented as &ldquo;single process/object owner&rdquo;; competing workers need their own transactional coordinator.</p></div>
+
+<h3 id="interrupted">How an interrupted turn is represented</h3>
+<p>There is no &ldquo;interrupted&rdquo; event or status field. The state of a turn is <em>computed from its events</em> by <code>journal_status_from_events</code> (<span class="src">crates/executor/src/turn_queue.rs:843-892</span>):</p>
+
+<figure class="code">
+<figcaption><strong>Turn status is a pure function of the journal</strong> <span class="src">crates/executor/src/turn_queue.rs:843-892</span></figcaption>
+<pre><code class="language-rust">enum JournalStatus {
+    Unstarted,
+    Running,
+    Finished(Result&lt;crate::SendResult&gt;),
+}
+
+fn journal_status_from_events(events: &amp;[exoharness::Event], turn: &amp;TurnRecord) -&gt; JournalStatus {
+    let Some(ended) = events
+        .iter()
+        .find(|event| matches!(event.data, EventData::TurnEnded))
+    else {
+        return if events
+            .iter()
+            .any(|event| matches!(event.data, EventData::TurnStarted { .. }))
+        {
+            JournalStatus::Running
+        } else {
+            JournalStatus::Unstarted
+        };
+    };
+    let result = match events.iter().find_map(|event| match &amp;event.data {
+        EventData::Error { message, .. } => Some(message),
+        _ => None,
+    }) {
+        Some(message) =&gt; Err(TurnFailed(message.clone()).into()),
+        None =&gt; Ok(crate::SendResult { turn_id: turn.id, session_id: turn.session_id, latest_event_id: ended.id }),
+    };
+    JournalStatus::Finished(result)
+}</code></pre>
+</figure>
+
+<table>
+<thead><tr><th>Situation</th><th>Events on the log</th><th>Queue entry</th><th>What recovery does</th></tr></thead>
+<tbody>
+<tr><td>Accepted, not begun</td><td>none for this turn</td><td><code>started=false</code></td><td>Runs <code>head.work</code> from the queue entry (<code>Unstarted</code>)</td></tr>
+<tr><td>Running or crashed mid-turn</td><td><code>TurnStarted</code>, <code>exo.runtime.turn_work</code>, input, partial model/tool events; no <code>TurnEnded</code></td><td><code>started=true</code></td><td>Rebuilds <code>TurnWork</code> from the journalled <code>turn_work</code> event (<em>not</em> the queue snapshot; see test <span class="src">crates/executor/src/turn_queue/tests.rs:521</span>) and calls <code>execute_turn(.., recovering=true)</code> which uses <code>thread.turn_handle(record)</code> instead of <code>begin_turn</code> (<span class="src">crates/executor/src/turn_queue.rs:706-812</span>, <span class="src">crates/executor/src/harness_executor.rs:745-760</span>)</td></tr>
+<tr><td>Harness done, <code>TurnEnded</code> not written</td><td>adds <code>exo.runtime.turn_completed</code></td><td>started</td><td>Recovery sees the marker (or an <code>Error</code>) and just calls <code>finish()</code>, never re-executes (<span class="src">crates/executor/src/turn_queue.rs:731-742</span>)</td></tr>
+<tr><td>Failed</td><td><code>Error{message}</code> then <code>TurnEnded</code></td><td>acknowledged</td><td><code>Finished(Err(..))</code>; <code>finalize_turn</code> writes both (<span class="src">crates/executor/src/shared.rs:6-27</span>)</td></tr>
+<tr><td>Cancelled</td><td>same as failed (queue path writes <code>Error</code> with the cancel reason via <code>persist_head_failure</code>; an unstarted head gets a synthetic <code>begin_turn</code> first)</td><td><code>control=Cancel</code></td><td>Never executed; closed with <code>Error</code> + <code>TurnEnded</code> (<span class="src">crates/executor/src/turn_queue.rs:814-841</span>)</td></tr>
+<tr><td>Suspended</td><td><b>No events written.</b> The turn just stays open</td><td><code>control=Suspend</code>, kept at head, order preserved</td><td>Resume flips <code>control</code> to <code>Run</code>; the same <code>TurnId</code> continues. <code>pending_threads</code> ignores suspended heads (<span class="src">crates/exoharness/src/basic/turn_queue.rs:94-115</span>)</td></tr>
+</tbody>
+</table>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: recovery state lives in the log, scheduling state in the queue</p>
+<p>The queue says <em>whether</em> a turn is wanted and in what order; the journal says <em>how far</em> it got. By committing <code>turn_work</code> in the same atomic batch as <code>TurnStarted</code> (<code>BeginTurnRequest.initial_events</code>, <span class="src">crates/exoharness/src/types.rs:396-406</span>), a crash can never leave a started turn without the information needed to resume it. Disagreement between the two is reconciled in one place: &ldquo;the journal is authoritative&rdquo; (<code>restart_reconciles_completion_and_admission_before_journal_creation</code>, <span class="src">crates/executor/src/turn_queue/tests.rs:456</span>).</p></div>
+
+<h2 id="history">From events to prompts</h2>
+<p>The log is not the prompt. The Rust <code>BasicExecutor</code> derives message history on each model round with <code>materialize_prompt_history</code>: query only <code>messages</code>, <code>tool_requested</code>, <code>tool_result</code> and the frontend-tool-response custom event, <code>Asc</code>, starting after a per-thread cached cursor, then fold the new events into a cached <code>Vec&lt;Message&gt;</code> (<span class="src">crates/executor/src/basic.rs:80-134</span>, <span class="src">crates/executor/src/basic.rs:29</span>, <span class="src">crates/executor/src/basic.rs:582-586</span>). The fold is <code>extend_message_history</code> (<span class="src">crates/executor/src/message_history.rs:15-128</span>). TypeScript harnesses build their own views; see <a href="harnesses.html">Harnesses</a>.</p>
+
+<p>The fold repairs what interrupted turns leave behind. It tracks <code>pending_tool_call_ids</code> from assistant tool-call parts and <code>ToolRequested</code> events; if a later non-tool message arrives (or the batch ends) with calls still pending, it synthesises a tool result so the transcript stays valid for the provider:</p>
+
+<figure class="code">
+<figcaption><strong>Dangling tool calls become explicit failures in the prompt, not in the log</strong> <span class="src">crates/executor/src/message_history.rs:130-151</span></figcaption>
+<pre><code class="language-rust">fn flush_dangling_tool_results(
+    history: &amp;mut Vec&lt;Message&gt;,
+    tool_call_names: &amp;HashMap&lt;ToolCallId, String&gt;,
+    pending_tool_call_ids: &amp;mut Vec&lt;ToolCallId&gt;,
+) {
+    for tool_call_id in std::mem::take(pending_tool_call_ids) {
+        let Some(tool_name) = tool_call_names.get(&amp;tool_call_id) else {
+            continue;
+        };
+        history.push(Message::Tool {
+            content: vec![ToolContentPart::ToolResult(ToolResultContentPart {
+                tool_call_id,
+                tool_name: tool_name.clone(),
+                output: to_lingua_value(json!({
+                    "ok": false,
+                    "error": "tool execution did not complete before the previous turn ended",
+                })),
+                provider_options: None,
+            })],
+        });
+    }
+}</code></pre>
+</figure>
+
+<div class="callout surprise"><p class="callout-title">Surprise: the history cache bakes in the cancellation it fabricates</p>
+<p>The doc comment says &ldquo;each batch must contain complete tool rounds: calls still pending at its end receive cancellation results, and their later real results would be discarded&rdquo; (<span class="src">crates/executor/src/message_history.rs:13-14</span>). Combined with an incremental cursor cache, a prompt materialised while a tool call is still in flight caches the synthetic &ldquo;did not complete&rdquo; result; the late <code>ToolResult</code> is skipped because it is no longer pending (<span class="src">crates/executor/src/message_history.rs:96-101</span>). The cache is a plain <code>HashMap&lt;ConversationId, _&gt;</code> and this file never evicts entries. Safe only because one turn runs per thread at a time.</p></div>
+
+<h2 id="usage-cost">Usage and cost on the log</h2>
+<p><code>Messages.usage</code> carries an optional boxed <code>UsageRecord</code> (model, prompt/completion/cached/cache-creation/reasoning tokens, <code>cost_usd</code>, <code>ttft_ms</code>, <code>duration_ms</code>), boxed so the enum stays small (<span class="src">crates/exoharness/src/types.rs:522-545</span>, <span class="src">crates/exoharness/src/types.rs:592-599</span>). The design doc (<span class="src">exoharness/docs/design/cost-tracking.md</span>) makes the key choice: the substrate stores usage verbatim and computes no money; cost is userspace policy provided by the standalone <code>cost</code> crate. That crate is pure math plus a loader: <code>PricingTable::compute_cost_usd</code> treats Anthropic-family providers as additive (prompt excludes cache) and everything else as inclusive (subtract cached first), with a token-boundary prefix match for model names (<span class="src">crates/cost/src/table.rs:59-115</span>); <code>cost::load</code> resolves explicit path, then a fresh 24h cache, then a 5s HTTP fetch of the LiteLLM price JSON, then a stale cache, then an empty table, and never fails (<span class="src">crates/cost/src/loader.rs:16-58</span>). The executor fills the record in <code>build_usage_record</code> (<span class="src">crates/executor/src/model_events.rs:32-72</span>).</p>
+<p>Code vs doc: the code <em>prefers a provider-reported cost</em> (<code>response.provider_cost_usd</code>, e.g. OpenRouter) and only falls back to the local table (<span class="src">crates/executor/src/model_events.rs:43-56</span>); the doc does not mention this. The doc also says <code>cache_creation_input_token_cost_above_1hr</code> is &ldquo;parsed but unused&rdquo;, but <code>ModelEntry</code> has no such field (<span class="src">crates/cost/src/table.rs:8-20</span>). When the CLI builds a provider without execution args, or the loader finds nothing, the table is empty and <code>cost_usd</code> stays null while tokens still persist (with execution args, <code>cost::load</code> runs and defaults to the public LiteLLM URL) (<span class="src">crates/cli/src/providers.rs:80-89</span>).</p>
+
+<h2 id="resources-env-access">Resources, environments, access (brief)</h2>
+<ul>
+<li><b>Environments</b> (<code>EnvironmentDefinition</code>) are named, validated JSON files at <code>environments/&lt;name&gt;.json</code>; a thread&rsquo;s <code>ThreadRecord.environment</code> embeds a copy (<span class="src">crates/exoharness/src/environment.rs:9-37</span>, <span class="src">crates/exoharness/src/basic.rs:415-440</span>). Details of what they configure are in <a href="sandboxes.html">Sandboxes</a>.</li>
+<li><b>Resources</b> (<code>ResourceDefinition</code> = directory or git source, mount path, mode) are <em>not</em> events or object-store keys. <code>ResourceStore</code> uses plain <code>std::fs</code> under <code>&lt;root&gt;/resources/{snapshots,threads,locks}</code>; local sources are pinned to a content-keyed snapshot when the agent is registered, and each thread gets a private copy-on-write clone recorded in <code>resources.json</code> (<span class="src">crates/exoharness/src/resources.rs:10-60</span>, <span class="src">crates/exoharness/src/resources/local.rs:90-215</span>, <span class="src">docs/resources.md</span>). <code>materialize</code> refuses to change a thread&rsquo;s resources after the fact (&ldquo;cannot change the resources of an existing thread&rdquo;). The log only sees them as <code>FileSystemMount</code>s inside sandbox events.</li>
+<li><b>Access.</b> A <code>Caller { principal, policy }</code> wraps an <code>AccessPolicy</code> (<code>check</code>, <code>created</code>, <code>check_operator</code>, vault hooks) (<span class="src">crates/exoharness/src/access.rs:7-33</span>). Every handle method begins with <code>harness.check(ResourceScope::..)</code>; creation calls <code>claim</code> so the policy can record ownership; <code>TurnStarted.user_id</code> and queue <code>principal</code>s carry the caller; <code>caller.json</code> tracks the last active principal and resets managed sandboxes when it changes (<span class="src">crates/exoharness/src/basic.rs:1488-1527</span>).</li>
+</ul>
+
+<h2 id="invariants">Invariants (and which tests pin them)</h2>
+<table>
+<thead><tr><th>Invariant</th><th>Enforced by</th><th>Pinned by</th></tr></thead>
+<tbody>
+<tr><td>A multi-event append is all-or-nothing</td><td>single batch object PUT</td><td><span class="src">crates/exoharness/src/basic/native.rs:898-940</span> (<code>failed_event_batch_is_invisible_and_can_be_retried_after_restart</code>)</td></tr>
+<tr><td>Event order = <code>EventId</code> order; cursors are exclusive</td><td>UUIDv7 ids, filename ranges, <code>cursor</code> filters</td><td><span class="src">crates/exoharness/src/basic/event_query_tests.rs</span></td></tr>
+<tr><td>Head is derived from the log, never trusted from <code>record.json</code></td><td><code>load_conversation_record</code>, <code>refresh_conversation_record</code></td><td><span class="src">crates/exoharness/src/basic_tests.rs:1114-1175</span></td></tr>
+<tr><td><code>begin_turn</code> then <code>add_events</code> then <code>finish</code> leaves <code>TurnStarted .. TurnEnded</code> bracketing the turn&rsquo;s events; <code>finish</code> returns the last event id</td><td>handles + <code>BasicTurnState</code></td><td><code>begin_turn_tracks_events_through_finish</code> <span class="src">crates/exoharness/src/contract_tests.rs:401-469</span></td></tr>
+<tr><td>Artifact writes through a turn carry its session+turn ids, and later turn appends still succeed</td><td>shared append path</td><td><span class="src">crates/exoharness/src/contract_tests.rs:471-524</span></td></tr>
+<tr><td>Thread listing is recent-first by head, cursor = recency key</td><td><code>paginate_conversation_records</code></td><td><span class="src">crates/exoharness/src/contract_tests.rs:316-399</span></td></tr>
+<tr><td>Watch loses and duplicates nothing, even when lagged past the 64-slot buffer</td><td>subscribe-then-list, <code>last_key</code> dedupe</td><td><span class="src">crates/exoharness/src/basic_tests.rs:39-110</span></td></tr>
+<tr><td>Admission is idempotent per <code>(principal, key)</code>; interrupts only hit the same principal&rsquo;s claimed head</td><td><code>StoredTurnCoordinator::enqueue</code></td><td><code>turn_admission_contract</code> <span class="src">crates/exoharness/src/contract_tests.rs:31-133</span></td></tr>
+<tr><td>Exactly one local process owns a thread&rsquo;s mutations</td><td>flock leases</td><td><span class="src">crates/exoharness/src/basic/sessions.rs:363</span> (<code>independent_threads_coexist_and_same_thread_mutations_are_rejected</code>)</td></tr>
+<tr><td>Agent slug unique; slug marker freed on delete</td><td><code>by-slug/</code> markers (note the TODO about cross-process races, <span class="src">crates/exoharness/src/basic.rs:512-513</span>)</td><td><span class="src">crates/exoharness/src/contract_tests.rs:237-314</span></td></tr>
+</tbody>
+</table>
+
+<h2 id="see-also">Where to go next</h2>
+<ul>
+<li><a href="architecture.html">Architecture</a> for how the executor, runtime and HTTP server compose these traits.</li>
+<li><a href="sandboxes.html">Sandboxes</a> for sandbox records, snapshots (<code>SnapshotKind</code>) and the event sinks used above.</li>
+<li><a href="harnesses.html">Harnesses</a> for how Codex/Claude Code/Pi/custom harnesses interpret and emit these events and recover turns.</li>
+<li><a href="egress-and-vaults.html">Egress &amp; vaults</a> for secrets, bindings and credential substitution.</li>
+</ul>
+
+</main>
+<aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/wiki.js"></script>
+</body>
+</html>

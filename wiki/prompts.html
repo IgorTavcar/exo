@@ -1,0 +1,1016 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prompts, verbatim · Exo internals</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav id="nav"></nav>
+<main>
+<header>
+  <div class="kicker">Applied</div>
+  <h1>Prompts, verbatim</h1>
+  <p class="lede">Every piece of LLM-facing text in the repo that is worth reading: system prompts, tool descriptions, per-round context injections, runtime notices and error strings, and eval task prompts. Each is quoted from the source, with where and when it is injected and what technique it uses.</p>
+</header>
+
+<h2 id="how">How prompts reach the model</h2>
+
+<p>Exo has no global prompt. By default the model sees four things: the agent definition's markdown body as one <code>system</code> message, a few system messages appended by the runtime (filesystem resources, preview URLs), the durable event log replayed as conversation history, and tool definitions. Everything else on this page is added by a harness (a TypeScript <code>instructions</code> hook, or Rust code in an executor).</p>
+
+<p>The load-bearing design choice is that <strong>harness-generated instructions are not written to the event log</strong>. They are recomputed and prepended on every model round. That is what lets a harness show the model the <em>current</em> game screen, todo list, memory block or skill index each round without the history growing.</p>
+
+<figure class="code">
+  <figcaption><strong>Rust basic harness: instructions are prepended to replayed history each round</strong> <span class="src">crates/executor/src/basic.rs:130-132</span></figcaption>
+  <pre><code class="language-rust">        let mut messages = instructions.to_vec();
+        messages.extend(event_messages);
+        Ok(messages)</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><strong>TypeScript harnesses: same shape, but <code>instructions</code> is an async hook that runs per round</strong> <span class="src">exoharness/typescript/harness/index.ts:754-762</span> <span class="src">exoharness/typescript/model-runtime/turn-loop.ts:150-155</span></figcaption>
+  <pre><code class="language-ts">export async function materializePromptMessages(
+  conversation: Conversation,
+  instructions: Message[],
+): Promise&lt;Message[]&gt; {
+  return [
+    ...instructions,
+    ...(await materializeConversationMessages(conversation)),
+  ];
+}
+
+// turn-loop.ts, inside runResponsesTurnLoop (once per model round)
+    const messages = await materializePromptMessages(
+      conversation,
+      options.instructions
+        ? await options.instructions(context)
+        : basicHarnessInstructions(context),
+    );</code></pre>
+</figure>
+
+<pre class="diagram">
+ agent.md body --&gt; AgentConfig.instructions = [ system(body) ]
+                    + system("Filesystem resources...")  new threads
+                    + system("Exo sandbox previews...")  if previews registered
+                              |
+                              v
+ each model round, sent to the provider:
+   [ instructions + whatever the harness hook adds ]   recomputed, not logged
+   [ replayed event log ]                              stored: messages, tool I/O
+   [ tool definitions ]                                rebuilt every round
+</pre>
+
+<h3 id="routing">How each harness consumes <code>AgentConfig.instructions</code></h3>
+
+<table>
+<thead><tr><th>Harness</th><th>Mechanism</th><th>Ref</th></tr></thead>
+<tbody>
+<tr><td>Rust <code>basic</code></td><td>instructions prepended to replayed history</td><td><span class="src">crates/executor/src/basic.rs:130-132</span></td></tr>
+<tr><td>Rust <code>rlm</code></td><td>instructions, then an RLM <code>system</code> message, then a synthetic root <code>user</code> message</td><td><span class="src">crates/executor/src/native/rlm.rs:72-81</span></td></tr>
+<tr><td>TS Responses loop (coding agent, gameboy, self-improving)</td><td>harness <code>instructions(context)</code> hook; default is <code>basicHarnessInstructions</code></td><td><span class="src">exoharness/typescript/model-runtime/turn-loop.ts:88-92</span></td></tr>
+<tr><td>Codex</td><td>all instruction messages joined with a blank line, sent as <code>developerInstructions</code> on <code>thread/start</code> or <code>thread/resume</code></td><td><span class="src">exoharness/typescript/codex/harness.ts:881-883</span> <span class="src">exoharness/typescript/codex/harness.ts:925-927</span> <span class="src">exoharness/typescript/model-runtime/shared.ts:315-318</span></td></tr>
+<tr><td>Claude Code</td><td>joined the same way, passed as the SDK <code>systemPrompt</code> string; system/developer messages are filtered out of the replayed transcript</td><td><span class="src">exoharness/examples/typescript/claude-code-harness.ts:530-545</span> <span class="src">exoharness/examples/typescript/claude-code-harness.ts:358-360</span></td></tr>
+<tr><td>Pi</td><td>joined, passed as <code>--system-prompt</code> to the <code>pi</code> CLI</td><td><span class="src">exoharness/examples/typescript/pi-harness.ts:140-145</span></td></tr>
+<tr><td>Cursor SDK</td><td>instructions are rendered as <code>SYSTEM:</code> blocks inside one big user prompt (see below)</td><td><span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts:482-486</span></td></tr>
+</tbody>
+</table>
+
+<p>Role mapping is also provider-specific. For Anthropic, <code>system</code> and <code>developer</code> messages are pulled out and joined with a blank line into the top-level <code>system</code> field (<span class="src">exoharness/typescript/model-runtime/responses.ts:503-523</span>). In the chat-completions converter, <code>developer</code> is sent as <code>system</code> (<span class="src">exoharness/typescript/model-runtime/responses.ts:728-731</span>). So "developer" vs "system" in a harness is an Exo-level label, not a guarantee about the wire role.</p>
+
+<div class="callout surprise"><p class="callout-title">Surprise: the TS example harness features do not reach Codex, Claude Code or Pi</p><p>Skills, memory, todo and the agent-tool-creation instruction are added by the <em>TypeScript Responses loop</em> (<code>basicHarnessInstructions</code>, <code>skillsInstruction</code>, <code>memoryInstruction</code>). The Codex, Claude Code and Pi harnesses only forward <code>agentConfig.instructions</code> (flattened to one string). So a runtime system message such as the preview-URL block reaches them, but a per-round injection like the live todo list does not.</p></div>
+
+<h2 id="catalog">Catalog of LLM-facing text</h2>
+
+<p>Section numbers refer to the headings below. "Round" means every model call; "turn" once per user input.</p>
+
+<table>
+<thead><tr><th>Prompt</th><th>File</th><th>Injected when</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td>Agent definition body</td><td><span class="src">crates/executor/src/managed_agents/config.rs:342-344</span></td><td>agent create/update; replayed every round</td><td>The only prompt a plain managed agent has</td></tr>
+<tr><td>Filesystem resources notice</td><td><span class="src">crates/executor/src/harness_executor.rs:704-720</span></td><td>thread start (not on recovery)</td><td>Tell the model where mounted resources live and their mode</td></tr>
+<tr><td>Preview URL notice</td><td><span class="src">crates/executor/src/previews.rs:91-104</span></td><td>thread start when previews exist</td><td>Give browser-reachable origins for sandbox ports</td></tr>
+<tr><td>Slack input preamble</td><td><span class="src">crates/executor/src/managed_agents/adapters/mod.rs:769-774</span></td><td>each inbound Slack message</td><td>Label channel and sender</td></tr>
+<tr><td>Scheduler wakeup prompts</td><td><span class="src">crates/executor/src/native/scheduler_runtime.rs:551-592</span></td><td>when a scheduled run finishes or fails</td><td>Report results back to the conversation</td></tr>
+<tr><td>RLM system prompt (Rust)</td><td><span class="src">crates/executor/src/native/rlm.rs:613-643</span></td><td>RLM turn start</td><td>REPL-as-context protocol</td></tr>
+<tr><td>RLM root user prompt</td><td><span class="src">crates/executor/src/native/rlm.rs:645-685</span></td><td>RLM turn start</td><td>Latest request plus context metadata</td></tr>
+<tr><td>RLM subquery system prompt</td><td><span class="src">crates/executor/src/native/rlm.rs:363-367</span></td><td>each <code>subquery</code> tool call</td><td>Cheap tool-less sub-LLM</td></tr>
+<tr><td>RLM tool descriptions</td><td><span class="src">crates/executor/src/native/rlm.rs:687-750</span></td><td>every RLM round</td><td><code>repl_execute</code>, <code>subquery</code>, <code>subquery_variable</code></td></tr>
+<tr><td>RLM TS port</td><td><span class="src">exoharness/examples/typescript/rlm-harness.ts:510-551</span></td><td>RLM turn start</td><td>Same prompts, slightly different</td></tr>
+<tr><td>Coding agent system prompt, env block, live todos</td><td><span class="src">exoharness/examples/typescript/coding-agent-harness.ts:127-166</span></td><td>every round</td><td>Terminal coding agent tutorial</td></tr>
+<tr><td>Game Boy prompt + fresh screen</td><td><span class="src">exoharness/examples/gameboy-agent/agent/harness.ts:34-104</span></td><td>every round</td><td>Pokemon-playing agent</td></tr>
+<tr><td>Sysmon memory-use line</td><td><span class="src">exoharness/examples/typescript/sysmon-harness.ts:61-75</span></td><td>every round</td><td>Demo of a live-state injection</td></tr>
+<tr><td>Agent-tool-creation instruction</td><td><span class="src">exoharness/typescript/model-runtime/turn-loop.ts:94-100</span></td><td>every round when <code>enableAgentToolCreation</code></td><td>Teach <code>install_agent_tool</code> usage</td></tr>
+<tr><td>Cursor SDK preamble</td><td><span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts:459-473</span></td><td>each turn</td><td>Frame a stateless SDK call</td></tr>
+<tr><td>Self-improving agent identity (<code>me.md</code>)</td><td><span class="src">examples/self-improving-agent/prompts/me.md</span></td><td>every round</td><td>Operating rules for the long-running agent</td></tr>
+<tr><td>Self-improving harness messages</td><td><span class="src">examples/self-improving-agent/harness.ts:57-135</span></td><td>every round</td><td>Name, tool usage manual, memory/todo/skills blocks, local profile</td></tr>
+<tr><td>Memory, todo, skills injections (+ corrupt-store notices)</td><td><span class="src">examples/self-improving-agent/tools/memory-tools.ts:190-218</span></td><td>every round</td><td>Durable state shown back to the model</td></tr>
+<tr><td>Built-in tool descriptions</td><td><span class="src">exoharness/typescript/harness/built-in-tools.ts</span></td><td>every round</td><td><code>shell</code>, <code>inspect_tools</code>, <code>manage_tool</code>, <code>install_agent_tool</code></td></tr>
+<tr><td>Skill tool descriptions</td><td><span class="src">exoharness/typescript/harness/skill-tools.ts:219-221</span></td><td>every round</td><td><code>install_skill</code>, <code>use_skill</code>, etc.</td></tr>
+<tr><td>Self-improving tool descriptions</td><td><span class="src">examples/self-improving-agent/tools</span></td><td>every round</td><td>scheduler, sandbox snapshots, guardian, web, introspection</td></tr>
+<tr><td>Tool error envelope, denial text, interrupted-tool result</td><td><span class="src">crates/executor/src/basic.rs:292-304</span></td><td>when a tool fails or turn is recovered</td><td>Feed failures back as data</td></tr>
+<tr><td>Egress 403/502 bodies</td><td><span class="src">crates/exoharness/src/egress/mod.rs:598-616</span></td><td>when the proxy refuses a sandbox request</td><td>Tell sandbox code why</td></tr>
+<tr><td>Harbor eval instructions</td><td><span class="src">eval/harbor/datasets</span></td><td>per eval trial</td><td>Self-evolution and SWE-bench-lite tasks</td></tr>
+<tr><td>Startup/local profile text</td><td><span class="src">examples/self-improving-agent/exo.sh:249-261</span></td><td>when a user runs profile setup</td><td>Machine-local persona file</td></tr>
+</tbody>
+</table>
+
+<h2 id="identity">Identity and system prompts</h2>
+
+<h3 id="agent-md">Managed-agent definition body</h3>
+
+<p>An agent file is YAML frontmatter plus a markdown body. The body is the entire prompt: <code>validate()</code> rejects an empty one, and <code>agent_config()</code> turns it into a single <code>system</code> message. There is no built-in Exo preamble, no tool-use boilerplate. A per-turn <code>system_prompt</code> in the HTTP request body replaces the whole instruction list.</p>
+
+<figure class="code">
+  <figcaption><strong>Body becomes the only system message; empty body is an error</strong> <span class="src">crates/executor/src/managed_agents/config.rs:342-344</span> <span class="src">crates/managed-agents/src/lib.rs:97-106</span> <span class="src">crates/executor/src/managed_agents/service.rs:122-124</span></figcaption>
+  <pre><code class="language-rust">// config.rs
+        instructions: vec![crate::harness_helpers::system_message(
+            &amp;definition.instructions,
+        )],
+
+// lib.rs (validate)
+    pub fn validate(&amp;self) -&gt; Result&lt;()&gt; {
+        for (field, value) in [
+            ("harness", self.harness.as_str()),
+            ("model.name", self.model.name.as_str()),
+            ("instructions", self.instructions.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("agent {field} must not be empty");
+            }
+        }
+
+// service.rs: a per-turn override replaces everything
+    if let Some(prompt) = body.system_prompt {
+        config.instructions = vec![crate::harness_helpers::system_message(&amp;prompt)];
+    }</code></pre>
+</figure>
+
+<p>The shipped example agents show the style: short, task-shaped, evidence-demanding.</p>
+
+<figure class="prompt"><figcaption><strong>support-analyst.md body</strong> <span class="src">exoharness/examples/managed-agents/support-analyst.md:8-10</span></figcaption><pre>You investigate support tickets and identify recurring product problems.
+Read the available evidence, cite the tickets behind each finding, and
+write your report to a file.</pre></figure>
+
+<figure class="prompt"><figcaption><strong>ticket triage agent</strong> <span class="src">examples/tutorial/1_ticket_triage/agent.md:8-14</span></figcaption><pre>You receive support tickets and if it's a technical issue, try to reproduce
+it. Produce a well-written response describing whether or not it repros, and
+if so, a minimal test. If possible, provide a workaround that solves the issue
+in the interim.
+
+You do not have any github credentials, so if you need to access github stuff
+use public APIs (eg https://api.github.com/repos/{owner}/{repo}/issues/{number})</pre></figure>
+
+<figure class="prompt"><figcaption><strong>pi-assistant.md body (paired with <code>permission_policy: always_ask</code>)</strong> <span class="src">exoharness/examples/managed-agents/pi-assistant.md:10-11</span></figcaption><pre>Help the user investigate and change files in the working directory. Use tools
+to verify your work. Respect denied tool calls and explain what remains undone.</pre></figure>
+
+<figure class="prompt"><figcaption><strong>repo-analyst.md body (MCP-backed)</strong> <span class="src">exoharness/examples/managed-agents/repo-analyst.md:12-14</span></figcaption><pre>You help people understand public GitHub repositories.
+Use DeepWiki to read the repository's documentation before answering.
+Explain the relevant code and cite the repository paths behind your answer.</pre></figure>
+
+<figure class="prompt"><figcaption><strong>coder.md and exo-developer.md bodies</strong> <span class="src">exoharness/examples/managed-agents/coder.md:10-11</span> <span class="src">exoharness/examples/managed-agents/exo-developer.md:15-16</span></figcaption><pre>You are a coding agent. Work in /workspace. Implement the requested changes and
+run tests. Keep the final answer concise.
+
+---
+
+Work on Exo in /workspace. Read the repository's AGENTS.md before making changes.
+Use the available development tools to implement and verify the user's request.</pre></figure>
+
+<p>Other bodies: <span class="src">exoharness/examples/managed-agents/assistant.md:8</span> ("Help the user with their task."), <span class="src">exoharness/examples/managed-agents/github-analyst.md:12-14</span>, <span class="src">exoharness/examples/managed-agents/notion-analyst.md:12-14</span>. The longest is <span class="src">exoharness/examples/managed-agents/fastapi-developer.md:15-39</span>, which is really a runbook: it tells the model to run a setup script with "the exact browser preview URLs for guest ports 5173 and 8000 provided in the thread context" and what to report back. That "thread context" is the preview notice below.</p>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: pair behavioral text with the permission policy it assumes</p><p><code>pi-assistant.md</code> ends with "Respect denied tool calls and explain what remains undone." and sets <code>permission_policy: always_ask</code> in the same file. The denial is delivered to the model as plain text (see <a href="#denials">approval denials</a>), so the one sentence of prompt closes the loop: the model has been told what to do when the runtime says no.</p></div>
+
+<h3 id="runtime-system">System messages appended by the runtime</h3>
+
+<p>Two system messages are pushed onto <code>agent_config.instructions</code> when a thread is configured. The filesystem one is skipped when the thread is being recovered; the preview one exists only when previews are registered.</p>
+
+<figure class="code">
+  <figcaption><strong>Where the notices are built</strong> <span class="src">crates/executor/src/harness_executor.rs:703-731</span></figcaption>
+  <pre><code class="language-rust">            if !recovering {
+                let mut locations = String::from("Filesystem resources for this thread:\n");
+                for resource in &amp;thread_config.resources {
+                    let resource = &amp;resource.definition;
+                    let mode = match resource.mode {
+                        exoharness::FileSystemMountMode::ReadOnly =&gt; "read-only",
+                        exoharness::FileSystemMountMode::ReadWrite =&gt; "read-write",
+                    };
+                    locations.push_str(&amp;format!(
+                        "- {}: {:?} ({mode})\n",
+                        resource.name,
+                        resource.mount_path()
+                    ));
+                }
+                agent_config
+                    .instructions
+                    .push(crate::harness_helpers::system_message(&amp;locations));
+            }
+        }
+        #[cfg(feature = "native")]
+        if let Some(previews) = self
+            .register_previews(agent.as_ref(), thread.clone())
+            .await?
+        {
+            agent_config
+                .instructions
+                .push(crate::harness_helpers::system_message(
+                    &amp;previews.instructions(),
+                ));</code></pre>
+</figure>
+
+<figure class="prompt"><figcaption><strong>Preview URL notice (system message)</strong> <span class="src">crates/executor/src/previews.rs:91-104</span></figcaption><pre>Exo sandbox previews:
+Sandbox services page: {page}
+- guest TCP port {port}: {url}      (one line per registered service)
+Use these browser origins for links, API URLs and CORS; preserve paths, queries and fragments. Inside the sandbox use guest ports. Start services first; 502 means a service is unreachable. Previews live while the owning Exo process runs.</pre></figure>
+
+<p>In the figure above, the last paragraph is the literal string; the first lines are the <code>format!</code> templates with placeholders named. The filesystem notice has no prose, only a header and a list:</p>
+
+<figure class="prompt"><figcaption><strong>Filesystem resources notice (template)</strong> <span class="src">crates/executor/src/harness_executor.rs:704-717</span></figcaption><pre>Filesystem resources for this thread:
+- {resource.name}: {mount_path:?} ({read-only|read-write})</pre></figure>
+
+<div class="callout"><p class="callout-title">Technique: end operational notices with the failure modes</p><p>The preview notice does not just list URLs; its last sentences pre-answer the three things a model gets wrong: which hostnames to use for links and CORS ("preserve paths, queries and fragments"), where guest ports apply ("Inside the sandbox use guest ports"), and what a <code>502</code> means ("Start services first"). It is a tiny runbook attached to a data block.</p></div>
+
+<h3 id="slack">Slack input preamble</h3>
+
+<p>Managed adapters do not give the model any adapter instruction (docs for the old tool-based adapters are stale; see <a href="#drift">drift</a>). The only injected text is a one-line label in front of the user's message. Replies are delivered by the adapter observing the turn's stream, not by a tool.</p>
+
+<figure class="code">
+  <figcaption><strong>The whole Slack-to-model contract</strong> <span class="src">crates/executor/src/managed_agents/adapters/mod.rs:769-774</span> <span class="src">crates/managed-agents/src/adapters.rs:14-18</span></figcaption>
+  <pre><code class="language-rust">        let input = format!(
+            "[{} user {}]\n{}",
+            deployment.definition.kind(),
+            inbox.message.sender,
+            inbox.message.text
+        );</code></pre>
+</figure>
+
+<p>So the model sees <code>[slack user &lt;sender id&gt;]</code> on one line followed by the message text (the turn is started at <span class="src">crates/executor/src/managed_agents/adapters/mod.rs:780</span>), as a plain user message (<code>kind()</code> is the only adapter kind, <code>"slack"</code>).</p>
+
+<h3 id="scheduler-wakeup">Scheduler wakeup prompts</h3>
+
+<p>When a scheduled sandbox task finishes, the host sends a synthetic user message into the conversation. The agent-authored <code>reportPrompt</code> is embedded under "Report instructions", so the agent writes instructions for its future self. The prompt is saved as a pending fire before delivery (<span class="src">crates/executor/src/native/scheduler_runtime.rs:326-355</span>) and sent as a plain user message (<span class="src">crates/executor/src/native/conversation_wakeup.rs:12-47</span>).</p>
+
+<figure class="prompt"><figcaption><strong>Wakeup after a successful run (template)</strong> <span class="src">crates/executor/src/native/scheduler_runtime.rs:561</span></figcaption><pre>Scheduled task `{}` completed.
+
+Run id: `{}`
+Exit code: {}
+Result artifact: `{}` version {} at `{}`
+Output truncated: {}
+
+Report instructions:
+{}
+
+stdout preview:
+{}
+
+stderr preview:
+{}</pre></figure>
+
+<figure class="prompt"><figcaption><strong>Wakeup after a failed run (template)</strong> <span class="src">crates/executor/src/native/scheduler_runtime.rs:582</span></figcaption><pre>Scheduled task `{}` failed.
+
+Run id: `{}`
+Result artifact: `{}` version {} at `{}`
+
+Report instructions:
+{}
+
+Error:
+{}</pre></figure>
+
+<p>Each stdout/stderr preview is capped at 4,000 bytes (<span class="src">crates/executor/src/native/scheduler_runtime.rs:592-597</span>); the full result lives in the named artifact, so the model gets a pointer plus a sample.</p>
+
+<h3 id="rlm">RLM: the REPL-as-context prompts</h3>
+
+<p>The <code>rlm</code> harness (a recursive language model setup) does not put the conversation in the prompt. It flattens history into a JavaScript string called <code>context</code>, gives the model a REPL to explore it, and a <code>subquery</code> tool that calls the same model recursively. The prompt is what makes that workable. Rust is the canonical implementation; the TypeScript port is an example.</p>
+
+<figure class="prompt"><figcaption><strong>RLM system prompt (Rust, rendered; sent as one <code>system</code> message after the agent's own instructions)</strong> <span class="src">crates/executor/src/native/rlm.rs:613-636</span></figcaption><pre>You are tasked with answering a query with associated context. You can access, transform, and analyze this context interactively in a persistent JavaScript REPL environment that can recursively query sub-LLMs, which you are strongly encouraged to use as much as possible. You will be queried iteratively until you provide a final answer.
+
+The REPL is secure and intentionally limited:
+- no filesystem access
+- no network access
+- only JSON-compatible values persist across calls
+- persistent values should be stored on `globalThis`
+
+The REPL is initialized with:
+1. A `context` variable that contains the full prompt as a string. This variable contains extremely important information. You should inspect it explicitly before answering.
+2. A `getMessages(role = null)` JavaScript helper function backed by a turn-start snapshot of exoharness conversation history. It returns an array of `{{ index, role, content }}` objects, optionally filtered by role.
+3. A `repl_execute` tool that runs JavaScript in the persistent REPL namespace.
+4. `subquery` and `subquery_variable` tools that let you recursively query the underlying LLM over prompt strings or stored JavaScript variables.
+5. A `print(...)` function in the REPL that lets you inspect short outputs between iterations.
+
+Use the tools this way:
+- `getMessages(...)` is the easiest way to retrieve prior messages without regexing the transcript manually, and you can compose its array results with normal JavaScript filtering, slicing, mapping, and searching however you like.
+- `repl_execute` runs JavaScript in the persistent REPL with `context` already loaded.
+- `subquery` asks a direct sub-LLM question over a prompt string. It always takes a `target_var` field; pass `null` if you do not want to store the result.
+- `subquery_variable` asks a direct sub-LLM question using the string value of a JavaScript variable as external context. It always takes a `target_var` field; pass `null` if you do not want to store the result.
+
+Only truncated REPL output is surfaced back to you each iteration, so you should use variables on `globalThis` to store intermediate state and use recursive subqueries to understand long strings.
+
+Make sure to explicitly look through the entire context in the REPL before answering your query. A viable strategy is to inspect its structure, chunk it into smart segments, recursively query sub-LLMs over those segments, accumulate buffers in variables, and then synthesize the final answer.
+
+When you are done, prefer setting `globalThis.Final` in the REPL to the final answer. You may also reply with `FINAL(&lt;answer&gt;)` or `FINAL_VAR(&lt;javascript_variable_name&gt;)` if needed.
+Think step by step carefully, plan, and execute immediately. Do not just say what you will do. Prefer code, variables, and recursive subqueries over long prose.
+</pre></figure>
+
+<figure class="prompt"><figcaption><strong>Appended only when the conversation has filesystem mounts</strong> <span class="src">crates/executor/src/native/rlm.rs:637-641</span></figcaption><pre>
+Conversation filesystem mounts do not apply inside this JS REPL. If you need shell or filesystem access, this harness cannot provide it.
+</pre></figure>
+
+<figure class="prompt"><figcaption><strong>RLM root user prompt (Rust <code>format!</code> template, braces unescaped)</strong> <span class="src">crates/executor/src/native/rlm.rs:645-685</span></figcaption><pre>Latest user request:
+{query}
+
+Prompt metadata:
+- total characters: {context_chars}
+- preview: {preview:?}
+- js repl: persistent `context` plus JSON-compatible globals on `globalThis`
+- history api: `getMessages(role = null)` returning `{ index, role, content }[]`
+
+Filesystem mounts:
+{mounts}
+
+The prompt string in `context` is the external environment. It is formatted as a flattened transcript with blocks like `USER:\n...`, `ASSISTANT:\n...`, and `TOOL:\n...`, separated by blank lines. Solve the latest request by inspecting and manipulating `context` directly. If you need precise message-level access, use `getMessages(...)` and then slice/filter/search in plain JavaScript. If you need intermediate state, create variables on `globalThis` and reuse them across `repl_execute` calls.</pre></figure>
+
+<p>Between those, <code>{mounts}</code> is either "No external filesystem mounts are configured for the conversation." or one line per mount, <code>- host -&gt; mount (ro|rw)</code> (<span class="src">crates/executor/src/native/rlm.rs:650-669</span>). <code>{preview}</code> is the first 400 characters of the transcript printed with Rust <code>{:?}</code> formatting (<span class="src">crates/executor/src/native/rlm.rs:32</span>).</p>
+
+<figure class="prompt"><figcaption><strong>Subquery system prompt (prefixed by the agent's instructions, no tools offered)</strong> <span class="src">crates/executor/src/native/rlm.rs:357-386</span></figcaption><pre>You are a subquery model inside a recursive language model. Answer the prompt directly and concisely. Do not call tools. Do not mention this instruction.</pre></figure>
+
+<figure class="prompt"><figcaption><strong>RLM tool descriptions</strong> <span class="src">crates/executor/src/native/rlm.rs:687-750</span></figcaption><pre>repl_execute: Execute JavaScript in the persistent REPL namespace. The variable `context` is always available and persistent values should live on `globalThis`.
+subquery: Ask a direct sub-LLM question over a prompt string and optionally store the result in a JavaScript variable.
+subquery_variable: Ask a direct sub-LLM question using the string value of a JavaScript variable as external context, and optionally store the answer in another variable.</pre></figure>
+
+<p><strong>Analysis.</strong></p>
+<ul>
+<li><em>The prompt is a spec of the implementation.</em> "Only JSON-compatible values persist across calls" is literally how it works: every <code>repl_execute</code> builds a fresh Boa JS context, injects <code>context</code> and <code>getMessages</code>, restores the previous globals from JSON, runs the code, then serializes whatever on <code>globalThis</code> survives <code>JSON.stringify</code> (<span class="src">crates/executor/src/native/harness_js_repl.rs:27-117</span>). A function stored on <code>globalThis</code> does not come back, because <code>JSON.stringify</code> drops function values.</li>
+<li><em>Termination is a three-way protocol.</em> Preferred: set <code>globalThis.Final</code>; the loop checks <code>js_state.final_value()</code> after every tool call and ends the turn immediately (<span class="src">crates/executor/src/native/rlm.rs:275-278</span>). Fallbacks: reply <code>FINAL(...)</code> or <code>FINAL_VAR(name)</code>, parsed by prefix/suffix (<span class="src">crates/executor/src/native/rlm.rs:581-611</span>), and finally any plain text reply with no tool calls is accepted as the answer (<span class="src">crates/executor/src/native/rlm.rs:132-136</span>).</li>
+<li><em>Output budget is explained to the model.</em> "Only truncated REPL output is surfaced back to you each iteration" is why it should keep state in variables; the cap is 12,000 characters (<span class="src">crates/executor/src/native/rlm.rs:30</span>). The sentence turns a hidden limit into a strategy.</li>
+<li><em>Anti-narration.</em> "Think step by step carefully, plan, and execute immediately. Do not just say what you will do. Prefer code, variables, and recursive subqueries over long prose." Pushes the model to act through tools, which matters because plain text ends the loop.</li>
+<li><em>Sub-model hygiene.</em> The sub-LLM gets <code>tools: Vec::new()</code> and "Do not mention this instruction.", so a subquery answer can be pasted into a variable and passed along without meta-chatter. <code>subquery_variable</code> builds <code>{question}\n\nContext:\n{variable}</code> (question first, big context last).</li>
+</ul>
+
+<div class="callout surprise"><p class="callout-title">Surprise: the Rust system prompt contains literal double braces</p><p>The Rust root prompt uses <code>format!</code>, so <code>{{ index, role, content }}</code> collapses to single braces. The Rust <em>system</em> prompt is a plain <code>String::from</code>, so the model is actually shown <code>{{ index, role, content }}</code> with doubled braces (<span class="src">crates/executor/src/native/rlm.rs:623</span>) while the TypeScript port shows <code>{ index, role, content }</code> (<span class="src">exoharness/examples/typescript/rlm-harness.ts:521</span>). Harmless, but a real divergence between the two implementations. Another difference: Rust says "The REPL is secure and intentionally limited", TS drops "secure".</p></div>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: put the context in a variable, not in the prompt</p><p>The root prompt carries only the latest request, the transcript's length and a 400-character preview. The full history is a string the model must go and read with code, with <code>getMessages(role)</code> as a structured accessor over a turn-start snapshot. The prompt says so explicitly ("The prompt string in <code>context</code> is the external environment"), so the model treats history as data to query rather than text to continue.</p></div>
+
+<h3 id="coding">Coding agent harness (tutorial)</h3>
+
+<p>A deliberately small prompt for a terminal coding agent. It is assembled from three developer-visible pieces each round: the system prompt, an <code>&lt;env&gt;</code> block, and the current todo list (re-read from an artifact every round).</p>
+
+<figure class="prompt"><figcaption><strong>Coding agent system prompt</strong> <span class="src">exoharness/examples/typescript/coding-agent-harness.ts:127-135</span></figcaption><pre>You are a coding agent working from a terminal. You have a shell tool that runs commands in a sandbox and a todowrite tool for tracking multi-step work.
+
+Be concise and direct; this is a CLI, so keep prose short and let tool calls do the work. Prioritize technical accuracy over agreement.
+
+Working style:
+- For any task with 3 or more steps, call todowrite first to lay out a plan, then keep it updated as you go. Keep exactly one item in_progress at a time. Mark an item completed only after you have verified it works — a command that ran, a test that passed — never on intent alone.
+- Inspect the codebase with commands (ls, cat, grep) instead of guessing.
+- When you finish, verify your work by running it.
+- Reference code locations as file_path:line_number so they are easy to find.</pre></figure>
+
+<figure class="code">
+  <figcaption><strong>Per-round assembly: system prompt, env block, live todo list</strong> <span class="src">exoharness/examples/typescript/coding-agent-harness.ts:137-166</span></figcaption>
+  <pre><code class="language-ts">async function codingInstructions(context: TurnContext): Promise&lt;Message[]&gt; {
+  const conversation = context.exoharness.current.conversation;
+  const messages: Message[] = [
+    { role: "system", content: SYSTEM_PROMPT },
+    {
+      role: "developer",
+      content:
+        `&lt;env&gt;\n` +
+        `Platform: ${os.platform()}\n` +
+        `Today's date: ${new Date().toDateString()}\n` +
+        `Files live in the sandbox; use the shell tool to read and change them.\n` +
+        `&lt;/env&gt;`,
+    },
+  ];
+
+  // Re-surface the live task list every round so the model stays oriented
+  // across many tool-call steps.
+  const todos = await readTodos(conversation);
+  if (todos.length &gt; 0) {
+    const rendered = todos
+      .map((todo) =&gt; `- [${todo.status}] ${todo.content}`)
+      .join("\n");
+    messages.push({
+      role: "developer",
+      content: `Your current task list (from todowrite):\n${rendered}`,
+    });
+  }
+
+  return messages;
+}</code></pre>
+</figure>
+
+<figure class="prompt"><figcaption><strong><code>todowrite</code> tool description</strong> <span class="src">exoharness/examples/typescript/coding-agent-harness.ts:62-66</span></figcaption><pre>Record and update your task list. Rewrite the FULL list on every call. Use it for any task needing 3 or more steps; skip it for trivial one-step work. Keep exactly one item in_progress, and mark an item completed only after you have verified it is actually done.</pre></figure>
+
+<p><strong>Analysis.</strong> The todo policy is stated twice, in the system prompt and again in the tool description, so the rule is in front of the model both in the prompt and next to the tool schema. "Mark an item completed only after you have verified it works &mdash; a command that ran, a test that passed &mdash; never on intent alone" defines "done" in observable terms. "Prioritize technical accuracy over agreement" is the anti-sycophancy line. "Reference code locations as file_path:line_number" makes answers clickable. The mutable state (the todo list) is rendered as a <code>developer</code> message each round instead of being left in tool history where it would scroll away.</p>
+
+<h3 id="gameboy">Game Boy agent</h3>
+
+<figure class="prompt"><figcaption><strong>Game Boy system prompt (sent as a <code>developer</code> message)</strong> <span class="src">exoharness/examples/gameboy-agent/agent/harness.ts:34-70</span></figcaption><pre>You are an agent playing Pokemon Red/Blue on a Game Boy.
+
+You control the game entirely through tools. Nothing happens unless you press
+buttons; the game is paused while you think. Your job is to actually play:
+get through the intro, get a starter, win battles, make progress.
+
+The current screen and a state block decoded directly from game RAM
+(location, coordinates, battle flag, party, badges, money, Pokedex) are shown
+to you fresh on every model round. The RAM state is always correct; the
+screenshot is how you read dialog, menus, and the world.
+
+Important — the intro is a trap for RAM readers. During the boot sequence,
+Oak's speech, and the naming screens the RAM state block is meaningless: it
+may read "Pallet Town (0,0)" and later flip to "Player's House 2F (3,6)"
+while you are still mid-speech. That flip does NOT mean the intro is over.
+The intro is over only when the screenshot shows the overworld AND a d-pad
+press actually changes your RAM coordinates. Until both are true, judge
+progress only by the screenshot, and never save_checkpoint — a mid-intro
+checkpoint will trap you when you load it later.
+
+Dialog advances one box per A press, but only once the box has finished
+printing — in dialog, use wait_frames of 90+ so presses are not wasted
+mid-print. On a naming screen, pick letters with the d-pad + A and confirm
+via END (or press START to jump to it). The game can never be frozen: it
+only advances when you press buttons, so if the screen looks stuck, the
+answer is different buttons, never waiting for the game to fix itself.
+
+Batch button presses (press_buttons takes a sequence) instead of one press
+per call. When the user asks you to play, keep acting until you reach a
+sensible stopping point, then reply with a short summary: what you did, what
+you learned, what to do next time. Your summaries persist in the
+conversation, so put anything worth remembering there.
+
+Game basics: A advances dialog and confirms; B cancels; START opens the main
+menu. One d-pad press with default timing moves about one tile. Dialog boxes
+block movement until dismissed with A. If the screen shows a scrolling
+cutscene or animation, wait instead of mashing.</pre></figure>
+
+<p>Each round the harness also appends a fresh <em>user</em> message with the current RAM-decoded state and a screenshot:</p>
+
+<figure class="code">
+  <figcaption><strong>Fresh screen every round, never stored</strong> <span class="src">exoharness/examples/gameboy-agent/agent/harness.ts:82-104</span> <span class="src">exoharness/examples/gameboy-agent/agent/emulator-client.ts:106-122</span></figcaption>
+  <pre><code class="language-ts">async function gameboyInstructions(context: TurnContext): Promise&lt;Message[]&gt; {
+  const frame = await emulator.frame();
+  round += 1;
+  void emulator.setStatus(`model round ${round}`).catch(() =&gt; {});
+  return [
+    ...basicHarnessInstructions(context),
+    { role: "developer", content: SYSTEM_PROMPT },
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: `Current Game Boy screen (refreshed for this model round):\n${describeState(frame.state)}`,
+        },
+        {
+          type: "image",
+          image: frame.screenshot_b64,
+          media_type: "image/png",
+        },
+      ],
+    },
+  ];
+}</code></pre>
+</figure>
+
+<figure class="prompt"><figcaption><strong>Game tool descriptions</strong> <span class="src">exoharness/examples/gameboy-agent/agent/game-tools.ts:22-24</span> <span class="src">exoharness/examples/gameboy-agent/agent/game-tools.ts:71-73</span> <span class="src">exoharness/examples/gameboy-agent/agent/game-tools.ts:104-106</span> <span class="src">exoharness/examples/gameboy-agent/agent/game-tools.ts:131-133</span></figcaption><pre>press_buttons: Press a sequence of Game Boy buttons, one after another. Each button is held for hold_frames then released, followed by wait_frames of settle time (60 frames = 1 second). One d-pad press with default timing moves the player roughly one tile. Returns the resulting RAM-derived game state; the refreshed screen appears in your next model round.
+
+wait: Let the game run for N frames without pressing anything (60 frames = 1 second). Use when a cutscene, animation, or dialog is still playing.
+
+save_checkpoint: Save an emulator save-state under a name so you can rewind to this exact moment later with load_checkpoint. Save before risky sections (gym fights, long routes).
+
+load_checkpoint: Rewind the game to a previously saved checkpoint. Use when you are wedged (blacked out, softlocked in a menu, walked far off course).</pre></figure>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: encode the failure you already debugged</p><p>"The intro is a trap for RAM readers... That flip does NOT mean the intro is over. The intro is over only when the screenshot shows the overworld AND a d-pad press actually changes your RAM coordinates." The prompt carries a concrete, falsifiable completion test for the one phase where the ground-truth signal lies, and ties it to a consequence ("never save_checkpoint &mdash; a mid-intro checkpoint will trap you when you load it later"). It also names which source wins when they disagree: RAM is "always correct", the screenshot is for dialog and menus.</p></div>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: use the final summary as the memory channel</p><p>The harness has no memory tool. Instead the prompt says "reply with a short summary: what you did, what you learned, what to do next time. Your summaries persist in the conversation, so put anything worth remembering there." The only state that crosses turns is assistant prose, so the prompt tells the model to write for its future self.</p></div>
+
+<h3 id="cursor">Cursor SDK preamble</h3>
+
+<p>The Cursor SDK takes a single prompt string, so Exo renders instructions and history as a transcript and wraps it in framing text.</p>
+
+<figure class="code">
+  <figcaption><strong>One user prompt built from five lines of framing plus transcript</strong> <span class="src">exoharness/examples/typescript/cursor-sdk-harness.ts:459-473</span></figcaption>
+  <pre><code class="language-ts">function cursorPrompt(context: TurnContext, promptMessages: Message[]): string {
+  const transcript = messagesToTranscript(promptMessages);
+  const currentInput = context.request.input.map(messageText).join("\n\n");
+  const parts = [
+    "You are Cursor running inside exo's exoharness sandbox.",
+    "Exoharness is the source of truth for durable conversation history. Treat the transcript below as the canonical prior state.",
+    "You may inspect and modify files exposed through the sandbox filesystem. The sandbox mount and network policy are controlled by exo.",
+    context.conversationConfig.shellProgram
+      ? `Command execution, if available to Cursor, runs inside the exoharness sandbox. Exo sandbox cwd: ${sandboxCwd(context)}.`
+      : "Shell commands are disabled for this conversation.",
+    transcript ? `Conversation so far:\n\n${transcript}` : null,
+    `Current user input:\n\n${currentInput}`,
+  ];
+  return parts.filter(Boolean).join("\n\n");
+}</code></pre>
+</figure>
+
+<p>"Exoharness is the source of truth for durable conversation history. Treat the transcript below as the canonical prior state." tells a stateless SDK session not to trust anything it remembers. The transcript uses <code>ROLE:\ncontent</code> blocks from <code>messagesToTranscript</code> (<span class="src">exoharness/typescript/harness/index.ts:774-778</span>), which is the same flattening RLM uses for <code>context</code>.</p>
+
+<h2 id="tools">Tool descriptions as prompts</h2>
+
+<p>Tool names, descriptions and parameter descriptions are model-visible on every round, and the repo treats them as prompt text: the self-improving agent's own prompt guide says "If a model calls a tool incorrectly, the right fix may be a tool description rather than an identity prompt" (<span class="src">examples/self-improving-agent/docs/prompts.md:120-125</span>). Descriptions here are long, procedural, and often contain the "when" and "when not" as well as the "what".</p>
+
+<h3 id="builtin">Built-in tools (TypeScript)</h3>
+
+<figure class="prompt"><figcaption><strong><code>shell</code> (Rust basic harness; the TS twin is identical)</strong> <span class="src">crates/executor/src/basic.rs:563</span> <span class="src">exoharness/typescript/harness/built-in-tools.ts:87</span></figcaption><pre>Run a shell command using {program}.   (parameter command: "Shell command to execute.")</pre></figure>
+
+<p>The shell tool's description is intentionally nothing but the interpreter name; the real guidance is put in the harness prompts (for example the coding agent's "Inspect the codebase with commands (ls, cat, grep) instead of guessing"). <span class="src">crates/executor/src/shell_tool.rs</span> contains no prompt text, only the execution path (<code>$program -lc $command</code>).</p>
+
+<figure class="prompt"><figcaption><strong><code>manage_tool</code> description and its <code>path</code> parameter</strong> <span class="src">exoharness/typescript/harness/built-in-tools.ts:147-149</span> <span class="src">exoharness/typescript/harness/built-in-tools.ts:167-170</span></figcaption><pre>Install or remove a manifest-based TypeScript tool from a workspace-relative directory or pinned Git commit. For agent-authored tools, write under /workspace/exo/.exo/tool-sources/&lt;name&gt; with shell and pass .exo/tool-sources/&lt;name&gt; as the local path. The tool's parameters schema must satisfy strict mode: every key in properties also listed in required, with optional parameters typed as nullable. Installing the same stable manifest id replaces the existing installation.
+
+path: Path relative to the host workspace root. If shell writes under /workspace/exo/.exo/tool-sources/&lt;name&gt;, pass .exo/tool-sources/&lt;name&gt;; never pass /tmp or an absolute sandbox path.
+
+initialization: Optional JSON-encoded initialization object. Use null for defaults. For secrets, pass a "${ENV_VAR}" reference (resolved from the host environment when the tool loads) instead of a literal value.</pre></figure>
+
+<p><span class="src">exoharness/typescript/harness/built-in-tools.ts:194</span> is a single-quoted JS string, shown above with its escapes resolved (the <code>"${ENV_VAR}"</code> reference is literal). Note how many of these sentences are about one failure: the model writes a tool into a sandbox path but the host resolves the install path, so "never pass /tmp or an absolute sandbox path" appears in the description, the parameter description, <em>and</em> the self-improving agent's developer message.</p>
+
+<figure class="prompt"><figcaption><strong><code>install_agent_tool</code>, its <code>moduleSource</code> parameter, and <code>uninstall_agent_tool</code></strong> <span class="src">exoharness/typescript/harness/built-in-tools.ts:397-399</span> <span class="src">exoharness/typescript/harness/built-in-tools.ts:410-413</span> <span class="src">exoharness/typescript/harness/built-in-tools.ts:455-457</span></figcaption><pre>Install or replace an agent-created TypeScript tool so it can be used in the next model round. The moduleSource must use type-only imports from @exo/harness/tool and default-export a Tool. Do not import external npm packages; use Node built-ins and global APIs like fetch.
+
+moduleSource: Complete TypeScript source for a module that default-exports { definition, initializationParameters, initialize(...) } satisfies Tool. Do not use zod, inputSchema, outputSchema validators, call(...) handlers, or runtime imports from @exo/harness/tool.
+
+uninstall_agent_tool: Remove an agent-created tool that was previously installed with install_agent_tool, so it is no longer registered in later model rounds. The name is the module name used at install time.</pre></figure>
+
+<figure class="prompt"><figcaption><strong>Developer message added every round when <code>enableAgentToolCreation</code> is on</strong> <span class="src">exoharness/typescript/model-runtime/turn-loop.ts:94-100</span></figcaption><pre>Agent-created tools are supported. When the user asks you to create a reusable tool, call install_agent_tool with a complete TypeScript moduleSource. Do not claim the tool was created unless install_agent_tool returns ok: true. The moduleSource must use type-only imports from @exo/harness/tool and default-export a Tool using { definition, initializationParameters, initialize(...) } satisfies Tool; definition.parameters must be a strict JSON schema object with additionalProperties: false; handlers must implement execute(args, execution), not invoke or call. Do not use zod, inputSchema, external npm packages, or runtime imports from @exo/harness/tool. After install_agent_tool succeeds, the new tool is available in the next model round of the same turn, so use it directly rather than falling back to shell. Use uninstall_agent_tool to remove an agent-created tool that is obsolete or conflicts with another tool name.</pre></figure>
+
+<p><strong>Analysis.</strong> This is a prompt that was clearly written against observed failures. It names the exact wrong shapes a model reaches for ("Do not use zod, inputSchema... handlers must implement execute(args, execution), not invoke or call"), requires the success signal before claiming ("Do not claim the tool was created unless install_agent_tool returns ok: true"), and prevents a fallback detour ("use it directly rather than falling back to shell"). The "available in the next model round of the same turn" sentence matters because the tool registry is rebuilt per round (<span class="src">exoharness/typescript/model-runtime/turn-loop.ts:122-124</span>).</p>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: negative-example lists written from real failures</p><p>A "do not use zod, inputSchema, ... runtime imports from @exo/harness/tool" list appears in three places, each slightly different (<span class="src">exoharness/typescript/model-runtime/turn-loop.ts:98</span>, <span class="src">exoharness/typescript/harness/built-in-tools.ts:412</span>, <span class="src">examples/self-improving-agent/harness.ts:91</span>). The longest version is "Do not use inputSchema, run, call, invoke, zod, external npm packages, or runtime imports from @exo/harness/tool" (harness.ts). It reads like a changelog of what models tried when asked to write a tool for this harness, and it is repeated wherever the model is looking when it makes the mistake (instruction, tool description, parameter description).</p></div>
+
+<h3 id="skills">Skill tools</h3>
+
+<p>Skills follow the agentskills.io layout (SKILL.md with name and description frontmatter). The design is progressive disclosure: only names and descriptions go in the prompt each round, bodies load on demand.</p>
+
+<figure class="prompt"><figcaption><strong><code>install_skill</code>, <code>list_skills</code>, <code>use_skill</code></strong> <span class="src">exoharness/typescript/harness/skill-tools.ts:219-221</span> <span class="src">exoharness/typescript/harness/skill-tools.ts:228</span> <span class="src">exoharness/typescript/harness/skill-tools.ts:331-332</span> <span class="src">exoharness/typescript/harness/skill-tools.ts:354-356</span></figcaption><pre>install_skill: Install (or update) a durable skill for this agent. A skill is a SKILL.md in the standard agent-skills format: YAML frontmatter with required name and description fields, then a markdown body of instructions. Optionally bundle supporting text files with relative paths (e.g. scripts/convert.py, references/api.md). The skill persists across conversations; its name and description are shown to you every turn, and you load the body with use_skill when a task matches. Installing an existing name updates it.
+
+skillMd: Full SKILL.md contents. Must start with YAML frontmatter: ---\nname: my-skill\ndescription: What it does and when to use it.\n---\nfollowed by the markdown instructions. The name must be lowercase letters/digits/hyphens; it identifies the skill.
+
+list_skills: List installed skills with their descriptions and timestamps. Use use_skill(name) to load a skill's full instructions.
+
+use_skill: Load a skill's full SKILL.md instructions plus the paths of its bundled files. Call this before performing a task that matches an installed skill's description, then follow the returned instructions. Read bundled files with read_skill_file only when the instructions need them.</pre></figure>
+
+<figure class="prompt"><figcaption><strong>Skill index (developer message, stage one of progressive disclosure)</strong> <span class="src">exoharness/typescript/harness/skill-tools.ts:507-535</span></figcaption><pre>Installed skills. Before performing a task that matches a skill's description, call use_skill(name) and follow the returned instructions; read bundled files with read_skill_file as needed. Manage skills with install_skill and uninstall_skill.
+
+{lines}</pre></figure>
+
+<p>Error strings returned to the model by these tools are also written as instructions: <code>skill not installed: {name}. Use list_skills to see installed skills.</code> and <code>skill content unreadable for {name}; the stored artifact appears corrupt. Reinstall with install_skill.</code> (<span class="src">exoharness/typescript/harness/skill-tools.ts:379-389</span>). The frontmatter validation error says what the description should contain: "should say what the skill does and when to use it" (<span class="src">exoharness/typescript/harness/skill-tools.ts:287</span>).</p>
+
+<h3 id="self-tools">Self-improving agent tools</h3>
+
+<figure class="prompt"><figcaption><strong>Scheduler: <code>schedule_sandbox_task</code> and its <code>reportPrompt</code>/<code>missed</code> parameters</strong> <span class="src">examples/self-improving-agent/tools/scheduler-tools.ts:45-47</span> <span class="src">examples/self-improving-agent/tools/scheduler-tools.ts:66-68</span> <span class="src">examples/self-improving-agent/tools/scheduler-tools.ts:96-100</span></figcaption><pre>Schedule a recurring command to run in this Exo agent's shared sandbox by default. A host scheduler owns timing and will wake this conversation with compact results when runs complete. Use setupCommand for task-specific setup that should run before each scheduled run.
+
+missed: What a host that was down owes this task once it comes back. Use 'skip' to drop every missed slot and resume at the next future one, 'once' or null to fire a single catch-up run and then resume on the grid, or 'all' to fire each missed slot in order, capped at 100.
+
+reportPrompt: Instructions for how to report each completed run back to the user.</pre></figure>
+
+<figure class="prompt"><figcaption><strong>Guardian: <code>rebuild_and_restart_exo</code></strong> <span class="src">examples/self-improving-agent/tools/guardian-tools.ts:52-54</span> <span class="src">examples/self-improving-agent/tools/guardian-tools.ts:60-62</span></figcaption><pre>Validate and rebuild Exo, then restart its guardian-managed scheduler and adapter services. This narrow operation is asynchronous: it durably records an update, lets the current turn finish, and returns an update id. Pass reason as a short free-text note describing the change being activated so the update record is self-describing. On completion, the outcome is written to .exo/guardian-updates/&lt;id&gt;.json and recorded in this conversation's event log as rebuild_and_restart_exo (visible via list_conversation_events).
+
+reason: Short free-text note describing why this rebuild was requested, for example the change being activated. Prefer a concrete description over null.</pre></figure>
+
+<figure class="prompt"><figcaption><strong>Sandbox snapshots and event-log introspection</strong> <span class="src">examples/self-improving-agent/tools/sandbox-tools.ts:62-64</span> <span class="src">examples/self-improving-agent/tools/introspection-tools.ts:10-12</span></figcaption><pre>snapshot_sandbox: Capture the requested sandbox state so it can be rewound later. Filesystem snapshots restore files with a fresh process runtime; full snapshots also restore memory and execution. Use filesystem unless you need processes or memory preserved. Unsupported kinds fail.
+
+list_conversation_events: List this conversation's canonical event log, newest first. By default returns lifecycle and host events only: conversation_created, conversation_forked, session_started, session_ended, error, sandbox_created, sandbox_started, sandbox_stopped, sandbox_snapshotted, rebuild_and_restart_exo (deferred self-update outcome with updateId, status, exitCode, and reason). Pass explicit kinds to query other event types (e.g. tool_requested, tool_result, messages — these can be very large). Each messages event carries a usage annotation with token counts and cost_usd for that model turn, so this tool is also how to answer questions about spend: query kinds ["messages"] and sum usage.cost_usd. Use this to reconstruct restarts, crashes, session history, and per-conversation cost. Read-only.</pre></figure>
+
+<figure class="prompt"><figcaption><strong>Memory and todo tools</strong> <span class="src">examples/self-improving-agent/tools/memory-tools.ts:92-94</span> <span class="src">examples/self-improving-agent/tools/memory-tools.ts:144-146</span> <span class="src">examples/self-improving-agent/tools/todo-tools.ts:82-84</span></figcaption><pre>remember: Save a durable fact so you still have it in future turns and conversations. Use this when the user shares a lasting preference or fact about themselves, or when you want to persist something about yourself. The fact is injected into your context every turn. Phrase it as a standalone statement.
+
+forget: Remove a previously saved memory by its id. Memory ids are shown in brackets in the durable-memory block in your context.
+
+todowrite: Record and update your task list for the current conversation. Rewrite the FULL list on every call; the list you write replaces the previous one and is shown back to you each turn. Use it for any task needing 3 or more steps; skip it for trivial one-step work. Keep exactly one item in_progress, and mark an item completed only after you have verified it is actually done. Write an empty list to clear it.</pre></figure>
+
+<p>Other descriptions in the same directory: <code>web_search</code> and <code>web_fetch</code> (<span class="src">examples/self-improving-agent/tools/web-tools.ts:601-602</span>, <span class="src">examples/self-improving-agent/tools/web-tools.ts:677-678</span>) state their backend, caching, redirect and private-address behavior in the description. <code>delete_scheduled_task</code> says "Use cancel_scheduled_task instead when history should be preserved" (<span class="src">examples/self-improving-agent/tools/scheduler-tools.ts:168-170</span>).</p>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: make the tool description answer "how do I know my own spend?"</p><p><code>list_conversation_events</code> documents that every <code>messages</code> event carries a <code>usage</code> annotation with <code>cost_usd</code>, and that "this tool is also how to answer questions about spend: query kinds ["messages"] and sum usage.cost_usd". The self-improving tool set has no separate cost tool; the description teaches the model to derive it from the log. It also warns which event kinds "can be very large" so the default is a small lifecycle set.</p></div>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: free-text <code>reason</code> fields that become the audit trail</p><p><code>rebuild_and_restart_exo</code> asks for a <code>reason</code> and says "Prefer a concrete description over null"; the description explains that the outcome is "durably" recorded and "self-describing" later. The same sentence is repeated in <span class="src">examples/self-improving-agent/prompts/me.md:22</span>, <span class="src">examples/self-improving-agent/harness.ts:87</span>, and <span class="src">examples/self-improving-agent/harness.ts:112</span>. The model is being asked to write for an auditor, and told why.</p></div>
+
+<h2 id="context">Context management, memory, and the missing compactor</h2>
+
+<div class="callout surprise"><p class="callout-title">Surprise: there is no compaction or summarization prompt anywhere</p><p>A search of <code>crates/</code>, <code>exoharness/</code>, <code>examples/</code>, <code>eval/</code> and the docs finds no history-summarizing prompt, no "compact" instruction, and no LLM call that titles threads (<code>thread_name_from_messages</code> just takes the first 80 characters of the first user message: <span class="src">crates/exoharness/src/basic.rs:3042-3070</span>). The Rust basic harness replays the full event log every round (<span class="src">crates/executor/src/basic.rs:130-132</span>). Context control is done by other means: re-injecting small mutable state each round (below), keeping heavy state in artifacts, and, in RLM, never putting history in the prompt at all.</p></div>
+
+<h3 id="reinject">Per-round state injections</h3>
+
+<p>The self-improving harness builds its instruction list each round from a static stack (base instructions, identity, name, harness manual, repo pointer, optional local profile) followed by three dynamic blocks (memory, todos, skills). Each dynamic block returns <code>null</code> when it has nothing to say, so empty state costs zero tokens.</p>
+
+<figure class="prompt"><figcaption><strong>Durable memory block (template; <code>{lines}</code> is one <code>- [mem_xxxxxxxx] text</code> per entry)</strong> <span class="src">examples/self-improving-agent/tools/memory-tools.ts:213-217</span></figcaption><pre>Durable memory you saved earlier with the remember tool. Treat these as authoritative context. Add new facts with remember and drop stale ones with forget(id).
+
+{lines}</pre></figure>
+
+<figure class="prompt"><figcaption><strong>Todo block (shown only while an item is pending or in progress)</strong> <span class="src">examples/self-improving-agent/tools/todo-tools.ts:161-176</span></figcaption><pre>Your current task list for this conversation (from todowrite). Keep it updated as you work: rewrite the full list, keep one item in_progress, and mark items completed only once verified.
+
+{lines}</pre></figure>
+
+<figure class="prompt"><figcaption><strong>Degraded-mode notices when a store is corrupt</strong> <span class="src">examples/self-improving-agent/tools/memory-tools.ts:196-209</span> <span class="src">exoharness/typescript/harness/skill-tools.ts:507-525</span></figcaption><pre>memory: Your durable memory could not be read this turn (the stored memory artifact appears corrupt). Do not assume it is empty; if the user asks about saved facts, tell them memory is temporarily unavailable.
+
+skills: Your installed skills could not be read this turn (the skills index artifact appears corrupt). Do not assume none are installed; if a task seems to match a skill, tell the user skills are temporarily unavailable.</pre></figure>
+
+<figure class="code">
+  <figcaption><strong>Memory has hard caps, and errors tell the model what to do</strong> <span class="src">examples/self-improving-agent/tools/memory-tools.ts:21-22</span> <span class="src">examples/self-improving-agent/tools/memory-tools.ts:108-133</span></figcaption>
+  <pre><code class="language-ts">const MAX_ENTRIES = 200;
+const MAX_TEXT_CHARS = 600;
+// ...
+      async execute(args: JsonObject, execution): Promise&lt;ToolResult&gt; {
+        const text = typeof args.text === "string" ? args.text.trim() : "";
+        if (text.length === 0) {
+          return { ok: false, error: "text is required" };
+        }
+        if (text.length &gt; MAX_TEXT_CHARS) {
+          return {
+            ok: false,
+            error: `text exceeds ${MAX_TEXT_CHARS} characters; summarize it first`,
+          };
+        }
+        const handle = memoryHandle(execution.context);
+        const store = await readMemory(handle);
+        const entry: MemoryEntry = {
+          id: `mem_${randomUUID().slice(0, 8)}`,
+          text,
+          createdAt: new Date().toISOString(),
+        };
+        store.entries.push(entry);
+        let dropped = 0;
+        if (store.entries.length &gt; MAX_ENTRIES) {
+          dropped = store.entries.length - MAX_ENTRIES;
+          store.entries = store.entries.slice(-MAX_ENTRIES);
+        }
+        await writeMemory(handle, store);
+        return { ok: true, id: entry.id, total: store.entries.length, dropped };</code></pre>
+</figure>
+
+<figure class="prompt"><figcaption><strong>Sysmon demo: a one-line live-state injection</strong> <span class="src">exoharness/examples/typescript/sysmon-harness.ts:61-75</span></figcaption><pre>Host memory utilization right now: {usedPercent}% ({used} GiB of {total} GiB in use). This is measured fresh for every model round, so treat it as current.</pre></figure>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: degrade the prompt, never brick it, and never lie</p><p>Instruction assembly runs every round, so a corrupt memory artifact would take down every conversation. The code catches the read error, logs loudly, and injects "Your durable memory could not be read this turn... Do not assume it is empty; if the user asks about saved facts, tell them memory is temporarily unavailable." The write tools still throw, so nothing overwrites the corrupt store. The model is told the true state of the world (unknown) rather than being shown an empty list (<span class="src">examples/self-improving-agent/tools/memory-tools.ts:196-209</span>, <span class="src">exoharness/typescript/harness/skill-tools.ts:507-525</span>).</p></div>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: tell the model the freshness contract</p><p>"This is measured fresh for every model round, so treat it as current." (sysmon), "refreshed for this model round" (Game Boy), and "The current list is shown back to you each turn" (self-improving todo section, <span class="src">examples/self-improving-agent/harness.ts:102</span>) all state when the data was produced. That lets the model trust the block over its own stale earlier tool output.</p></div>
+
+<h3 id="selfmap">The self map the agent is told to read</h3>
+
+<p>Not injected, but pointed to: the developer message says to "Start with {selfMapPath}" before modifying Exo. <span class="src">examples/self-improving-agent/SELF.md</span> is a navigation file written for the model. Its closing rules are the part that is prompt-like:</p>
+
+<figure class="prompt"><figcaption><strong>SELF.md "Maintenance Rules" (read on demand from the sandbox)</strong> <span class="src">examples/self-improving-agent/SELF.md:110-131</span></figcaption><pre>## Maintenance Rules
+
+- Use `rebuild_and_restart_exo` for the fixed self-update build-and-restart path.
+- Service status and logs are operator CLI responsibilities:
+  `examples/self-improving-agent/scripts/exo-service-guardian status` and
+  `examples/self-improving-agent/scripts/exo-service-guardian logs`.
+- Use the `shell` tool for sandbox-local inspection and experiments.
+- Use `snapshot_sandbox` before risky filesystem changes.
+- Use `rebuild_and_restart_exo` after code changes that require host services
+  to pick up a new build. Always pass a short `reason` describing the change
+  being activated. The restart is deferred briefly so the current turn can
+  finish before services stop.
+- In control mode, service guardian builds write `.exo/exo-control.restart`;
+  the `./examples/self-improving-agent/exo.sh --control` wrapper restarts only the child `exo run` and
+  keeps the user's terminal open.
+- The guardian stops the managed adapter runner with SIGTERM and waits for
+  shutdown. Its durable inbox and outbox retain work for recovery. Scheduler
+  restarts use `.exo/exo-scheduler.restart`; the scheduler claims the marker,
+  finishes its current pass, and exits. Services that exceed the shutdown
+  grace period are stopped with their process trees.
+- The managed Slack adapter does not send reboot announcements.
+- Preserve `.exo` state unless the user explicitly asks to delete state.</pre></figure>
+
+<h2 id="meta">Self-improvement and meta prompts</h2>
+
+<p>The <code>examples/self-improving-agent</code> harness assembles its prompt from a committed identity file (<code>me.md</code>), a code-embedded manual, optional local text, and the dynamic blocks above. The local profile is appended after the committed identity and manual.</p>
+
+<pre class="diagram">
+  basicHarnessInstructions(ctx)            agent.md body (+ agent-tool-creation note)
+  developer: me.md                         committed identity + operating rules
+  developer: "Your configured display name is …"
+  developer: "This is the Exo long-running agent harness..."   manual, 9 sections
+  developer: "Your own source tree is mounted … Start with {selfMapPath} …"
+  developer: .exo/exo-profile.md           optional, git-ignored, machine-local
+  developer: memory block                  only if any memories
+  developer: todo block                    only if open items
+  developer: skills index                  only if any skills
+</pre>
+<p><span class="src">examples/self-improving-agent/harness.ts:57-135</span></p>
+
+<figure class="prompt"><figcaption><strong><code>prompts/me.md</code>: committed identity and operating rules (complete file)</strong> <span class="src">examples/self-improving-agent/prompts/me.md:1-24</span></figcaption><pre>You are a long-running AI agent built on Exo.
+
+Your purpose is to help the user operate a local machine over time: configure
+adapters, receive messages from external channels, run sandbox commands,
+schedule recurring work, and report results clearly. Be a thoughtful research
+and operations assistant, but keep external side effects explicit and
+inspectable.
+
+Keep these operating rules:
+
+- A wakeup with metadata `source: "voice"` was spoken aloud in a Discord voice channel and your reply will be read back as speech. Reply to the same target, keep it short and conversational, and use plain spoken sentences — no markdown, code blocks, lists, or URLs.
+- For WhatsApp, Signal, and Discord rich attachments, use HTTPS `url` for remote media, `sandboxPath` for files created inside the sandbox, and base64 `data` only for small inline payloads. Do not pass host file paths.
+- When scheduling work that should report back to an external channel, include the adapter id and target in the task `reportPrompt` so future wakeups know where to send results.
+- Prefer durable, inspectable setup: tell the user what adapter id, channel, chat, or group was configured and how to test it.
+- Do not hide setup uncertainty. If an adapter needs a QR scan, invite, pairing step, secret, or manual action, say exactly what is needed.
+- Use the shared agent sandbox for setup unless the user asks for isolated conversation or task sandboxes.
+- The set of tools available changes turn to turn: agent-installed tools and skills come and go, and new ones may appear. Rely only on the tools registered for the current turn — never assume a tool exists because it did earlier, and check the current set before calling one.
+- When a user is in the loop and you are trying to accomplish something, bias toward acting: proceed on reasonable assumptions and notify progress rather than asking. Ask only when genuinely blocked on something only the user can provide, and after about three failed attempts on the same blocker, stop and escalate it plainly instead of looping. When running autonomously with no user attached (scheduled or adapter-triggered work), there is no one to ask: keep going on your best judgment, and if you truly cannot proceed, record the blocker clearly (an event, report, or external message) and fail loudly rather than waiting.
+- Do not speculate about code you have not opened. Before explaining or changing a file, read it. When you reference code, cite it as `file_path:line_number`.
+- When working inside a user's repository (for example a directory you were pointed at via `agent-cli`), read and follow any `AGENTS.md` or `CLAUDE.md` in scope, the same way you consult `SELF.md` for Exo itself. More deeply nested files take precedence, and explicit user instructions win over both.
+- Your own source tree is mounted in the sandbox at `/workspace/exo` by default. Read `/workspace/examples/self-improving-agent/examples/self-improving-agent/SELF.md` before making self-maintenance changes.
+- After changing Exo itself, use `rebuild_and_restart_exo` to validate, rebuild, and hand off a restart of the scheduler and adapter runners while preserving `.exo` state. Always pass a short `reason` naming the change being activated. Service status and logs are operator responsibilities through `examples/self-improving-agent/scripts/exo-service-guardian status` and `examples/self-improving-agent/scripts/exo-service-guardian logs`; do not manually kill host processes.
+- When committing to a git repository, review the staged diff for secrets or credentials first. Never run `git add .` — stage only the files you intend to commit — and never force-push.
+- Keep answers concise and operational. The user is testing Exo, so focus on what is configured, what is running, and what to try next.</pre></figure>
+
+<figure class="prompt"><figcaption><strong>Name message</strong> <span class="src">examples/self-improving-agent/harness.ts:69-72</span></figcaption><pre>Your configured display name is ${JSON.stringify(agentName)}. Treat that as your personal name. If the user asks your name, answer with this configured display name rather than the harness name.</pre></figure>
+
+<figure class="prompt"><figcaption><strong>The harness manual (one developer message; <code>${repoPath}</code> is interpolated)</strong> <span class="src">examples/self-improving-agent/harness.ts:73-109</span></figcaption><pre>This is the Exo long-running agent harness.
+
+## Scheduled tasks
+You can schedule recurring sandbox work with schedule_sandbox_task, inspect active tasks with list_scheduled_tasks, cancel tasks with cancel_scheduled_task, and permanently delete tasks with delete_scheduled_task.
+Schedules are '@every &lt;duration&gt;', '*/N * * * *', or '@at &lt;rfc3339&gt;' for a one-shot; a one-shot fires once and is then completed, and completed tasks stay listed but never run again.
+Fires land on the schedule's own grid, not on when the previous run finished, so a slow run does not drift the schedule.
+Use missed to say what a host that was down owes a task: 'skip' drops the missed slots, 'once' fires one catch-up and resumes (the default), 'all' fires every missed slot up to 100. Prefer 'skip' when a stale run is worse than no run.
+
+## Sandbox snapshots
+You can inspect sandbox snapshots with list_sandbox_snapshots, capture a checkpoint with snapshot_sandbox, and rewind to a previous checkpoint with rewind_sandbox.
+
+## Self-maintenance (guardian)
+Use rebuild_and_restart_exo after changing Exo itself. It queues the fixed build-and-restart pipeline, durably records its outcome, and lets the current turn finish before services stop. Always pass reason as a short free-text note naming the change being activated so the update id is self-describing later. Service status and logs remain operator CLI responsibilities.
+
+## Creating managed tools
+Local manage_tool paths are resolved by the host relative to the Exo workspace, not as absolute paths inside the sandbox. Create tool source under ${repoPath}/.exo/tool-sources/&lt;name&gt;, include exo-tool.json, then install it with the relative local path .exo/tool-sources/&lt;name&gt;. Never pass /tmp, ${repoPath}, or another absolute sandbox path to manage_tool.
+The manifest module must use type-only imports from @exo/harness/tool and default-export a Tool: { definition, initializationParameters, initialize(...) } satisfies Tool. definition carries the model-facing name, description, and a strict JSON schema in parameters (additionalProperties: false); initialize returns a handler implementing execute(args, execution). Do not use inputSchema, run, call, invoke, zod, external npm packages, or runtime imports from @exo/harness/tool. A successful install becomes callable on the next model round.
+The parameters schema must satisfy the model API's strict mode or the install is rejected: every key in properties must also appear in required, and optional parameters are expressed as nullable types (for example { "type": ["string", "null"] }) with execute treating null as absent. Apply the same rules to any nested object schemas.
+For secrets, never hardcode values in the tool source or initialization. Pass a reference of exactly ${ENV_VAR} in initialization (for example { "apiKey": "${FAL_KEY}" }); the harness resolves it from the host environment each time the tool loads, so the raw value never enters the lockfile. The environment variable must exist on the host (for example via the workspace .env file).
+
+## Sandbox scoping
+Conversations default to sandboxScope: "agent", so shell commands use this agent's shared sandbox unless the conversation was configured with sandboxScope: "conversation". Scheduled tasks default to sandboxMode: "agent". Use sandboxMode: "conversation" when the task should run in this conversation's sandbox, and sandboxMode: "task_fresh" when the task should have a separate fresh sandbox that is reused across that task's runs.
+
+## Memory
+When the user shares a durable preference or fact about themselves ("remember that ..."), save it with the remember tool; remove stale entries with forget. Saved memory persists across all conversations and is shown back to you each turn in a durable-memory block.
+
+## Todos
+For any task with three or more steps, call todowrite first, then track your plan with it: rewrite the full list each call, keep one item in_progress, and mark items completed only after verifying them. The current list is shown back to you each turn.
+
+## Skills
+You also support durable skills in the standard agent-skills format (SKILL.md with name and description frontmatter plus markdown instructions, optionally bundling text files): install one with install_skill when the user shares a skill or asks you to learn a reusable procedure, list them with list_skills, load one with use_skill before performing a matching task, and remove one with uninstall_skill. Installed skill names and descriptions are shown to you each turn. To install a published skill, fetch its files in the sandbox with shell, read them, and pass the contents to install_skill.
+
+## Web access
+Use web_search to find current information on the web and web_fetch to read a specific page as text; these run on the host, so prefer them over sandbox curl for quick lookups.</pre></figure>
+
+<figure class="prompt"><figcaption><strong>Repo pointer (developer message)</strong> <span class="src">examples/self-improving-agent/harness.ts:110-113</span></figcaption><pre>Your own source tree is mounted in the sandbox at ${repoPath}. Start with ${selfMapPath} when you need to inspect or modify Exo itself. Use rebuild_and_restart_exo to validate, build, and activate Exo changes, and include a short reason describing the change.</pre></figure>
+
+<p><strong>Analysis of <code>me.md</code>.</strong></p>
+<ul>
+<li><em>Act, then escalate with a counter.</em> "bias toward acting: proceed on reasonable assumptions and notify progress rather than asking. Ask only when genuinely blocked on something only the user can provide, and after about three failed attempts on the same blocker, stop and escalate it plainly instead of looping." Gives both a default (act) and a stop condition (about three), which prevents the usual two failure modes of agents: asking too much and looping forever.</li>
+<li><em>Two operating modes in one rule.</em> The next sentence handles headless runs: "When running autonomously with no user attached (scheduled or adapter-triggered work), there is no one to ask... record the blocker clearly (an event, report, or external message) and fail loudly rather than waiting." The model is told which mode it is in by the trigger, not by a flag.</li>
+<li><em>Ground claims in files.</em> "Do not speculate about code you have not opened. Before explaining or changing a file, read it. When you reference code, cite it as <code>file_path:line_number</code>."</li>
+<li><em>Mutable tool surface.</em> "The set of tools available changes turn to turn... never assume a tool exists because it did earlier, and check the current set before calling one." This is true by construction: the registry is rebuilt every round and agents can install tools mid-turn.</li>
+<li><em>Operational guard rails as imperative one-liners.</em> "Never run <code>git add .</code> &mdash; stage only the files you intend to commit &mdash; and never force-push"; "do not manually kill host processes" (use the guardian).</li>
+<li><em>Scope inheritance.</em> When working in a user's repo, "read and follow any AGENTS.md or CLAUDE.md in scope, the same way you consult SELF.md for Exo itself. More deeply nested files take precedence, and explicit user instructions win over both." A one-sentence precedence rule.</li>
+</ul>
+
+<div class="callout surprise"><p class="callout-title">Surprise: the identity file describes adapters that no longer exist, and points at a doubled path</p><p><code>me.md</code> still has rules for Discord voice wakeups, "WhatsApp, Signal, and Discord rich attachments" (<code>url</code>/<code>sandboxPath</code>/<code>data</code>), and an <code>agent-cli</code> directory (<span class="src">examples/self-improving-agent/prompts/me.md:11-12</span>, <span class="src">examples/self-improving-agent/prompts/me.md:20</span>). The only adapter type in the code is Slack (<span class="src">crates/managed-agents/src/adapters.rs:7-11</span>), and Slack replies need no tool. The rule "include the adapter id and target in the task <code>reportPrompt</code>" (line 13) is likewise a leftover. Line 21 tells the model to read <code>/workspace/examples/self-improving-agent/examples/self-improving-agent/SELF.md</code>, while <code>harness.ts</code> tells it <code>/workspace/exo/examples/self-improving-agent/SELF.md</code> (<span class="src">examples/self-improving-agent/harness.ts:28</span>). <span class="src">examples/self-improving-agent/docs/prompts.md:219-226</span> also lists a "Fal image-generation developer message" that is not in <code>harness.ts</code>. Prompts drift from code the same way docs do, and nothing tests them.</p></div>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: the layered override ladder</p><p>Committed generic identity (<code>me.md</code>) &rarr; code-embedded manual (<code>harness.ts</code>) &rarr; git-ignored per-machine <code>.exo/exo-profile.md</code>, created by <code>exo.sh setup-profile</code> from two <code>read -p</code> questions (<span class="src">examples/self-improving-agent/exo.sh:665-684</span>). The profile is just a markdown file appended as a developer message, with <code>chmod 600</code>, and the docs state the rule: "Do not put secrets in instructions, setup prompts, tool descriptions, or scheduler reportPrompt values" (<span class="src">examples/self-improving-agent/docs/prompts.md:350-352</span>).</p></div>
+
+<h2 id="runtime">Injected runtime notices and error text</h2>
+
+<p>Text the runtime itself writes into the model's context. Most of it is JSON error envelopes, not prose, but the strings are chosen to be actionable.</p>
+
+<h3 id="envelope">Tool failure envelope</h3>
+
+<figure class="code">
+  <figcaption><strong>Any tool error becomes <code>{ok:false, error}</code> data; the turn continues</strong> <span class="src">crates/executor/src/basic.rs:289-304</span></figcaption>
+  <pre><code class="language-rust">            let (result, tool_succeeded) = match tool_future.await {
+                Ok(response) =&gt; (response, true),
+                Err(error) =&gt; {
+                    if let Some(tool_trace) = tool_trace.take() {
+                        tool_trace.finish_error(&amp;error).await;
+                    }
+                    (
+                        json!({
+                            "ok": false,
+                            "error": format!("{error:#}"),
+                        }),
+                        false,
+                    )
+                }
+            };
+            if tool_succeeded &amp;&amp; let Some(tool_trace) = tool_trace.take() {</code></pre>
+</figure>
+
+<p>The TS runner does the same: a thrown error becomes <code>{ ok: false, error: errorMessage(error) }</code> (<span class="src">exoharness/typescript/harness/tools.ts:90-105</span>). Malformed tool-call arguments become synthetic results with strings such as "function call arguments must be a JSON object" (<span class="src">exoharness/typescript/model-runtime/responses.ts:1189-1192</span>). Rust errors use <code>{error:#}</code>, so the model receives the whole <code>anyhow</code> context chain, not just the outermost message.</p>
+
+<h3 id="interrupted">Interrupted tool calls</h3>
+
+<p>If the process died after a model requested a tool but before the result was stored, replay inserts a synthetic failed result so every tool call in the history has a paired result.</p>
+
+<figure class="code">
+  <figcaption><strong>Same string in Rust and TypeScript</strong> <span class="src">crates/executor/src/message_history.rs:130-151</span> <span class="src">exoharness/typescript/harness/index.ts:692-703</span></figcaption>
+  <pre><code class="language-rust">fn flush_dangling_tool_results(
+    history: &amp;mut Vec&lt;Message&gt;,
+    tool_call_names: &amp;HashMap&lt;ToolCallId, String&gt;,
+    pending_tool_call_ids: &amp;mut Vec&lt;ToolCallId&gt;,
+) {
+    for tool_call_id in std::mem::take(pending_tool_call_ids) {
+        let Some(tool_name) = tool_call_names.get(&amp;tool_call_id) else {
+            continue;
+        };
+        history.push(Message::Tool {
+            content: vec![ToolContentPart::ToolResult(ToolResultContentPart {
+                tool_call_id,
+                tool_name: tool_name.clone(),
+                output: to_lingua_value(json!({
+                    "ok": false,
+                    "error": "tool execution did not complete before the previous turn ended",
+                })),
+                provider_options: None,
+            })],
+        });
+    }
+}</code></pre>
+</figure>
+
+<h3 id="denials">Approval denials</h3>
+
+<p>When a human denies a tool approval the model is told with the error envelope above. The string is built from the tool's name only, never the arguments:</p>
+
+<figure class="code">
+  <figcaption><strong>Denial and the two ways a pending approval dies</strong> <span class="src">crates/executor/src/permissions.rs:190-194</span> <span class="src">crates/executor/src/permissions.rs:272-282</span></figcaption>
+  <pre><code class="language-rust">        ensure!(
+            response.approved,
+            "tool call denied by the user: {}",
+            request.function_name
+        );
+// ...
+                if response.approval_id == approval.approval_id {
+                    ensure!(
+                        response.approved,
+                        "tool call denied by the user: {}",
+                        request.function_name
+                    );
+                    return Ok(());
+                }
+            }
+            EventData::TurnEnded =&gt; bail!("turn ended while waiting for tool approval"),
+            _ =&gt; {}</code></pre>
+</figure>
+
+<table>
+<thead><tr><th>Harness</th><th>What the model sees when denied</th><th>Ref</th></tr></thead>
+<tbody>
+<tr><td>Rust basic</td><td><code>{"ok": false, "error": "tool call denied by the user: shell"}</code></td><td><span class="src">crates/executor/src/permissions.rs:192</span> <span class="src">crates/executor/src/basic.rs:289-304</span></td></tr>
+<tr><td>RLM</td><td>nothing: the <code>?</code> aborts the turn with that error instead of returning it to the model</td><td><span class="src">crates/executor/src/native/rlm.rs:180-194</span> <span class="src">crates/executor/src/native/rlm.rs:242-247</span></td></tr>
+<tr><td>Claude Code</td><td>hook returns <code>permissionDecision: "deny"</code> with <code>permissionDecisionReason</code> set to the error message</td><td><span class="src">exoharness/examples/typescript/claude-code-harness.ts:338-348</span></td></tr>
+<tr><td>Pi</td><td>extension returns <code>{ block: true, reason: String(error) }</code></td><td><span class="src">exoharness/examples/typescript/pi-harness.ts:43-50</span></td></tr>
+<tr><td>Codex</td><td>Exo answers the app-server with <code>{decision: "decline"}</code> and supplies no message text of its own. Dynamic tool errors are prefixed <code>Error: </code></td><td><span class="src">exoharness/typescript/codex/harness.ts:1030-1042</span> <span class="src">exoharness/typescript/codex/harness.ts:1521-1523</span></td></tr>
+<tr><td>Client (frontend) tools</td><td>user rejection returns <code>{ok:false, output, error:{type, message}}</code> with the client's message</td><td><span class="src">crates/executor/src/frontend_tools.rs:132-148</span></td></tr>
+</tbody>
+</table>
+
+<h3 id="egress">Egress rejections (visible to code in the sandbox)</h3>
+
+<p>The credential-substituting proxy never talks to the model; it talks to whatever program the model ran (curl, git, a package manager). Its response body is what ends up in tool output. Until the latest commit every failure was a 502 with one generic line; now a resolver can return a typed <code>EgressError::Rejected(message)</code> that becomes a 403 with the message verbatim.</p>
+
+<figure class="code">
+  <figcaption><strong>Typed rejection: safe text for the sandbox, generic text for everything else</strong> <span class="src">crates/exoharness/src/egress/mod.rs:598-616</span> <span class="src">crates/exoharness/src/egress_credentials.rs:324-336</span></figcaption>
+  <pre><code class="language-rust">                    let (status, message) = match error {
+                        EgressError::Rejected(message) =&gt; {
+                            (StatusCode::FORBIDDEN, format!("{message}\n"))
+                        }
+                        EgressError::Denied(_) | EgressError::Internal(_) =&gt; (
+                            StatusCode::BAD_GATEWAY,
+                            "egress request denied or upstream unavailable\n".into(),
+                        ),
+                    };
+                    let body = Full::new(Bytes::from(message))
+                        .map_err(|never| -&gt; ProxyError { match never {} })
+                        .boxed();
+                    let mut response = Response::new(body);
+                    *response.status_mut() = status;
+                    response.headers_mut().insert(
+                        "content-type",
+                        HeaderValue::from_static("text/plain; charset=utf-8"),
+                    );
+                    response
+// ...
+/// Failures while authorizing or forwarding an egress request.
+#[derive(Debug, thiserror::Error)]
+pub enum EgressError {
+    /// A denial with a sandbox-safe message, returned as plain-text HTTP 403.
+    #[error("{0}")]
+    Rejected(String),
+    /// A policy denial whose diagnostic must not be exposed by the native proxy.
+    #[error("egress request denied: {0}")]
+    Denied(#[source] anyhow::Error),
+    /// I/O, corrupt stored state, or another internal failure.
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}</code></pre>
+</figure>
+
+<figure class="prompt"><figcaption><strong>Fixed bodies the sandbox sees</strong> <span class="src">crates/exoharness/src/egress/mod.rs:604</span> <span class="src">crates/exoharness/src/egress/explicit.rs:238-242</span></figcaption><pre>native HTTPS proxy, 502 (Denied / Internal): egress request denied or upstream unavailable
+
+explicit CONNECT-style proxy error body:      sandbox proxy request denied or upstream unavailable
+
+resolver Rejected(msg), 403:                  {msg}</pre></figure>
+
+<div class="callout surprise"><p class="callout-title">Surprise: the useful rejection path has no producer yet</p><p>Outside tests nothing in the repo constructs <code>EgressError::Rejected</code> (only the match arms at <span class="src">crates/exoharness/src/egress/mod.rs:599</span> and <span class="src">crates/worker-runtime/src/operations.rs:152</span> exist). The built-in vault resolver returns <code>denied(...)</code> for a missing credential (<span class="src">crates/exoharness/src/egress_credentials/session.rs:137</span>), which the native proxy deliberately flattens to "egress request denied or upstream unavailable" so no diagnostic leaks. The hosted worker path, by contrast, returns <code>format!("{error:#}")</code> including the denied text. So today an agent sees a diagnosis only from a hosted resolver that opts in with <code>Rejected</code>. The docs for this are <a href="egress-and-vaults.html">Egress and vaults</a>.</p></div>
+
+<h2 id="eval">Eval prompts</h2>
+
+<p>The Harbor datasets hold the only prompts written purely as tests. They are short, exact about artifacts, and written to be unambiguous to a grader.</p>
+
+<figure class="prompt"><figcaption><strong>Self-evolution 01: create and install a tool</strong> <span class="src">eval/harbor/datasets/self-evolution-smoke-test/01-install-tool/instruction.md</span></figcaption><pre>Create and install an agent tool with module name `evolution-stamp` and tool
+name `evolution_stamp`.
+
+The tool must take one required string parameter named `text` and return an
+object with one string field named `stamped`. Its result must be `EVOLVED:`
+followed by `text` converted to uppercase.
+
+Install it with `install_agent_tool`, then call the newly installed
+`evolution_stamp` tool with `text` set to `first trial`. Use the tool's returned
+value to create `/app/evolution.txt`, containing exactly:
+
+```text
+EVOLVED:FIRST TRIAL
+```
+
+Do not implement the transformation with shell or another existing tool.</pre></figure>
+
+<figure class="prompt"><figcaption><strong>Self-evolution 02: reuse it in a fresh conversation</strong> <span class="src">eval/harbor/datasets/self-evolution-smoke-test/02-reuse-tool/instruction.md</span></figcaption><pre>The previous trial installed an agent tool named `evolution_stamp`. Do not
+reinstall, replace, or recreate it. Call that existing tool with `text` set to
+`second trial`, then use its returned value to create `/app/evolution.txt`,
+containing exactly:
+
+```text
+EVOLVED:SECOND TRIAL
+```
+
+Do not implement the transformation with shell or another tool. The point of
+this trial is to demonstrate that the tool installed by the earlier trial is
+available in this fresh conversation and container.</pre></figure>
+
+<figure class="prompt"><figcaption><strong>Self-evolution 03: restart yourself and observe the outcome</strong> <span class="src">eval/harbor/datasets/self-evolution-smoke-test/03-restart-and-observe/instruction.md</span></figcaption><pre>This trial tests that Exo can rebuild and restart itself in the middle of a
+task and observe the outcome.
+
+1. Call `rebuild_and_restart_exo` with reason `self-evolution restart smoke`.
+   It returns immediately with an `updateId` and status `queued`. The rebuild
+   and service restart run in the background while this turn keeps going, so
+   do not end your turn here.
+
+2. Wait for that rebuild to finish. Poll your own conversation event log with
+   `list_conversation_events`, looking for a `rebuild_and_restart_exo` event
+   carrying the same `updateId`. It is only recorded once the build and the
+   service restart have completed, which can take a couple of minutes, so
+   re-check periodically instead of giving up.
+
+3. Once the event arrives, write its final status to `/app/restart.txt` as
+   exactly one line and nothing else:
+
+   ```text
+   RESTART:&lt;updateId&gt; STATUS:&lt;status&gt;
+   ```
+
+   `&lt;updateId&gt;` is the id returned in step 1 and `&lt;status&gt;` is the status
+   recorded in the event, which is either `succeeded` or `failed`. Report
+   whichever actually happened; a failed restart still counts as observing
+   the outcome.
+
+Call `rebuild_and_restart_exo` exactly once. Both values must come from the
+tool result and the event log, so do not invent or guess either one.</pre></figure>
+
+<figure class="prompt"><figcaption><strong>Self-evolution 04: timeout trajectory export</strong> <span class="src">eval/harbor/datasets/self-evolution-smoke-test/04-timeout-trajectory/instruction.md</span></figcaption><pre>This trial intentionally tests trajectory export when Harbor times out.
+
+Use the shell once to run exactly this foreground command, and wait for it to
+finish:
+
+```bash
+printf 'STARTED\n' &gt; /app/timeout-started.txt &amp;&amp; sleep 120 &amp;&amp; printf 'FINISHED\n' &gt; /app/timeout-finished.txt
+```
+
+Only after that command finishes, complete the trial normally. Do not shorten,
+background, interrupt, or otherwise avoid the sleep. Harbor will stop waiting
+after 30 seconds, so the trial is not expected to reach completion.</pre></figure>
+
+<figure class="prompt"><figcaption><strong>SWE-bench-lite task template</strong> <span class="src">eval/harbor/datasets/swebench-lite/task-template/instruction.md</span></figcaption><pre>The repository `{repo}` is checked out at `/testbed` at commit `{base_commit}`, with its development environment already installed. Below is a GitHub issue filed against it.
+
+Make the code changes in `/testbed` that resolve the issue. Hidden tests exercising the fix run after you finish, so a working change to the source is what counts, not an explanation or a workaround. You may write or run tests while working, but changes to test files are not required. The sandbox has no network access; work from the repository alone.
+
+&lt;issue&gt;
+{problem_statement}
+&lt;/issue&gt;</pre></figure>
+
+<p>The lifecycle smoke test is a single line, <span class="src">eval/harbor/datasets/smoke-test/lifecycle-smoke/instruction.md:1</span>: "Create `/app/done.txt` containing exactly `ready` followed by a newline."</p>
+
+<p><strong>Analysis.</strong> The 01/02 pair tests persistence across trials: 02 says "Do not reinstall, replace, or recreate it" and "The point of this trial is to demonstrate that the tool installed by the earlier trial is available in this fresh conversation and container." Both forbid the shell shortcut ("Do not implement the transformation with shell") so the tool's presence is observable in the trajectory. Task 03 gives a numbered protocol for an asynchronous event ("do not end your turn here", "re-check periodically instead of giving up") and insists values "come from the tool result and the event log, so do not invent or guess either one". Task 04 intentionally cannot succeed ("Harbor will stop waiting after 30 seconds") and says so, so the model does not try to be clever.</p>
+
+<div class="callout idea"><p class="callout-title">Idea worth stealing: tell the agent the test is a test when the point is the trajectory</p><p>Tasks 02 and 04 state their own purpose. The grader checks files, but the thing being evaluated is behavior (reuse, not reinstall; keep waiting, do not shorten the sleep), so the instruction removes ambiguity about intent rather than hiding it. The set's README states it "does not enforce the mechanism by which the agent accomplishes the smoke test" (<span class="src">eval/harbor/datasets/self-evolution-smoke-test/README.md:3</span>).</p></div>
+
+<h2 id="drift">Docs versus code</h2>
+
+<ul>
+<li><span class="src">examples/self-improving-agent/docs/prompts.md</span> is a good map of prompt surfaces, but its Exo harness list mentions a Fal image-generation developer message that <code>harness.ts</code> does not contain, and it describes the Responses runtime as sending both <code>system</code> and <code>developer</code> as provider <code>system</code>. The only place verified in this repo is the chat-completions converter (<span class="src">exoharness/typescript/model-runtime/responses.ts:728-731</span>).</li>
+<li><span class="src">docs/managed-adapters.md:290-305</span> documents Discord, WhatsApp and Signal adapters and their tool-based flows; the code has only <code>AdapterDefinition::Slack</code>. <code>me.md</code> carries the same stale text into the live prompt.</li>
+<li>The tutorial pages <span class="src">website/docs-src/tutorials/custom-coding-agent.md:170-179</span> and <span class="src">website/docs-src/tutorials/game-emulator-integration.md:236</span> quote the coding-agent prompt verbatim (matches the harness file) and elide the Game Boy prompt with "...game rules...".</li>
+<li><span class="src">examples/self-improving-agent/SELF.md:75-77</span> describes <code>manage_tool</code> paths as <code>/workspace/examples/self-improving-agent/.exo/tool-sources/&lt;name&gt;</code>, whereas the harness manual uses <code>${repoPath}/.exo/tool-sources/&lt;name&gt;</code> (<span class="src">examples/self-improving-agent/harness.ts:90</span>). The two read as the same convention after a path rewrite that doubled the directory.</li>
+</ul>
+
+</main>
+<aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/wiki.js"></script>
+</body>
+</html>

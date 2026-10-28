@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Examples &amp; custom harnesses · Exo internals</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav id="nav"></nav>
+<main>
+<header>
+  <div class="kicker">Applied</div>
+  <h1>Examples &amp; custom harnesses</h1>
+  <p class="lede">What you can build on Exo, shown through the in-repo examples: a minimal TypeScript harness in about 15 lines, a Game Boy agent, a self-rebuilding long-running assistant (memory, scheduler, guardian), a recursive-language-model harness, and the Harbor eval wrapper that drives all of it.</p>
+</header>
+
+<h2 id="map">The examples at a glance</h2>
+<p>Everything below sits on the same contract (see <a href="harnesses.html">harnesses.html</a> for the TypeScript harness API and <a href="tools-and-mcp.html">tools-and-mcp.html</a> for tools): a harness module exports <code>defineHarness({ runTurn })</code>; Exo's Rust side owns durable state (events, artifacts, sandboxes, secrets); your module owns prompt assembly, the tool registry, and when a turn ends. The examples differ only in how much of the loop they take over.</p>
+
+<table>
+<thead><tr><th>Example</th><th>Where</th><th>What it demonstrates</th></tr></thead>
+<tbody>
+<tr><td>basic / sysmon / coding-agent</td><td><span class="src">exoharness/examples/typescript/basic-harness.ts</span>, <span class="src">exoharness/examples/typescript/sysmon-harness.ts</span>, <span class="src">exoharness/examples/typescript/coding-agent-harness.ts</span></td><td>The two hooks (<code>instructions</code>, <code>registerTools</code>) over the stock loop; <code>defineTool</code>; artifact-backed state re-injected each round.</td></tr>
+<tr><td>rlm-harness</td><td><span class="src">exoharness/examples/typescript/rlm-harness.ts</span></td><td>A harness that replaces the loop entirely: the prompt lives in a JS REPL, the model recursively queries itself.</td></tr>
+<tr><td>Game Boy agent</td><td><span class="src">exoharness/examples/gameboy-agent</span></td><td>Sidecar pattern: external stateful system behind HTTP, fresh screenshot injected every round.</td></tr>
+<tr><td>Self-improving agent</td><td><span class="src">examples/self-improving-agent</span></td><td>A persistent assistant that edits, rebuilds and restarts itself; memory, todo, scheduler, guardian, web tools.</td></tr>
+<tr><td>Environments</td><td><span class="src">exoharness/examples/environments</span></td><td>Sandbox spec YAMLs for smolvm, firecracker and apple_container.</td></tr>
+<tr><td>Managed-agent definitions</td><td><span class="src">exoharness/examples/managed-agents</span>, <span class="src">examples/tutorial/1_ticket_triage/agent.md</span></td><td>Zero-code agents: a markdown file with YAML front matter (see <a href="managed-agents.html">managed-agents.html</a>).</td></tr>
+<tr><td>Tutorials</td><td><span class="src">website/docs-src/tutorials/index.md</span></td><td>Prose walkthroughs of the above; check them against the code (see the drift notes below).</td></tr>
+<tr><td>Harbor evals</td><td><span class="src">eval/harbor</span></td><td>Runs the self-improving harness as a Harbor external agent over benchmark datasets.</td></tr>
+</tbody>
+</table>
+
+<h2 id="minimal-harness">1. Writing a minimal harness</h2>
+
+<h3 id="basic">The smallest harness</h3>
+<p>The whole of <span class="src">exoharness/examples/typescript/basic-harness.ts:5-12</span> is a call into the stock loop. Everything interesting is in what <code>runResponsesHarnessTurn</code> does for you:</p>
+
+<figure class="code">
+<figcaption><strong>A complete harness</strong> <span class="src">exoharness/examples/typescript/basic-harness.ts:5-12</span></figcaption>
+<pre><code class="language-ts">const harness = defineHarness({
+  nativeToolApprovals: true,
+  tools: [],
+
+  async runTurn(context) {
+    await runResponsesHarnessTurn(context);
+  },
+});</code></pre>
+</figure>
+
+<p><code>nativeToolApprovals: true</code> declares that this harness routes every tool call through <code>authorizeTool</code>. When a harness does not set it to <code>true</code>, the runner calls <code>validateToolPolicies(..., false)</code> before the turn, which throws if the conversation uses the <code>always_ask</code> permission policy (<span class="src">exoharness/typescript/harness/runner.ts:302-310</span>, <span class="src">exoharness/typescript/harness/index.ts:450-467</span>). The Codex preset sets it to <code>false</code> (<span class="src">exoharness/typescript/codex/harness.ts:353</span>).</p>
+
+<h3 id="turn-loop">What the stock loop does each round</h3>
+<p><code>runResponsesHarnessTurn</code> (<span class="src">exoharness/typescript/model-runtime/turn-loop.ts:36-54</span>) resolves the model and credential, builds a Responses runtime, and runs <code>runResponsesTurnLoop</code>. The loop body is the thing to internalize, because both hooks are called <em>inside</em> it, once per model round:</p>
+
+<figure class="code">
+<figcaption><strong>Registry and instructions are rebuilt every round</strong> <span class="src">exoharness/typescript/model-runtime/turn-loop.ts:113-156</span></figcaption>
+<pre><code class="language-ts">  for (let round = 0; ; round += 1) {
+    if (
+      maxToolRoundTrips !== null &&
+      maxToolRoundTrips !== undefined &&
+      round &gt; maxToolRoundTrips
+    ) {
+      return latestEventId;
+    }
+
+    const tools = options.registerTools
+      ? createToolRegistry(context)
+      : await createDefaultToolRegistry(context);
+    if (options.registerTools) {
+      await options.registerTools(tools, context);
+    }
+    // ... context.tools (runtime-provided tools) are registered here too ...
+    const definitions = tools.definitions();
+    validateToolPolicies(
+      context,
+      definitions.map((tool) =&gt; tool.name),
+    );
+    const messages = await materializePromptMessages(
+      conversation,
+      options.instructions
+        ? await options.instructions(context)
+        : basicHarnessInstructions(context),
+    );</code></pre>
+</figure>
+
+<p>After the model call it appends the response events, and if there are tool calls it executes them through <code>tools.executePending</code> inside <code>runtime.traceToolCall</code> and loops (<span class="src">exoharness/typescript/model-runtime/turn-loop.ts:186-207</span>). Three consequences that every example below exploits:</p>
+<ul>
+<li><strong>Dynamic tools for free.</strong> Because the registry is rebuilt per round, a tool installed by <code>manage_tool</code> in round N is callable in round N+1 of the same turn (<span class="src">exoharness/typescript/harness/tool-modules.ts:114</span> reads the installed-tools registry on every build).</li>
+<li><strong>State injection for free.</strong> Because <code>instructions</code> is re-run per round, anything you read from artifacts (todo list, memory, a screenshot) is always current and never piles up in history.</li>
+<li><strong>Tool names are unique.</strong> <code>HarnessToolRegistry.register</code> throws <code>tool is already registered: &lt;name&gt;</code> on a duplicate (<span class="src">exoharness/typescript/harness/tools.ts:63</span>).</li>
+</ul>
+
+<div class="callout surprise">
+<p class="callout-title">Surprise: budget exhaustion is silent here, loud elsewhere</p>
+<p>The stock loop <em>returns quietly</em> when <code>round &gt; maxToolRoundTrips</code> (<span class="src">exoharness/typescript/model-runtime/turn-loop.ts:114-120</span>), ending the turn with whatever was last written. The RLM harness uses <code>assertRoundBudget</code>, which <em>throws</em> <code>"&lt;label&gt; exceeded the configured round budget"</code> (<span class="src">exoharness/typescript/harness/index.ts:482-496</span>), and so does the Rust RLM executor (<span class="src">crates/executor/src/native/rlm.rs:84-89</span>). Same knob, two failure semantics.</p>
+</div>
+
+<h3 id="sysmon">Hook 1 and 2: sysmon-harness</h3>
+<p><span class="src">exoharness/examples/typescript/sysmon-harness.ts</span> is the tutorial's "custom harness". It registers the built-in <code>shell</code> plus one <code>defineTool</code> tool, and its <code>instructions</code> hook appends live host memory utilization measured fresh each round (<span class="src">exoharness/examples/typescript/sysmon-harness.ts:61-75</span>). A tool is a plain object with four parts: a <code>definition</code> (name, description, strict JSON schema), <code>initializationParameters</code> (schema for config bound at load time), and <code>initialize()</code> returning a handler with <code>execute(args, execution)</code> (<span class="src">exoharness/typescript/harness/tools.ts:41-53</span>). The same shape is used by file-based tool modules with a manifest, e.g. <span class="src">exoharness/examples/typescript/tools/uppercase.ts</span> plus <span class="src">exoharness/examples/typescript/tools/uppercase.manifest.json</span> (initialization values supplied by the manifest), and the unreferenced demo <span class="src">exoharness/examples/typescript/tools/irc.ts</span> that shows a networked integration with typed config.</p>
+
+<h3 id="coding-agent">Stateful tools: coding-agent-harness</h3>
+<p><span class="src">exoharness/examples/typescript/coding-agent-harness.ts</span> is the pattern behind the self-improving agent's memory and todo tools, in miniature: a tool writes state to a conversation artifact, and the <code>instructions</code> hook reads it back on every round.</p>
+
+<figure class="code">
+<figcaption><strong>Write state in a tool, re-surface it in instructions</strong> <span class="src">exoharness/examples/typescript/coding-agent-harness.ts:49-57</span>, <span class="src">exoharness/examples/typescript/coding-agent-harness.ts:98-109</span>, <span class="src">exoharness/examples/typescript/coding-agent-harness.ts:115-123</span>, <span class="src">exoharness/examples/typescript/coding-agent-harness.ts:154-163</span></figcaption>
+<pre><code class="language-ts">async function writeTodos(
+  conversation: Conversation,
+  todos: Todo[],
+): Promise&lt;void&gt; {
+  await conversation.writeArtifactJson({
+    path: TODO_ARTIFACT_PATH,
+    value: todos as unknown as JsonValue,
+  });
+}
+
+// inside defineTool({ ... initialize() { return { async execute(args, execution) {
+        const todos = (args.todos ?? []) as unknown as Todo[];
+        await writeTodos(
+          execution.context.exoharness.current.conversation,
+          todos,
+        );
+// ... } } } })
+
+async function registerCodingTools(
+  tools: HarnessToolRegistry,
+  context: TurnContext,
+): Promise&lt;void&gt; {
+  // shell is the coding workhorse: it reads (cat), searches (grep), edits
+  // (sed), builds, and runs — all inside the conversation's sandbox.
+  registerBuiltInTools(tools, context, ["shell"]);
+  await registerLibraryTools(tools, context, todoTool);
+}
+
+// in codingInstructions(): re-surface the live task list every round
+  const todos = await readTodos(conversation);
+  if (todos.length &gt; 0) {
+    const rendered = todos
+      .map((todo) =&gt; `- [${todo.status}] ${todo.content}`)
+      .join("\n");
+    messages.push({
+      role: "developer",
+      content: `Your current task list (from todowrite):\n${rendered}`,
+    });
+  }</code></pre>
+</figure>
+
+<p>Artifacts are versioned and append-only: <code>readTodos</code> lists every version and picks the highest (<span class="src">exoharness/examples/typescript/coding-agent-harness.ts:36-47</span>). The tutorial text (<span class="src">website/docs-src/tutorials/custom-coding-agent.md</span>) mirrors this code closely; two small drifts: the tutorial's final <code>defineHarness</code> omits <code>nativeToolApprovals: true</code> that the real file sets (code copied from the tutorial would therefore be rejected under <code>always_ask</code>) (<span class="src">exoharness/examples/typescript/coding-agent-harness.ts:168-170</span>), and the file's <code>readTodos</code> has no <code>version</code> argument whereas the self-improving agent's equivalents pass one.</p>
+
+<h3 id="gameboy">Sidecar pattern: the Game Boy agent</h3>
+<p>The Game Boy example (<span class="src">exoharness/examples/gameboy-agent/README.md</span>, walkthrough in <span class="src">website/docs-src/tutorials/game-emulator-integration.md</span>) wires an agent to an external stateful system in four parts: a headless PyBoy emulator behind HTTP (<span class="src">exoharness/examples/gameboy-agent/emulator/server.py:3-19</span>: <code>/frame</code>, <code>/press</code>, <code>/tick</code>, <code>/checkpoint/save|load</code>, <code>/view</code>), a typed client, five tools (<code>press_buttons</code>, <code>wait</code>, <code>save_checkpoint</code>, <code>load_checkpoint</code>, <code>list_checkpoints</code>; <span class="src">exoharness/examples/gameboy-agent/agent/game-tools.ts:14-175</span>), and a harness. The game only advances when asked (<code>PyBoy(..., window="null")</code>, ticked by the request handlers; <span class="src">exoharness/examples/gameboy-agent/emulator/server.py:89-106</span>), so the world is turn-based and deterministic between tool calls.</p>
+
+<figure class="code">
+<figcaption><strong>A multimodal observation re-injected every round, so frames never accumulate in history</strong> <span class="src">exoharness/examples/gameboy-agent/agent/harness.ts:82-114</span></figcaption>
+<pre><code class="language-ts">async function gameboyInstructions(context: TurnContext): Promise&lt;Message[]&gt; {
+  const frame = await emulator.frame();
+  round += 1;
+  void emulator.setStatus(`model round ${round}`).catch(() =&gt; {});
+  return [
+    ...basicHarnessInstructions(context),
+    { role: "developer", content: SYSTEM_PROMPT },
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: `Current Game Boy screen (refreshed for this model round):\n${describeState(frame.state)}`,
+        },
+        {
+          type: "image",
+          image: frame.screenshot_b64,
+          media_type: "image/png",
+        },
+      ],
+    },
+  ];
+}
+
+export default defineHarness({
+  nativeToolApprovals: true,
+  async runTurn(context) {
+    await runResponsesHarnessTurn(context, {
+      instructions: gameboyInstructions,
+      registerTools: registerGameboyTools,
+    });
+  },
+});</code></pre>
+</figure>
+
+<div class="callout idea">
+<p class="callout-title">Idea worth stealing: observation in instructions, results in tools</p>
+<p>Tool results return only text (RAM-decoded state); the screenshot comes from the <code>instructions</code> hook (<span class="src">exoharness/examples/gameboy-agent/agent/game-tools.ts:1-3</span>). That keeps the durable event log free of stale images while the model always acts on the current frame. Prompt text for this agent is covered in <a href="prompts.html">prompts.html</a>; the interesting content there is that the RAM block is declared ground truth but meaningless during the intro (<span class="src">exoharness/examples/gameboy-agent/agent/harness.ts:45-52</span>).</p>
+</div>
+
+<p>The agent definition is a markdown file with front matter (<span class="src">exoharness/examples/gameboy-agent/agent.md:1-8</span>): <code>harness: ./agent/harness.ts</code> selects the TypeScript module, <code>max_tool_round_trips: 20</code> bounds each turn, and each <code>exo thread send</code> is one turn. The tutorial's closing note says the evaluation this was extracted from added a self-rewritten playbook, memory files and an <code>install_tool</code> meta-tool, and the agent authored 14 tools and 2 skills (<span class="src">website/docs-src/tutorials/game-emulator-integration.md:367-375</span>); that machinery is not in the repo example, but the self-improving agent below is the in-repo analogue.</p>
+
+<h2 id="self-improving">2. The self-improving agent</h2>
+<p><span class="src">examples/self-improving-agent/README.md</span> describes "a persistent agent ... helpful wherever there is a task to do from a computer". Architecturally it is a TypeScript harness (<span class="src">examples/self-improving-agent/harness.ts</span>, 144 lines), a set of tools, one Rust crate (the scheduler runner), and a pair of bash supervisors. The design argument is in <span class="src">examples/self-improving-agent/docs/RSI.md</span>: recursion needs runtime support (state carried forward safely), which Exo provides as an append-only event log, lineage across clones, sandbox snapshots/rewind, and an exoharness core the agent cannot modify under default policy.</p>
+
+<pre class="diagram">
+  user / Slack / scheduler wakeups
+              |
+              v
+   exo run  (REPL, or --serve --adapters-only)       host
+   +---------------------------------------------+
+   | harness.ts  (TS, per-round hooks)           |   reads artifacts: memory, todos, skills
+   |   instructions: identity + memory + todos   |
+   |   tools: profile (bootstrap | practical)    |
+   +----------+-------------------+--------------+
+              | executeTool()     | spawn detached
+              v                   v
+   Rust ExoToolRuntime     deferred-rebuild-and-restart
+   (harness_tool.rs)             |  sleep 2; exo-service-guardian restart-all --build
+   shell, scheduler_*,           v
+   snapshot/rewind,        cargo build -> drain scheduler -> SIGTERM adapters -> start
+   list_conversation_events      |
+              ^                  v
+              |            exo thread complete-rebuild-update
+   exo-scheduler-runner          -> .exo/guardian-updates/ID.json + conversation event
+   (polls .exo/scheduled-tasks, runs commands in sandbox, wakes conversation)
+
+   sandbox (Docker): repo mounted at /workspace/exo, SELF.md is the self-map
+</pre>
+
+<h3 id="sia-harness">Harness assembly and profiles</h3>
+<p><code>harness.ts</code> exports the default harness <em>and</em> its two hooks (<code>registerExoTools</code>, <code>exoInstructions</code>) so other harnesses can compose on top of it, as the comment says (<span class="src">examples/self-improving-agent/harness.ts:30-55</span>). The Harbor eval does exactly this reuse by pointing at it (<span class="src">eval/harbor/src/exo_harbor/conventions.py:4</span>).</p>
+
+<figure class="code">
+<figcaption><strong>Tool registration = built-ins + profile + configured library modules + installed tools</strong> <span class="src">examples/self-improving-agent/harness.ts:43-55</span></figcaption>
+<pre><code class="language-ts">export async function registerExoTools(
+  tools: HarnessToolRegistry,
+  context: TurnContext,
+): Promise&lt;void&gt; {
+  const profile = resolveExoProfile();
+  registerBuiltInTools(tools, context, profile.builtInToolNames(context));
+  await profile.registerTools(tools, context);
+  for (const modulePath of context.agentConfig.typescript?.toolModulePaths ??
+    []) {
+    await registerLibraryToolModulePath(tools, context, modulePath);
+  }
+  await registerConfiguredAgentTools(tools, context);
+}</code></pre>
+</figure>
+
+<p>Prompt assembly (<span class="src">examples/self-improving-agent/harness.ts:57-135</span>) is a list of developer messages: <code>basicHarnessInstructions</code>, the identity prompt <span class="src">examples/self-improving-agent/prompts/me.md</span>, the agent's display name, a capability overview, the self-map pointer, an optional local profile (<span class="src">examples/self-improving-agent/harness.ts:137-144</span>, default <code>.exo/exo-profile.md</code>, git-ignored), then three dynamic blocks appended last: <code>memoryInstruction</code>, <code>todoInstruction</code>, <code>skillsInstruction</code>. The prompt wording itself is in <a href="prompts.html">prompts.html</a>.</p>
+
+<table>
+<thead><tr><th>Profile</th><th>Built-in tools</th><th>Library tools</th><th>Source</th></tr></thead>
+<tbody>
+<tr><td><code>bootstrap</code></td><td><code>shell</code>, <code>inspect_tools</code>, <code>manage_tool</code></td><td>none; plus <code>rebuild_and_restart_exo</code></td><td><span class="src">examples/self-improving-agent/profiles/bootstrap.ts:5-13</span></td></tr>
+<tr><td><code>practical</code> (default)</td><td>same, plus <code>install_agent_tool</code>/<code>uninstall_agent_tool</code> only if <code>enableAgentToolCreation</code></td><td>scheduler (4), introspection (1), sandbox (4), memory (2), todo (1), skills (5), web (2)</td><td><span class="src">examples/self-improving-agent/profiles/practical.ts:25-38</span></td></tr>
+</tbody>
+</table>
+
+<p>Profile choice is <code>EXO_PROFILE</code> (<span class="src">examples/self-improving-agent/profiles/index.ts:10-18</span>; exo.sh defaults it to <code>practical</code>, <span class="src">examples/self-improving-agent/exo.sh:46</span>); an unknown name throws. The test <span class="src">examples/self-improving-agent/profiles/profiles.test.ts:11-30</span> pins "bootstrap has exactly the recovery capabilities". Note the practical profile builds a throwaway <code>HarnessToolRegistry</code> and re-registers each tool with <code>source: "library"</code> (<span class="src">examples/self-improving-agent/profiles/practical.ts:26-36</span>), but registers the guardian tool directly so it stays <code>built_in</code>; the test asserts this classification.</p>
+
+<div class="callout surprise">
+<p class="callout-title">Surprise: the "bootstrap" recovery profile does not isolate import-time breakage</p>
+<p>Profiles are chosen at runtime, but <span class="src">examples/self-improving-agent/profiles/index.ts:1-2</span> statically imports both profile modules, and <span class="src">examples/self-improving-agent/harness.ts:13-15</span> statically imports <code>memory-tools</code> and <code>todo-tools</code>. A syntax error the agent introduces in <em>any</em> of those files would fail module load regardless of <code>EXO_PROFILE</code>. Bootstrap protects against a bad tool <em>set</em>, not a bad tool <em>file</em>. This is my reading of the import graph, not something the docs claim.</p>
+</div>
+
+<h3 id="host-tools">The two-layer tool model: TS definition, Rust execution</h3>
+<p>The model only sees what the TypeScript registry registers; execution can stay in TypeScript or be delegated to Rust. <code>hostTool</code> is the bridge: its handler just forwards to <code>execution.context.executeTool({ functionName, arguments })</code> (<span class="src">examples/self-improving-agent/tools/host-tools.ts:23-37</span>), which lands in the match in <code>ExoToolRuntime::execute</code> (<span class="src">crates/executor/src/native/harness_tool.rs:113-194</span>): <code>shell</code>, the four scheduler tools, <code>list_conversation_events</code>, <code>get_sandbox_status</code>, <code>list_sandbox_snapshots</code>, <code>snapshot_sandbox</code>, <code>rewind_sandbox</code>; anything else errors with <code>tool execution is not configured for {other}</code>. A Rust arm without a TS definition is therefore unreachable, and <code>SELF.md</code> says so (<span class="src">examples/self-improving-agent/SELF.md:81-97</span>). The sandbox tools (<span class="src">examples/self-improving-agent/tools/sandbox-tools.ts</span>) and <code>list_conversation_events</code> (<span class="src">examples/self-improving-agent/tools/introspection-tools.ts</span>) are pure definitions; the logic is Rust. See <a href="sandboxes.html">sandboxes.html</a> for what snapshot/rewind do underneath.</p>
+
+<div class="callout warn">
+<p class="callout-title">Doc vs code: "ambiguous" is actually "the installed tool loses"</p>
+<p>SELF.md rule 4 says an agent-installed tool with the same name as a Rust-backed one makes "calls ambiguous" (<span class="src">examples/self-improving-agent/SELF.md:96-97</span>). In code, <code>register</code> throws <code>tool is already registered</code> (<span class="src">exoharness/typescript/harness/tools.ts:63</span>). Installed tools are registered last (<span class="src">examples/self-improving-agent/harness.ts:49-54</span>) inside a try/catch that logs <code>skipping broken installed tool</code> and moves on (<span class="src">exoharness/typescript/harness/tool-modules.ts:114-131</span>), so a colliding installed tool is dropped, not ambiguous. Install-time collision checking is also documented (<span class="src">examples/self-improving-agent/docs/tools-and-adapters.md:40-49</span>).</p>
+</div>
+
+<h3 id="memory">Memory design</h3>
+<p><span class="src">examples/self-improving-agent/tools/memory-tools.ts</span> is a deliberately tiny memory: one JSON artifact <code>memory/exo-memory.json</code> on the <em>agent</em> handle (so it spans every conversation), entries <code>{id, text, createdAt}</code>, capped at 200 entries and 600 characters each (<span class="src">examples/self-improving-agent/tools/memory-tools.ts:19-22</span>). Two tools, <code>remember(text)</code> and <code>forget(id)</code>; the whole store is injected back as a developer message on every round, with ids visible so the model can <code>forget</code> them. <span class="src">examples/self-improving-agent/docs/SELF-CONTROL.md:83-93</span> states the choice outright: no embeddings or retrieval, because for short facts "always injecting the whole store is simpler and easier to audit"; the storage layer could stay if the read path later moves to query-time recall.</p>
+
+<figure class="code">
+<figcaption><strong>Write path: validate, append, drop oldest past the cap</strong> <span class="src">examples/self-improving-agent/tools/memory-tools.ts:108-134</span></figcaption>
+<pre><code class="language-ts">      async execute(args: JsonObject, execution): Promise&lt;ToolResult&gt; {
+        const text = typeof args.text === "string" ? args.text.trim() : "";
+        if (text.length === 0) {
+          return { ok: false, error: "text is required" };
+        }
+        if (text.length &gt; MAX_TEXT_CHARS) {
+          return {
+            ok: false,
+            error: `text exceeds ${MAX_TEXT_CHARS} characters; summarize it first`,
+          };
+        }
+        const handle = memoryHandle(execution.context);
+        const store = await readMemory(handle);
+        const entry: MemoryEntry = {
+          id: `mem_${randomUUID().slice(0, 8)}`,
+          text,
+          createdAt: new Date().toISOString(),
+        };
+        store.entries.push(entry);
+        let dropped = 0;
+        if (store.entries.length &gt; MAX_ENTRIES) {
+          dropped = store.entries.length - MAX_ENTRIES;
+          store.entries = store.entries.slice(-MAX_ENTRIES);
+        }
+        await writeMemory(handle, store);
+        return { ok: true, id: entry.id, total: store.entries.length, dropped };
+      },</code></pre>
+</figure>
+
+<figure class="code">
+<figcaption><strong>Read path degrades, write path refuses</strong> <span class="src">examples/self-improving-agent/tools/memory-tools.ts:190-218</span></figcaption>
+<pre><code class="language-ts">export async function memoryInstruction(
+  context: TurnContext,
+): Promise&lt;Message | null&gt; {
+  let store: MemoryStore;
+  try {
+    store = await readMemory(memoryHandle(context));
+  } catch (error) {
+    // Prompt assembly runs every model round, so a corrupt store must not brick
+    // the agent in every conversation. Degrade the read: log loudly and tell the
+    // model memory is unavailable rather than silently pretending it is empty.
+    // The write path (remember/forget) still throws, so nothing overwrites the
+    // corrupt artifact while it is broken.
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(`memory unavailable during prompt assembly: ${detail}`);
+    return {
+      role: "developer",
+      content:
+        "Your durable memory could not be read this turn (the stored memory artifact appears corrupt). Do not assume it is empty; if the user asks about saved facts, tell them memory is temporarily unavailable.",
+    };
+  }
+  if (store.entries.length === 0) {
+    return null;
+  }
+  const lines = store.entries.map((entry) =&gt; `- [${entry.id}] ${entry.text}`);
+  return {
+    role: "developer",
+    content: `Durable memory you saved earlier with the remember tool. Treat these as authoritative context. Add new facts with remember and drop stale ones with forget(id).\n\n${lines.join("\n")}`,
+  };
+}</code></pre>
+</figure>
+
+<p>Related stores: <code>todowrite</code> (<span class="src">examples/self-improving-agent/tools/todo-tools.ts</span>) is the same pattern but <em>conversation</em>-scoped and tolerant (a corrupt list is treated as empty, because it is "fully regenerable", <span class="src">examples/self-improving-agent/tools/todo-tools.ts:60-66</span>), and only injected while at least one item is pending or in progress (<span class="src">examples/self-improving-agent/tools/todo-tools.ts:161-176</span>). Skills (<code>install_skill</code>, <code>use_skill</code>, ...) store names and descriptions in agent artifacts and inject only the names each turn, loading bodies on demand (<span class="src">examples/self-improving-agent/README.md:168-182</span>; design in <span class="src">exoharness/docs/design/skills.md</span>).</p>
+
+<div class="callout idea">
+<p class="callout-title">Idea worth stealing: choose the failure mode per store by regenerability</p>
+<p>Memory (not regenerable) fails closed on writes and loud-but-alive on reads; todos (regenerable) silently reset. Both avoid the worst case, a corrupt artifact that bricks prompt assembly "in every conversation" (<span class="src">examples/self-improving-agent/tools/memory-tools.ts:197-202</span>).</p>
+</div>
+
+<div class="callout warn">
+<p class="callout-title">Known limitation: read-modify-write without compare-and-swap</p>
+<p>Agent-scoped memory is shared across concurrently running conversations, and <code>remember</code>/<code>forget</code> read the latest version then write a whole new one; the code carries a <code>TODO(storage-rework)</code> admitting a lost update is possible (<span class="src">examples/self-improving-agent/tools/memory-tools.ts:71-76</span>). Each write also adds a new artifact version and the read path lists all artifact versions then filters client-side (<span class="src">examples/self-improving-agent/tools/memory-tools.ts:220-245</span>), on every model round.</p>
+</div>
+
+<h3 id="scheduler">The scheduler</h3>
+<p>Scheduling is two halves. The model-facing half is four tool definitions that delegate to Rust (<span class="src">examples/self-improving-agent/tools/scheduler-tools.ts:39-219</span>): <code>schedule_sandbox_task</code> (name, <code>@every 10m</code> / <code>*/N * * * *</code> / <code>@at &lt;rfc3339&gt;</code>, <code>missed</code> policy, argv command, <code>sandboxMode</code>, optional <code>setupCommand</code>, <code>reportPrompt</code>, <code>maxOutputBytes</code>), <code>list_scheduled_tasks</code>, <code>cancel_scheduled_task</code> (disable, keep history) and <code>delete_scheduled_task</code>. The host half is the <code>exo-scheduler-runner</code> binary, an "example-local" crate (<span class="src">examples/self-improving-agent/scheduler-runner/src/main.rs:16-18</span>) that builds a full <code>Runtime</code> with <code>LocalProvider::typescript</code> (<span class="src">examples/self-improving-agent/scheduler-runner/src/main.rs:170-196</span>) and loops over <code>run_due_tasks</code>; the logic lives in <code>crates/executor</code>.</p>
+
+<figure class="code">
+<figcaption><strong>Runner main loop: single-instance lock, settle old wakeups, poll, honour drain marker</strong> <span class="src">examples/self-improving-agent/scheduler-runner/src/main.rs:66-97</span></figcaption>
+<pre><code class="language-rust">            let _lock = SchedulerRunnerLock::acquire(&amp;cli.root)?;
+            let store = SchedulerStore::new(cli.root.join("scheduled-tasks"));
+            // A previous runner may have died between finishing a task and
+            // waking its conversation. Settle that before taking new work.
+            let redelivered = redeliver_pending_wakes(Arc::clone(&amp;harness), &amp;store).await?;
+            // ...
+            loop {
+                let runs =
+                    run_due_tasks(Arc::clone(&amp;harness), &amp;store, SchedulerRunOptions { limit })
+                        .await?;
+                // ... print one line per run ...
+                if !watch {
+                    break;
+                }
+                if claim_restart_marker(&amp;cli.root) {
+                    println!("restart marker claimed; exiting so the guardian can restart us");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(interval_seconds)).await;
+            }</code></pre>
+</figure>
+
+<p>Semantics worth knowing, all in the executor:</p>
+<ul>
+<li><strong>Leases.</strong> <code>claim_due_tasks</code> stamps a lease (<code>DEFAULT_TASK_LEASE_MS</code> = 10 min) on up to <code>limit</code> due tasks, so a second runner or a crashed one does not double-fire until it expires (<span class="src">crates/executor/src/native/scheduler_store.rs:89-105</span>, <span class="src">crates/executor/src/native/scheduler_types.rs:10</span>). The runner also takes a pid lockfile <code>exo-scheduler.lock</code> and reclaims it if the recorded pid is dead (<span class="src">examples/self-improving-agent/scheduler-runner/src/main.rs:105-138</span>).</li>
+<li><strong>Missed fires.</strong> <code>MissedPolicy</code> is <code>Skip</code> | <code>Once</code> (default) | <code>All</code> (capped at <code>MAX_MISSED_FIRE_CATCHUP</code> = 100), consulted only when more than one slot behind; fires land on the schedule's grid, not on last-finish time (<span class="src">crates/executor/src/native/scheduler_types.rs:72-90</span>).</li>
+<li><strong>Sandbox modes.</strong> <code>agent</code> (default, shared sticky sandbox), <code>conversation</code>, <code>task_fresh</code> (<span class="src">crates/executor/src/native/scheduler_types.rs:131-138</span>).</li>
+<li><strong>Result delivery is write-ahead.</strong> After a run, the output goes to a conversation artifact <code>scheduled-tasks/&lt;name&gt;/&lt;run&gt;.json</code>, then a pending-fire record is stored <em>before</em> the wakeup is sent, then marked delivered. On startup <code>redeliver_pending_wakes</code> replays unconfirmed ones; delivery is at-least-once, bounded to one repeat by the <code>(task, slot)</code> key (<span class="src">crates/executor/src/native/scheduler_runtime.rs:62-102</span>, <span class="src">crates/executor/src/native/scheduler_runtime.rs:338-358</span>).</li>
+<li><strong>Orphans.</strong> If the owning agent or conversation no longer exists, the task disables itself (<span class="src">crates/executor/src/native/scheduler_runtime.rs:176-181</span>).</li>
+</ul>
+
+<div class="callout idea">
+<p class="callout-title">Idea worth stealing: record the wakeup before you send it</p>
+<p>The in-code comment explains why: the wakeup "is the only thing that tells the conversation this run happened, and nothing retries a machine-sent event" (<span class="src">crates/executor/src/native/scheduler_runtime.rs:338-343</span>). A tiny outbox (<code>put_pending_fire</code> then <code>mark_fire_delivered</code>) turns a silent-loss crash window into a replay.</p>
+</div>
+
+<h3 id="guardian">The guardian and the rebuild/restart dance</h3>
+<p>The agent cannot restart host services from inside its sandbox, and should not kill its own process mid-turn. The solution is a facade tool plus a detached helper:</p>
+
+<ol class="steps">
+<li><strong>Model calls <code>rebuild_and_restart_exo({reason})</code></strong> (<span class="src">examples/self-improving-agent/tools/guardian-tools.ts:47-75</span>). The tool is "narrow": one fixed operation, the reason is the only argument.</li>
+<li><strong>Durable "queued" record first.</strong> <code>queueRebuildAndRestart</code> mints a UUID <code>updateId</code> and writes <code>.exo/guardian-updates/&lt;id&gt;.json</code> (status <code>queued</code>, agent and conversation ids and slugs) via tmp-file plus <code>renameSync</code> (<span class="src">examples/self-improving-agent/tools/guardian-tools.ts:88-127</span>, <span class="src">examples/self-improving-agent/tools/guardian-tools.ts:169-173</span>).</li>
+<li><strong>Spawn and return.</strong> It spawns <code>scripts/deferred-rebuild-and-restart</code> with <code>detached: true</code>, logs to <code>.exo/exo-service-guardian-actions.log</code>, and <code>unref()</code>s, then returns <code>{status: "queued", deferred: true, updateId, pid, outcomePath, ...}</code> immediately (<span class="src">examples/self-improving-agent/tools/guardian-tools.ts:129-167</span>).</li>
+<li><strong>Let the turn finish.</strong> The script <code>sleep</code>s <code>DEFERRED_RESTART_DELAY_SECONDS</code> = 2 s (<span class="src">examples/self-improving-agent/scripts/deferred-rebuild-and-restart:37</span>), then runs <code>exo-service-guardian restart-all --build</code>.</li>
+<li><strong>Build, then stop, then start.</strong> <code>build_all</code> runs <code>cargo build -p exo</code> and the scheduler-runner manifest, then writes <code>.exo/exo-control.restart</code> (<span class="src">examples/self-improving-agent/scripts/exo-service-guardian:109-124</span>). <code>restart_services</code> drains the scheduler, SIGTERMs the adapter runner, and relaunches both with <code>nohup</code> (<span class="src">examples/self-improving-agent/scripts/exo-service-guardian:221-257</span>, <span class="src">examples/self-improving-agent/scripts/exo-service-guardian:343-367</span>).</li>
+<li><strong>Record the outcome with the new binary.</strong> The script maps the guardian exit code to <code>succeeded</code>/<code>failed</code> and calls <code>exo thread complete-rebuild-update</code> using the freshly built <code>target/debug/exo</code> (<span class="src">examples/self-improving-agent/scripts/deferred-rebuild-and-restart:38-73</span>). The CLI finalizes the outcome file first, then appends a <code>rebuild_and_restart_exo</code> custom event to the requesting conversation (<span class="src">crates/cli/src/main.rs:1921-1963</span>, <span class="src">crates/executor/src/native/conversation_events.rs:69-120</span>).</li>
+<li><strong>The agent finds out by looking.</strong> <code>list_conversation_events</code> includes that event kind in its default set (<span class="src">crates/executor/src/native/conversation_events.rs:27-43</span>). In the path I read, nothing wakes the conversation; the model has to ask.</li>
+</ol>
+
+<figure class="code">
+<figcaption><strong>The deferred runner: queue, wait, run guardian, finalize with the new binary</strong> <span class="src">examples/self-improving-agent/scripts/deferred-rebuild-and-restart:37-77</span></figcaption>
+<pre><code class="language-sh">sleep "$delay"
+set +e
+"$@"
+code=$?
+completed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [ "$code" -eq 0 ]; then
+  status=succeeded
+else
+  status=failed
+fi
+
+if [ ! -x "$exo_bin" ]; then
+  printf '[%s] rebuild update %s: exo binary missing at %s; writing outcome without event log\n' \
+    "$completed_at" "$update_id" "$exo_bin"
+  node -e '
+const fs = require("node:fs");
+// ... patch status/exitCode/completedAt into the JSON record ...
+' "$record" "$status" "$code" "$completed_at"
+  exit "$code"
+fi
+
+set +e
+exo_args=(--root "$exo_root")
+if [[ -f "$env_file" ]]; then
+  exo_args+=(--env-file "$env_file")
+fi
+"$exo_bin" thread "${exo_args[@]}" complete-rebuild-update \
+  --outcome "$record" \
+  --status "$status" \
+  --exit-code "$code" \
+  --completed-at "$completed_at"</code></pre>
+</figure>
+
+<div class="callout idea">
+<p class="callout-title">Idea worth stealing: a failed build leaves the old system running</p>
+<p>The guardian runs under <code>set -euo pipefail</code> (<span class="src">examples/self-improving-agent/scripts/exo-service-guardian:2</span>), and <code>restart-all</code> calls <code>build_all</code> before <code>restart_services</code> (<span class="src">examples/self-improving-agent/scripts/exo-service-guardian:500-505</span>). A compile error therefore aborts before anything is stopped, and the deferred script records <code>status: failed</code> with the exit code. The agent breaks its code, the old build keeps serving, and the failure is a durable event it can read next turn.</p>
+</div>
+
+<h4 id="drain">Graceful drain by marker file</h4>
+<p>Stopping the scheduler is a protocol, not a signal. The guardian creates <code>.exo/exo-scheduler.restart</code>, waits up to <code>DRAIN_CLAIM_SECONDS</code> (15) for the runner to <em>claim</em> it by deleting it (which it does between passes, after finishing in-flight tasks), then waits up to <code>DRAIN_GRACE_SECONDS</code> (300) for exit. An unclaimed marker (old build, wedged runner) or an overrun falls back to killing the process tree. Adapters get SIGTERM and the same 300 s wait; their durable inbox/outbox covers recovery (<span class="src">examples/self-improving-agent/SELF.md:125-129</span>).</p>
+
+<figure class="code">
+<figcaption><strong>Claim-then-drain, with a kill fallback</strong> <span class="src">examples/self-improving-agent/scripts/exo-service-guardian:277-316</span></figcaption>
+<pre><code class="language-sh">drain_pid_file() {
+  # ... pid/running checks ...
+  echo "Requesting graceful $label drain..."
+  : &gt;"$marker"
+  waited=0
+  while [[ -f "$marker" &amp;&amp; "$waited" -lt "$DRAIN_CLAIM_SECONDS" ]]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if [[ -f "$marker" ]]; then
+    rm -f "$marker"
+    echo "$label did not claim the drain request; stopping process tree..."
+    terminate_process_tree "$pid"
+  else
+    waited=0
+    while process_running "$pid" &amp;&amp; [[ "$waited" -lt "$DRAIN_GRACE_SECONDS" ]]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    # ... still running after grace: terminate_process_tree, else "drained and exited cleanly" ...
+  fi
+  rm -f "$pid_file"
+}</code></pre>
+</figure>
+
+<p>The runner side is four lines: <code>claim_restart_marker</code> is <code>fs::remove_file(...).is_ok()</code>, so removal is the claim (<span class="src">examples/self-improving-agent/scheduler-runner/src/main.rs:155-157</span>); atomic unlink means exactly one claimant. The interactive REPL has its own marker: with <code>exo.sh --control</code>, a loop restarts only the child <code>exo run</code> when <code>.exo/exo-control.restart</code> appears, keeping the terminal open (<span class="src">examples/self-improving-agent/exo.sh:788-844</span>).</p>
+
+<div class="callout warn">
+<p class="callout-title">Doc vs code: "validate" is just <code>cargo build</code></p>
+<p>The tool description, <code>me.md</code> and SELF-CONTROL all say the tool will "validate and rebuild" (<span class="src">examples/self-improving-agent/tools/guardian-tools.ts:53</span>, <span class="src">examples/self-improving-agent/prompts/me.md:22</span>). The only command run is <code>restart-all --build</code> (<span class="src">examples/self-improving-agent/tools/guardian-tools.ts:108</span>): two <code>cargo build</code>s. No TypeScript type-check, no tests. A broken <code>harness.ts</code> will not fail the rebuild; it fails on the next turn. SELF-CONTROL.md section 8 itself notes that a canary path ("run the changed build against a cloned sandbox") is future work (<span class="src">examples/self-improving-agent/docs/SELF-CONTROL.md:189</span>). Also: a drain grace of 300 s is shorter than the default per-command timeout of 10 min (<span class="src">crates/executor/src/native/scheduler_types.rs:11</span>), so a long task running at restart time can be killed.</p>
+</div>
+
+<h3 id="safety">What makes the loop "somewhat safe"</h3>
+<p>Collected from <span class="src">examples/self-improving-agent/docs/SELF-CONTROL.md:16-27</span> and the code above:</p>
+<ul>
+<li><strong>State outside the thing you rewrite.</strong> The conversation event log, artifacts, scheduler records and secrets live under <code>.exo</code>/the secret backend, not in the sandbox. <code>rewind_sandbox</code> restores files only; history is not erased, so a rewound agent can still read what it already tried (<span class="src">examples/self-improving-agent/docs/SELF-CONTROL.md:78</span>). The state table is at <span class="src">examples/self-improving-agent/docs/SELF-CONTROL.md:54-65</span>.</li>
+<li><strong>Git as the second log.</strong> The repo is mounted into the sandbox at <code>/workspace/exo</code>, edits go through <code>shell</code>, and <span class="src">examples/self-improving-agent/SELF.md</span> is the navigation map the harness points to every turn (<span class="src">examples/self-improving-agent/harness.ts:110-113</span>).</li>
+<li><strong>Narrow host privilege.</strong> The sandboxed model gets one fixed host operation instead of a host shell; the system prompt says "do not manually kill host processes" (<span class="src">examples/self-improving-agent/prompts/me.md:22</span>).</li>
+<li><strong>Reversible by default.</strong> The mutation principles (audit trail, named tools, disable over delete) are stated at <span class="src">examples/self-improving-agent/docs/SELF-CONTROL.md:16-27</span>; <code>cancel_scheduled_task</code> versus <code>delete_scheduled_task</code> is the concrete instance.</li>
+<li><strong>Extension with validation.</strong> <code>manage_tool</code> installs a tool only after staging, loading, initializing and strict-schema checking it; failed installs leave no state (<span class="src">examples/self-improving-agent/docs/tools-and-adapters.md:40-49</span>). Secrets in tool config are referenced as exactly <code>${ENV_VAR}</code> and resolved from the host at load, never written to the lockfile (<span class="src">examples/self-improving-agent/docs/tools-and-adapters.md:72-77</span>).</li>
+</ul>
+
+<h3 id="web">Host-side web tools</h3>
+<p><code>web_search</code> (Brave if a key is in the vault or <code>BRAVE_API_KEY</code>, else DuckDuckGo HTML) and <code>web_fetch</code> (readability to markdown) run in the harness process on the host, so they work even when the sandbox has networking off (<span class="src">examples/self-improving-agent/tools/web-tools.ts:19-25</span>). Because they are host-side they need their own SSRF guard: private IPv4/IPv6 are blocked, and the check is repeated at socket-connect time through a custom undici <code>lookup</code> to defeat DNS rebinding between preflight and connection (<span class="src">examples/self-improving-agent/tools/web-tools.ts:187-232</span>). This is separate from the sandbox egress proxy covered in <a href="egress-and-vaults.html">egress-and-vaults.html</a>.</p>
+
+<h3 id="sia-docs-drift">Docs that no longer match</h3>
+<p>The adapter worker system was removed in favor of managed adapters, but several docs still describe it:</p>
+<ul>
+<li><span class="src">examples/self-improving-agent/docs/EXO-BASICS.md:80-82</span> lists <code>create_adapter</code>, <code>list_adapters</code>, <code>send_adapter_message</code> ... as tools; <span class="src">examples/self-improving-agent/README.md:184-190</span> says they were removed, and <code>practical.ts</code> registers none of them.</li>
+<li><span class="src">examples/self-improving-agent/docs/tools-and-adapters.md:94-116</span> still documents the adapter lifecycle and says practical includes "adapter" tools; <span class="src">examples/self-improving-agent/docs/design/adapter-architecture.md:3-4</span> opens by calling itself "the earlier self-agent implementation".</li>
+<li><span class="src">examples/self-improving-agent/docs/SELF-CONTROL.md:141</span> points to <code>docs/design/skills-arch.md</code>, which does not exist; the skills design is <span class="src">exoharness/docs/design/skills.md</span>.</li>
+<li><span class="src">examples/self-improving-agent/prompts/me.md:11-14</span> still instructs on Discord voice, WhatsApp and adapter ids even though those tools are gone from the registry.</li>
+</ul>
+
+<h2 id="rlm">3. Recursive language models (RLM)</h2>
+<p>The idea: instead of putting a long conversation into the model's context, put it in a variable of a JavaScript REPL. The model is told "the prompt string in <code>context</code> is the external environment" and works by writing code that slices it, calling sub-LLMs over chunks, accumulating results in variables, and finally setting <code>globalThis.Final</code>. The long context never enters the root model's window except as a 400-character preview plus whatever <code>print</code> output the model chooses to surface (<span class="src">exoharness/examples/typescript/rlm-harness.ts:540-551</span>). The system prompt text is in <a href="prompts.html">prompts.html</a>.</p>
+
+<p>The same design exists twice: as a TypeScript example harness and as a first-class Rust executor selectable with <code>harness: rlm</code> (<span class="src">crates/executor/src/managed_agents/config.rs:149</span>, <span class="src">crates/executor/src/native/constructors.rs:30-35</span>). Both emit the same custom events (<code>rlm_context_initialized</code>, <code>rlm_model_response</code>, <code>rlm_tool_call</code>, <code>rlm_tool_result</code>, <code>rlm_final_answer</code>) and write the final answer as an ordinary <code>messages</code> event.</p>
+
+<figure class="code">
+<figcaption><strong>The REPL: fresh VM per call, only JSON-able globals persist</strong> <span class="src">exoharness/examples/typescript/rlm-harness.ts:225-255</span></figcaption>
+<pre><code class="language-ts">  execute(code: string): ReplExecutionResult {
+    const stdout: string[] = [];
+    const sandbox = this.buildSandbox(stdout);
+    let error: string | null = null;
+
+    try {
+      vm.runInContext(code, vm.createContext(sandbox), {
+        timeout: REPL_TIMEOUT_MS,
+        displayErrors: true,
+      });
+    } catch (caught) {
+      error =
+        caught instanceof Error
+          ? (caught.stack ?? caught.message)
+          : String(caught);
+    }
+
+    this.globals = collectJsonGlobals(sandbox);
+    const final = this.globals.Final;
+    return {
+      stdout: clampPreview(stdout.join("\n"), STDOUT_PREVIEW_CHARS),
+      variable_names: Object.keys(this.globals)
+        .sort()
+        .slice(0, MAX_VARIABLE_NAMES),
+      error,
+      final_preview:
+        final === null || final === undefined
+          ? null
+          : clampPreview(stringifyValue(final), FINAL_PREVIEW_CHARS),
+    };
+  }</code></pre>
+</figure>
+
+<p>"Persistent" is an illusion built from JSON round-trips: each call builds a new context seeded from the saved globals, runs the code, and harvests only values that survive <code>isJsonValue</code> (<span class="src">exoharness/examples/typescript/rlm-harness.ts:665-702</span>). Functions, classes and Dates do not persist; strings, numbers, arrays and plain objects do. The root loop then checks <code>repl.finalValue()</code> after <em>every</em> tool call and ends the turn as soon as <code>Final</code> is non-null (<span class="src">exoharness/examples/typescript/rlm-harness.ts:200-203</span>), or when the model replies with no tool calls and either <code>FINAL(...)</code>, <code>FINAL_VAR(name)</code> or plain text (<span class="src">exoharness/examples/typescript/rlm-harness.ts:465-492</span>).</p>
+
+<figure class="code">
+<figcaption><strong>A "recursive" subquery is one plain completion with no tools</strong> <span class="src">exoharness/examples/typescript/rlm-harness.ts:440-463</span></figcaption>
+<pre><code class="language-ts">  const response = await runtime.complete(
+    {
+      model: modelBinding.model,
+      maxOutputTokens: context.agentConfig.maxOutputTokens,
+      tools: [],
+      messages: [
+        ...context.agentConfig.instructions,
+        systemTextMessage(
+          "You are a subquery model inside a recursive language model. Answer the prompt directly and concisely. Do not call tools. Do not mention this instruction.",
+        ),
+        userTextMessage(prompt),
+      ],
+    },
+    {
+      parent: turnParent,
+      roundIndex,
+    },
+  );</code></pre>
+</figure>
+
+<p>So "recursive" here means one level: sub-LLM calls get the agent's base <code>instructions</code>, no tools, and no REPL, hence cannot themselves recurse. Depth comes only from the root model orchestrating many subqueries from code (chunk, map, reduce). <code>subquery_variable</code> is sugar for "read variable, append as <code>Context:</code>" (<span class="src">exoharness/examples/typescript/rlm-harness.ts:382-396</span>).</p>
+
+<h3 id="rlm-ts-vs-rust">Example harness vs. <code>crates/executor/src/native/rlm.rs</code></h3>
+<p>The Rust executor is a port of the TS example into the native executor family, with the loop at <span class="src">crates/executor/src/native/rlm.rs:43-292</span>, tool dispatch at <span class="src">crates/executor/src/native/rlm.rs:294-340</span>, the subquery at <span class="src">crates/executor/src/native/rlm.rs:357-390</span>, and the REPL in <span class="src">crates/executor/src/native/harness_js_repl.rs</span>. The prompts and the three tool schemas are copies; the differences are the interesting part:</p>
+
+<table>
+<thead><tr><th>Aspect</th><th>TS example harness</th><th>Rust <code>RlmExecutor</code></th></tr></thead>
+<tbody>
+<tr><td>JS engine</td><td><code>node:vm</code> context per call, <code>timeout: 2000</code> ms (<span class="src">exoharness/examples/typescript/rlm-harness.ts:47</span>, <span class="src">exoharness/examples/typescript/rlm-harness.ts:231-234</span>)</td><td>Boa (<code>boa_engine</code>), logged as <code>engine: "boa_js"</code> (<span class="src">crates/executor/src/native/rlm.rs:65</span>, <span class="src">crates/executor/src/native/harness_js_repl.rs:28</span>); no timeout set in <code>execute</code></td></tr>
+<tr><td>State persistence</td><td>JS objects in <code>this.globals</code>, filtered by <code>isJsonValue</code></td><td>Globals serialized to JSON and re-injected as a prelude on every run: <code>for (const [key, value] of Object.entries({state_json})) globalThis[key] = value</code> (<span class="src">crates/executor/src/native/harness_js_repl.rs:45-47</span>)</td></tr>
+<tr><td>Code execution</td><td><code>vm.runInContext</code></td><td><code>(0, eval)(code_json)</code> (indirect eval, global scope) inside a generated wrapper script (<span class="src">crates/executor/src/native/harness_js_repl.rs:65-69</span>)</td></tr>
+<tr><td>Other tools</td><td>None: exactly <code>repl_execute</code>, <code>subquery</code>, <code>subquery_variable</code></td><td>Also exposes the runtime's own tools and frontend (client-executed) tools alongside the three RLM tools (<span class="src">crates/executor/src/native/rlm.rs:91-108</span>, <span class="src">crates/executor/src/native/rlm.rs:196-225</span>)</td></tr>
+<tr><td>Permissions</td><td><code>context.authorizeTool</code> (<span class="src">exoharness/examples/typescript/rlm-harness.ts:323</span>)</td><td><code>crate::permissions::authorize(...)</code> with the conversation's policy (<span class="src">crates/executor/src/native/rlm.rs:181-193</span>)</td></tr>
+<tr><td>System prompt</td><td>"The REPL is intentionally limited"</td><td>"The REPL is secure and intentionally limited", plus a note that conversation filesystem mounts do not apply inside the REPL (<span class="src">crates/executor/src/native/rlm.rs:612-641</span>)</td></tr>
+<tr><td>Round budget</td><td><code>assertRoundBudget</code> throws</td><td><code>bail!("RLM turn exceeded the configured round budget")</code></td></tr>
+<tr><td>How selected</td><td><code>harness: path/to/rlm-harness.ts</code></td><td><code>harness: rlm</code> in agent definition, or <code>--harness rlm</code> (<span class="src">crates/cli/src/main.rs:330</span>)</td></tr>
+</tbody>
+</table>
+
+<div class="callout surprise">
+<p class="callout-title">Surprise: the REPL sandboxes differ in what they protect against</p>
+<p>The Rust (Boa) REPL has no host objects, but also no execution cap in the code I read: <code>harness_js_repl.rs</code> contains no timeout or loop limit, so an infinite loop in model-written JS would hang that turn. The TS example caps at 2 s but runs in <code>node:vm</code> and injects host closures (<code>print</code>, <code>console</code>, <code>getMessages</code>) into the context (<span class="src">exoharness/examples/typescript/rlm-harness.ts:279-307</span>); Node documents <code>vm</code> as not a security boundary, so "no filesystem access, no network access" in the prompt is a statement about what the model is told, not a verified isolation property. Treat the TS version as an experiment harness.</p>
+</div>
+
+<div class="callout idea">
+<p class="callout-title">Idea worth stealing: make the context a variable, not a prompt</p>
+<p>The root loop never feeds the transcript to the model as messages (<span class="src">exoharness/examples/typescript/rlm-harness.ts:106-123</span>); it materializes conversation history once (<code>materializeConversationMessages</code>), flattens it to a <code>USER:/ASSISTANT:/TOOL:</code> transcript, and exposes both the string and a structured <code>getMessages(role)</code> view to code. Everything the harness does is logged as custom events, so the RLM's reasoning is fully replayable from the event log.</p>
+</div>
+
+<h2 id="deployment-examples">4. Environments, managed-agent definitions and tutorials</h2>
+
+<h3 id="environments">Environments</h3>
+<p>Four YAMLs in <span class="src">exoharness/examples/environments</span> show the sandbox spec surface (details in <a href="sandboxes.html">sandboxes.html</a>): <code>codex-smolvm.yaml</code> (smolvm, 2 vCPU/1 GiB, unrestricted networking, <code>idle_seconds: 600</code>), <code>codex-firecracker.yaml</code> (firecracker with a local ext4 rootfs and <code>networking: {type: limited, allowed_hosts: [api.openai.com]}</code>), <code>pi-local.yaml</code> (<code>apple_container</code>), and <code>fastapi-smolvm.yaml</code>, the richest: a pinned image digest, <code>storage_gib</code>/<code>overlay_gib</code>, a read-only <code>file_system_mounts</code> entry for <code>../fastapi</code>, and <code>tcp_ports: [5173, 8000]</code> (<span class="src">exoharness/examples/environments/fastapi-smolvm.yaml</span>). The matching <code>fastapi/start.sh</code> is a bootstrap script the agent runs inside; <span class="src">exoharness/examples/managed-agents/fastapi-developer.md</span> tells the model to invoke it. The coding-agent tutorial passes a similar file with <code>exo run coder --environment-file ...</code> (<span class="src">website/docs-src/tutorials/custom-coding-agent.md</span>).</p>
+
+<h3 id="managed-examples">Managed-agent definitions</h3>
+<p>Nine one-file agents in <span class="src">exoharness/examples/managed-agents</span> cover the zero-code path. Each is YAML front matter (<code>harness</code>, <code>model</code> with <code>credential</code>, optional <code>permission_policy</code>, <code>mcp_servers</code>, <code>resources</code>) and a markdown body that becomes the instructions:</p>
+<table>
+<thead><tr><th>File</th><th>Shows</th></tr></thead>
+<tbody>
+<tr><td><span class="src">exoharness/examples/managed-agents/assistant.md</span></td><td><code>harness: basic</code>, the minimum.</td></tr>
+<tr><td><span class="src">exoharness/examples/managed-agents/coder.md</span></td><td>Codex harness with <code>permission_policy: { type: always_allow }</code>.</td></tr>
+<tr><td><span class="src">exoharness/examples/managed-agents/pi-assistant.md</span></td><td>Pi harness with <code>always_ask</code>.</td></tr>
+<tr><td><span class="src">exoharness/examples/managed-agents/exo-developer.md</span>, <span class="src">exoharness/examples/managed-agents/fastapi-developer.md</span></td><td>A <code>resources:</code> git checkout mounted at <code>/workspace</code> (optionally with a vault <code>credential</code>).</td></tr>
+<tr><td><span class="src">exoharness/examples/managed-agents/notion-analyst.md</span>, <span class="src">exoharness/examples/managed-agents/github-analyst.md</span>, <span class="src">exoharness/examples/managed-agents/repo-analyst.md</span></td><td>Remote MCP servers by URL; Notion uses the OAuth-through-vault flow in the README (<span class="src">exoharness/examples/managed-agents/README.md:1-40</span>, <a href="egress-and-vaults.html">egress-and-vaults.html</a>).</td></tr>
+<tr><td><span class="src">exoharness/examples/managed-agents/support-analyst.md</span>, <span class="src">examples/tutorial/1_ticket_triage/agent.md</span></td><td>Prompt-only agents; the support tutorial adds a repo checkout and then source access (<span class="src">website/docs-src/tutorials/support-agent.md</span>).</td></tr>
+</tbody>
+</table>
+<p>MCP tools require approval by default while built-ins default to <code>always_allow</code>; a trusted server opts out with <code>permission_policy: {type: always_allow}</code> on its <code>mcp_servers</code> entry (<span class="src">exoharness/examples/managed-agents/README.md:20-30</span>). The contract behind these files is in <a href="managed-agents.html">managed-agents.html</a> and <a href="tools-and-mcp.html">tools-and-mcp.html</a>.</p>
+
+<h3 id="tutorials">Tutorials</h3>
+<p><span class="src">website/docs-src/tutorials/index.md</span> lists four. They map one-to-one onto code: <em>Support agent</em> (managed-agent markdown, no code), <em>Custom harness</em> (sysmon-harness), <em>Custom Coding Agent</em> (coding-agent-harness), <em>Game &amp; Third-Party Tool Integration</em> (gameboy-agent, plus an appendix showing composition: take <code>createDefaultToolRegistry</code>, re-register its instances, then add game tools; <span class="src">website/docs-src/tutorials/game-emulator-integration.md:377-447</span>). The self-improving harness's comment at <span class="src">examples/self-improving-agent/harness.ts:40-42</span> points at that appendix as the way to extend it by composition.</p>
+
+<h2 id="harbor">5. Harbor evals (short)</h2>
+<p><span class="src">eval/harbor</span> is a Python package, <code>exo_harbor</code>, that makes an Exo harness a Harbor external agent so it can be scored on Harbor's benchmark catalog (terminal-bench, SWE-bench Lite via a generator script, bundled smoke datasets). <code>ExoSessionPlugin</code> creates one shared agent per job (<span class="src">eval/harbor/src/exo_harbor/plugin.py:19-50</span>); <code>ExoAgent</code> gives every trial a fresh conversation, attaches Harbor's task container to it with <code>exo sandbox attach</code> (Exo borrows it, never stops it), sends the task as one turn, and exports the trajectory (<span class="src">eval/harbor/src/exo_harbor/agent.py:78-135</span>, <span class="src">eval/harbor/README.md:1-25</span>). The default harness module is the self-improving agent (<span class="src">eval/harbor/src/exo_harbor/conventions.py:4</span>); <code>basic</code> is a shell-only control and <code>pi</code> drives the Pi agent in the task container.</p>
+<div class="callout surprise">
+<p class="callout-title">Surprise: concurrency is rejected on purpose</p>
+<p>With the exo harness, <code>--n-concurrent</code> above 1 raises a <code>ValueError</code> in the plugin because trials share one self-evolving agent: memory, installed tools and source edits from trial N are meant to be visible in trial N+1, and parallel self-edits would race (<span class="src">eval/harbor/src/exo_harbor/plugin.py:33-40</span>). The <code>self-evolution-smoke-test</code> dataset (<span class="src">eval/harbor/datasets/self-evolution-smoke-test</span>: install-tool, reuse-tool, restart-and-observe, timeout-trajectory) checks exactly that persistence. Ordered datasets (<code>task_order.json</code>) exist for continual-learning sequences (<span class="src">eval/harbor/README.md</span>).</p>
+</div>
+
+<h2 id="takeaways">What to copy</h2>
+<ul>
+<li>Start from <code>runResponsesHarnessTurn</code> with two hooks; reach for a custom loop only when the loop itself is the idea (RLM).</li>
+<li>Keep durable agent state in artifacts, and surface it through <code>instructions</code>; choose strict or tolerant failure per store.</li>
+<li>Give an agent self-modification only through narrow facades whose effects are durable records (<code>guardian-updates/&lt;id&gt;.json</code> plus a conversation event), and put the privileged work in a detached helper that outlives the turn.</li>
+<li>For restarts, use claim-by-delete marker files with a kill fallback, and outboxes (pending-fire records) for anything that must not be lost across a restart.</li>
+</ul>
+<p>For the contracts these examples rely on, see <a href="harnesses.html">harnesses.html</a> (harness API), <a href="tools-and-mcp.html">tools-and-mcp.html</a> (tools, approvals), <a href="sandboxes.html">sandboxes.html</a> (snapshots, rewind, scopes), and <a href="prompts.html">prompts.html</a> (the prompt text the examples inject).</p>
+
+</main>
+<aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/wiki.js"></script>
+</body>
+</html>

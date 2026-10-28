@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Egress, secrets &amp; vaults · Exo internals</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav id="nav"></nav>
+<main>
+<header>
+  <div class="kicker">Runtime internals</div>
+  <h1>Egress, secrets &amp; vaults</h1>
+  <p class="lede">How Exo lets an agent sandbox use API keys it can never read: a per-sandbox TLS-intercepting proxy swaps placeholder strings for real secrets from an encrypted vault, but only on requests to hosts that three independent allowlists agree on.</p>
+</header>
+
+<h2 id="overview">The idea in one picture</h2>
+<p>The sandbox gets <em>placeholders</em>, never secrets. Inside the VM, <code>OPENAI_API_KEY</code> is the string <code>exo_egress_&lt;32 hex&gt;</code>. Everything the VM sends over TCP 80/443 (and DNS) is redirected by the host firewall to a per-sandbox proxy in the Exo runtime. The proxy terminates TLS with a throwaway CA the guest was told to trust, checks the request, asks a <code>EgressCredentialResolver</code> for the real value, rewrites the header, and forwards to a pinned public IP. The real value exists only in the runtime's memory and in the encrypted vault file.</p>
+
+<pre class="diagram">
+  sandbox (Firecracker / SmolVM)            host: one EgressProxy per sandbox
+  ------------------------------            ------------------------------------------------
+  OPENAI_API_KEY=exo_egress_ab12..          nft DNAT 80/443/53 -> listeners (source-IP bound)
+  curl https://api.openai.com/v1/..   --->  TLS accept (leaf signed by throwaway CA)
+    Authorization: Bearer exo_egress_ab12     1. Host == SNI == allowed host, port 443, no "//"
+                                              2. placeholder only in a plain header, HTTPS only
+                                              3. binding's own host/URL allowlist permits dest
+                                              4. resolver -> sandbox's pinned SecretReference
+                                              5. vault: secret's own policy permits dest (AAD-bound)
+                                              6. swap, resolve DNS -> public IPv4 only, pin, no redirects
+                                        ---> api.openai.com   Authorization: Bearer sk-real...
+</pre>
+
+<p>Code map: the HTTP/TLS machinery is <span class="src">crates/exoharness/src/egress/mod.rs</span>; the substitution rules and the resolver trait are <span class="src">crates/exoharness/src/egress_credentials.rs</span>; vault storage is <span class="src">crates/exoharness/src/vault.rs</span> + <span class="src">crates/exoharness/src/vault/local.rs</span>; encryption is <span class="src">crates/exoharness/src/secrets.rs</span>; the CLI is <span class="src">crates/cli/src/vaults.rs</span>. Sandbox providers themselves are covered in <a href="sandboxes.html">Sandboxes</a>; MCP in general in <a href="tools-and-mcp.html">Tools &amp; MCP</a>.</p>
+
+<h2 id="threat-model">Threat model</h2>
+<p>The adversary is <strong>code running inside the sandbox</strong>: a prompt-injected model issuing arbitrary shell commands, a malicious dependency, a compromised build script. It can read every env var and file in the guest, craft any HTTP request, point DNS wherever it likes, and open any socket. The Exo runtime, its state directory and master key are trusted.</p>
+
+<table>
+<thead><tr><th>Asset / property</th><th>Defended?</th><th>How</th></tr></thead>
+<tbody>
+<tr><td>Secret value readable from inside the guest</td><td>Yes</td><td>Guest only ever sees <code>exo_egress_*</code> placeholders (<span class="src">crates/exoharness/src/egress_credentials.rs:13</span>). Real values are resolved per request on the host.</td></tr>
+<tr><td>Secret sent to an attacker-chosen host</td><td>Yes</td><td>Substitution only happens when the destination is in the binding's allowlist <em>and</em> the secret's own stored policy. See <a href="#host-binding">host-binding</a>.</td></tr>
+<tr><td>SSRF to cloud metadata / RFC1918 via an allowed hostname</td><td>Yes</td><td>Upstream DNS is resolved on the host per request, filtered to public IPv4, and pinned into the HTTP client (<span class="src">crates/exoharness/src/egress/mod.rs:69-91</span>, <span class="src">:460-492</span>).</td></tr>
+<tr><td>Bypassing the proxy with <code>--noproxy</code>, raw sockets, IPv6, QUIC</td><td>Yes (on enforcing backends)</td><td>Interception happens in the host network path, not via <code>HTTPS_PROXY</code>. Firecracker drops IPv6 and non-DNAT'd traffic; SmolVM routes all outbound TCP to the interceptor.</td></tr>
+<tr><td>Reading the vault from a mounted directory</td><td>Yes</td><td><code>validate_secret_mount</code> rejects sandbox mounts that overlap <code>vaults/</code> or the master key (<span class="src">crates/exoharness/src/basic/native.rs:1042-1078</span>).</td></tr>
+<tr><td>Editing <code>vaults.json</code> to widen a secret's destinations</td><td>Yes</td><td>Metadata (including the policy) is AES-GCM additional authenticated data. See <a href="#at-rest">secret storage at rest</a>.</td></tr>
+<tr><td>Using the credential <em>at its authorized endpoint</em></td><td><strong>No</strong></td><td>docs/egress.md says it plainly: grants "do not prevent sandbox code from making its own authorized model requests", nor enforce tool-level permissions.</td></tr>
+<tr><td>Upstream echoing the secret back in a response</td><td><strong>No</strong></td><td>Responses stream through unmodified; "Allowed upstreams can still return sensitive values in their responses."</td></tr>
+<tr><td>Secrets in URL query, request body, WebSocket frames, signed requests</td><td>Not supported</td><td>Header-only (<a href="#substitution">below</a>); <code>CredentialInjectionLocation</code> has exactly one field, <code>header</code>.</td></tr>
+</tbody>
+</table>
+
+<h2 id="routing">Forcing traffic through the proxy, per provider</h2>
+<p>The proxy is only constructed when it is needed: <code>EgressPolicy::requires_proxy()</code> is true if there are credential bindings, an <code>allowed_tcp_ports</code> list, or <code>Limited</code> networking (<span class="src">crates/exoharness/src/types.rs:948-953</span>). Plain unrestricted or disabled networking uses the backend's own rules and no interception (<span class="src">crates/exoharness/src/egress/sandbox.rs:262-265</span>). A proxied sandbox must also have a managed lifecycle (<code>idle_ttl</code>), otherwise acquisition fails (<span class="src">crates/exoharness/src/egress/sandbox.rs:267-270</span>).</p>
+
+<table>
+<thead><tr><th>Backend</th><th>Mechanism</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><strong>Firecracker</strong> (Linux, or macOS via Lima)</td><td>Per-VM nftables table: DNAT guest TCP 80/443 and TCP/UDP 53 to host listeners; listeners accept only the VM's source IP</td><td>Runs Exo's own DNS service on the host (allowlist = what resolves). <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:3663-3781</span></td></tr>
+<tr><td><strong>SmolVM</strong></td><td>SmolVM is started with <code>--egress-interceptor &lt;loopback addr&gt;</code> and a 32-byte token in <code>SMOLVM_INTERCEPTOR_TOKEN</code>; every guest TCP connection is handed to Exo with its original destination</td><td>Token and proxy variables never enter the guest. <span class="src">crates/exoharness/src/sandbox_provider/smolvm/egress.rs:18-116</span></td></tr>
+<tr><td><strong>Cloudflare Workers</strong> (hosted)</td><td>The platform intercepts public-DNS HTTP; the worker is asked to rewrite headers via <code>EgressSession</code></td><td>Same substitution code, different transport. <span class="src">crates/worker-runtime/src/policy.rs:30-111</span></td></tr>
+<tr><td><strong>External proxy</strong></td><td><code>ExternalProxyConfig</code>: host authenticates then CONNECT-tunnels through a remote proxy that holds the TLS identity</td><td><span class="src">crates/exoharness/src/egress/external.rs</span></td></tr>
+<tr><td><strong>ExplicitProxy / hosted CONNECT</strong></td><td>Authenticated <code>HTTPS_PROXY</code> on a caller-bound listener (<code>exo:&lt;uuid&gt;</code> Basic auth)</td><td>Not an enforcement mechanism: "Proxy configuration alone does not prevent clients from bypassing the proxy". <span class="src">crates/exoharness/src/egress/explicit.rs:77-183</span></td></tr>
+<tr><td>Docker / Apple Containers / local process, E2B, Daytona, Sprites, AgentCore</td><td>None</td><td>Each calls <code>EgressPolicy::validate_basic</code>, which rejects credentials, <code>allowed_tcp_ports</code> and limited networking up front (<span class="src">crates/exoharness/src/types.rs:933-946</span>, e.g. <span class="src">crates/exoharness/src/sandbox_provider/e2b.rs:237</span>). Vercel has its own check: it translates exact-host policy natively but refuses credential bindings (<span class="src">crates/exoharness/src/sandbox_provider/vercel.rs:786-790</span>).</td></tr>
+</tbody>
+</table>
+
+<h3 id="firecracker-rules">What the Firecracker firewall actually says</h3>
+<figure class="code">
+  <figcaption><strong>DNAT to the proxy, then default-reject everything not aimed at it</strong> <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:3689-3731</span></figcaption>
+  <pre><code class="language-rust">writeln!(
+    rules,
+    "add set inet {table} allowed_hosts {{ type ipv4_addr; flags timeout; timeout 1h; size 4096; }}"
+)?;
+for (protocol, port, destination) in [
+    ("tcp", 80, proxy.http),
+    ("tcp", 443, proxy.https),
+    ("tcp", 53, proxy.dns),
+    ("udp", 53, proxy.dns),
+] {
+    if port != 53 &amp;&amp; !policy.allows_tcp_port(port) {
+        continue;
+    }
+    writeln!(
+        rules,
+        "add rule inet {table} prerouting iifname {interface} ip saddr {source} {protocol} dport {port} counter dnat ip to {destination}"
+    )?;
+}
+for chain in ["input", "forward"] {
+    writeln!(rules, "add rule inet {table} {chain} iifname {interface} meta nfproto ipv6 counter drop")?;
+    writeln!(rules, "add rule inet {table} {chain} iifname {interface} ip saddr != {source} counter drop")?;
+    // ... accept only `ct status dnat` to the proxy endpoints ...
+    writeln!(rules, "add rule inet {table} {chain} iifname {interface} counter reject")?;
+}</code></pre>
+</figure>
+
+<p>On top of the firewall, the listener itself checks who is connecting. <code>LocalEgressTransport</code> holds a single atomic "bound source" (the guest IPv4) set once by <code>bind_source</code> via compare-and-swap; <code>accepts_peer</code> drops any connection whose peer differs, and <code>0</code> means "no one admitted yet" (<span class="src">crates/exoharness/src/egress/transport.rs:255-265</span>, <span class="src">:308-314</span>). The proxy is created <em>before</em> the VM boots (so its endpoints can be written into the firewall) but admits nobody until the VM's address is bound (<span class="src">crates/exoharness/src/egress/sandbox.rs:286-291</span>).</p>
+
+<p>For non-80/443 TCP in restricted mode, the firewall only permits destinations in the <code>allowed_hosts</code> nft set. That set is filled by the DNS service: it resolves an allowed name on the host, admits the addresses, and only then answers the guest, so "a connection cannot race its firewall rule" (<span class="src">crates/exoharness/src/egress/transport.rs:394-427</span>). Entries expire after an hour.</p>
+
+<div class="callout surprise">
+  <p class="callout-title">DNS is part of the policy engine</p>
+  <p>There are two layers. The base <code>dns_response</code> answers an allowed name's A query with the fixed synthetic address <code>192.0.2.1</code> (TTL 0) and every other name, including subdomains like <code>leak.api.test</code>, with <code>NXDOMAIN</code> (<span class="src">crates/exoharness/src/egress/transport.rs:429-462</span>; test <span class="src">crates/exoharness/src/egress/tests.rs:1061-1100</span>). On Firecracker, <code>network_dns_response</code> then throws that synthetic answer away and substitutes the <em>real</em> public IPv4 addresses (TTL 60) resolved on the host by <code>FirecrackerDns</code>, after adding them to the VM's nft <code>allowed_hosts</code> set (<span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:3592-3661</span>). HTTP(S) works either way because the DNAT rule ignores the destination IP; the real addresses only matter for non-HTTP TCP. In limited mode, DNS lookups of non-allowed names (the classic exfiltration channel) die at the first hop; unrestricted mode answers everything.</p>
+</div>
+
+<h2 id="tls">TLS interception and the CA</h2>
+<p>Yes, it is a full MITM, scoped to the hosts that need it. <code>tls_configuration</code> builds a brand-new CA and a single leaf certificate per sandbox, and returns only the CA <em>certificate</em> PEM and a <code>TlsAcceptor</code>:</p>
+
+<figure class="code">
+  <figcaption><strong>A throwaway CA whose private key never leaves this function</strong> <span class="src">crates/exoharness/src/egress/mod.rs:555-584</span></figcaption>
+  <pre><code class="language-rust">fn tls_configuration(hosts: Vec&lt;String&gt;) -&gt; Result&lt;(String, TlsAcceptor)&gt; {
+    let mut ca = CertificateParams::new(Vec::&lt;String&gt;::new())?;
+    ca.distinguished_name
+        .push(DnType::CommonName, "Exo sandbox egress CA");
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    // ...
+    let key = KeyPair::generate()?;
+    let certificate = ca.self_signed(&amp;key)?;
+    let issuer = Issuer::new(ca, key);
+    let leaf_key = KeyPair::generate()?;
+    let mut leaf = CertificateParams::new(hosts)?;   // SANs = exact hostnames
+    // ...
+    let leaf = leaf.signed_by(&amp;leaf_key, &amp;issuer)?;
+    // ... rustls ServerConfig, no client auth ...
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok((certificate.pem(), TlsAcceptor::from(Arc::new(tls))))
+}</code></pre>
+</figure>
+
+<ul>
+<li><strong>One leaf, SANs are the interception set.</strong> In <code>Limited</code> mode that is every allowed host. In <code>Unrestricted</code> mode it is only the hosts named by credential bindings (<span class="src">crates/exoharness/src/egress/mod.rs:256-263</span>).</li>
+<li><strong>Trust installation is per-process env, not the system store.</strong> After boot the handle runs <code>PREPARE_TRUST</code>, which copies <code>/etc/ssl/certs/ca-certificates.crt</code> to <code>/tmp/exo-egress-&lt;uuid&gt;.pem</code> and appends the CA (<span class="src">crates/exoharness/src/egress/mod.rs:823-830</span>). Every command then gets <code>SSL_CERT_FILE</code>, <code>CODEX_CA_CERTIFICATE</code>, <code>REQUESTS_CA_BUNDLE</code>, <code>NODE_EXTRA_CA_CERTS</code>, <code>CURL_CA_BUNDLE</code> and <code>GIT_SSL_CAINFO</code> pointing at it, overriding anything the caller passed (<span class="src">crates/exoharness/src/egress/sandbox.rs:119-136</span>). Clients with their own trust store (Java, browsers) are not covered.</li>
+<li><strong>HTTP/1.1 only</strong> (ALPN). WebSocket upgrades and CONNECT are refused with a denial in <code>rewrite_headers</code> (<span class="src">crates/exoharness/src/egress_credentials.rs:441-446</span>).</li>
+<li><strong>Unrestricted mode does not MITM public sites.</strong> <code>transparent_https_connection</code> peeks the ClientHello with <code>rustls::server::Acceptor</code>, extracts the SNI, and either intercepts (SNI is a credential host) or <code>copy_bidirectional</code>s the original bytes to the real server. The test <code>transparent_unrestricted_egress_intercepts_credentials_and_preserves_public_tls</code> asserts a client that trusts only the upstream's CA still reaches <code>public.test</code> (<span class="src">crates/exoharness/src/egress/mod.rs:656-717</span>, <span class="src">crates/exoharness/src/egress/tests.rs:1782-1867</span>).</li>
+</ul>
+
+<div class="callout idea">
+  <p class="callout-title">Idea worth stealing: placeholders are minted per sandbox, so they are not even portable between sandboxes</p>
+  <p>Each proxy mints its own <code>exo_egress_&lt;uuidv4&gt;</code> per binding (<span class="src">crates/exoharness/src/egress_credentials.rs:100-116</span>). Sandbox A's placeholder presented to sandbox B's proxy fails validation ("credential placeholder does not match this request") and never reaches the resolver; the test expects a 502 (<span class="src">crates/exoharness/src/egress/tests.rs:1820-1828</span>). Combined with the CA being per sandbox, an exfiltrated placeholder or CA bundle is worthless elsewhere.</p>
+</div>
+
+<h2 id="policy">Policy language and evaluation order</h2>
+<p>There are three policy objects, all in <span class="src">crates/exoharness/src/types.rs</span>, and a fourth that lives on the secret itself.</p>
+
+<figure class="code">
+  <figcaption><strong>The whole network policy vocabulary</strong> <span class="src">crates/exoharness/src/types.rs:874-922</span></figcaption>
+  <pre><code class="language-rust">#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SandboxNetworkPolicy {
+    Unrestricted,
+    Disabled,
+    Limited { allowed_hosts: Vec&lt;String&gt; },
+}
+
+pub struct EgressPolicy {
+    pub networking: SandboxNetworkPolicy,
+    /// Outbound TCP ports. Omitted allows all ports; an empty list denies all.
+    pub allowed_tcp_ports: Option&lt;Vec&lt;u16&gt;&gt;,
+    pub credentials: Vec&lt;EgressCredentialBinding&gt;,
+}
+
+pub struct EgressCredentialBinding {
+    pub name: String,
+    pub environment_variable: String,
+    pub networking: CredentialNetworkPolicy,
+    pub injection_location: CredentialInjectionLocation,   // { header: bool }
+}
+
+pub enum CredentialNetworkPolicy {
+    Limited { allowed_hosts: Vec&lt;String&gt; },
+    Destinations { allowed_destinations: Vec&lt;crate::CredentialDestination&gt; },
+}</code></pre>
+</figure>
+
+<table>
+<thead><tr><th>Question</th><th>Answer</th><th>Evidence</th></tr></thead>
+<tbody>
+<tr><td>Wildcards (<code>*.example.com</code>)?</td><td>No. Rejected at policy-load time. Exact lowercase ASCII hostnames only, max 128 hosts, no IP literals, no trailing dot, no port.</td><td><span class="src">crates/exoharness/src/types.rs:840-873</span>; test <span class="src">crates/exoharness/src/egress/tests.rs:915-928</span></td></tr>
+<tr><td>Method / path rules?</td><td>No. Method and path are only passed to the resolver (<code>EgressDestination</code>), so a <em>hosted resolver</em> may implement them (the Git tests do). <code>Url</code> credential destinations match the exact path+query string.</td><td><span class="src">crates/exoharness/src/egress_credentials.rs:21-27</span>, <span class="src">crates/exoharness/src/credential_policy.rs:65-72</span></td></tr>
+<tr><td>CIDR rules?</td><td>Not in <code>EgressPolicy</code>. <code>FirecrackerConfig.allowed_egress_cidrs</code> exists but is emitted only on the non-proxy firewall path.</td><td><span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:194</span>, <span class="src">:3556-3561</span></td></tr>
+<tr><td>Ports?</td><td>HTTP interception only handles 80 (HTTP) and 443 (HTTPS). <code>allowed_tcp_ports</code> gates other TCP (opaque relay, unrestricted only). Port 0 is invalid.</td><td><span class="src">crates/exoharness/src/egress_credentials.rs:348-370</span>, <span class="src">:373-431</span></td></tr>
+<tr><td>Credential policy <code>unrestricted</code>?</td><td>Does not parse. A credential must list hosts or destinations; an empty list disables substitution and does <em>not</em> inherit the sandbox's hosts.</td><td><span class="src">crates/exoharness/src/types.rs:1593-1614</span>; test <span class="src">crates/exoharness/src/egress/tests.rs:1032-1058</span></td></tr>
+</tbody>
+</table>
+
+<h3 id="eval-order">Evaluation order for one HTTPS request</h3>
+<ol class="steps">
+<li><strong>Peer.</strong> Listener accepts only the bound guest IP (or, for SmolVM, a stream carrying the right token and a public IPv4, non-IPv6 destination).</li>
+<li><strong>Port and host.</strong> <code>transparent_https_connection</code> calls <code>check_port(443)</code>. In limited mode every connection is intercepted; in unrestricted mode the SNI is peeked and the host must satisfy <code>permits_host</code>.</li>
+<li><strong>Request shape</strong> (<code>State::destination</code>, <span class="src">crates/exoharness/src/egress/mod.rs:402-458</span>): not CONNECT; origin-form URI; exactly one <code>Host</code>; host canonicalised and permitted; standard port; <strong>SNI equals Host</strong>; path starts with <code>/</code> but not <code>//</code>; the parsed URL's authority is unchanged. Violations are plain <code>anyhow</code> errors and therefore a generic 502.</li>
+<li><strong>Upstream client</strong> (<code>State::client</code>): resolve DNS <em>now</em>, keep only public IPv4, pin with <code>resolve_to_addrs</code>, <code>no_proxy()</code>, <code>redirect(Policy::none())</code>. The client pool is keyed on <code>(host, port)</code> and rebuilt whenever the resolved set changes (test <span class="src">crates/exoharness/src/egress/tests.rs:1579-1625</span>).</li>
+<li><strong>Header rewrite</strong> (<code>rewrite_headers</code>): reject Upgrade/CONNECT, <code>validate_credentials</code>, strip hop-by-hop headers (including those named in <code>Connection</code>), then <code>substitute_credentials</code>.</li>
+<li><strong>Resolver</strong>, which re-checks the secret's own policy (next section).</li>
+<li><strong>Relay</strong>. Request bodies are fully buffered with a 128 MiB cap (<code>EXO_EGRESS_MAX_REQUEST_BODY_BYTES</code>), responses stream. On a 401 with substituted credentials, one refresh-and-retry.</li>
+</ol>
+
+<p>Connection hygiene: at most 128 concurrent connections per proxy (<code>MAX_CONNECTIONS</code>), a 30-second I/O timeout (<code>IO_TIMEOUT</code>) for TLS accept, header read, body read, resolver call and refresh call, and 10 seconds to connect upstream (<span class="src">crates/exoharness/src/egress/mod.rs:53-57</span>).</p>
+
+<div class="callout warn">
+  <p class="callout-title">Public-IP filter is conservative and IPv4-only</p>
+  <p><code>public_ipv4</code> rejects 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0.0/24, 192.0.2/24, 192.88.99/24, 192.168/16, 198.18/15, 198.51.100/24, 203.0.113/24, multicast and above, and <em>every</em> IPv6 address, including <code>::ffff:8.8.8.8</code> (<span class="src">crates/exoharness/src/egress/mod.rs:527-549</span>; test <span class="src">crates/exoharness/src/egress/tests.rs:929-944</span>). A host that has only AAAA records is unreachable through the proxy.</p>
+</div>
+
+<h2 id="substitution">Credential substitution</h2>
+
+<h3 id="binding-anatomy">Anatomy of a binding</h3>
+<p>A binding says: "environment variable <code>V</code> in the guest stands for secret <code>name</code>, usable on these hosts/URLs, in these places". <code>prepare_bindings</code> validates the variable name (<code>[A-Za-z_][A-Za-z0-9_]*</code>, no duplicates), normalises the networking policy, and mints (or validates, when caller-supplied) a placeholder of exactly <code>exo_egress_</code> + 32 hex characters (<span class="src">crates/exoharness/src/egress_credentials.rs:71-124</span>).</p>
+
+<h3 id="where">Where substitution happens</h3>
+<p><strong>Request headers only.</strong> There is no URL or body substitution: <code>validate_credentials</code> and <code>substitute_credentials</code> iterate <code>headers</code> and nothing else, and <code>CredentialInjectionLocation</code> (<code>deny_unknown_fields</code>) rejects <code>{"header": true, "body": true}</code> (test <span class="src">crates/exoharness/src/egress/tests.rs:1007-1010</span>). A placeholder in a URL or body is simply forwarded as the inert literal. Within headers the placeholder may be anywhere in the value, so <code>Bearer &lt;ph&gt;</code>, a bare <code>x-api-key</code>, and <code>Token &lt;ph&gt;; scope=read</code> all work (test <span class="src">crates/exoharness/src/egress/tests.rs:553-621</span>). There is one special case: for <code>Authorization: Basic</code> the proxy base64-decodes the value, substitutes inside <code>user:pass</code>, and re-encodes (<span class="src">crates/exoharness/src/egress_credentials.rs:209-225</span>, used by the Git smart-HTTP flow).</p>
+
+<figure class="code">
+  <figcaption><strong>Validate everything before resolving anything</strong> <span class="src">crates/exoharness/src/egress_credentials.rs:126-162</span></figcaption>
+  <pre><code class="language-rust">pub(crate) fn validate_credentials(
+    bindings: &amp;[Binding], headers: &amp;HeaderMap, destination: &amp;EgressDestination, tls: bool,
+) -&gt; Result&lt;()&gt; {
+    for (header, value) in headers {
+        let basic = basic_credential_placeholder(header, value)?;
+        let value = basic.as_deref().map(str::as_bytes).unwrap_or(value.as_bytes());
+        if !contains_placeholder(value) {
+            continue;
+        }
+        ensure!(tls, "credential substitution requires HTTPS");
+        ensure!(
+            !hop_header(header) &amp;&amp; header != HOST &amp;&amp; header != "content-length",
+            "credential cannot rewrite HTTP routing or framing"
+        );
+        ensure!(headers.get_all(header).iter().count() == 1, "duplicate credential header");
+        let mut unresolved = std::str::from_utf8(value)?.to_owned();
+        for binding in bindings {
+            if binding.permits_header(destination) {
+                unresolved = unresolved.replace(&amp;binding.placeholder, "");
+            }
+        }
+        ensure!(
+            !unresolved.contains(PLACEHOLDER_PREFIX),
+            "credential placeholder does not match this request"
+        );
+    }
+    Ok(())
+}</code></pre>
+</figure>
+
+<p>The last <code>ensure!</code> is the heart of the exfiltration defence. It removes every placeholder the binding set is allowed to resolve <em>for this destination</em> and then fails if any <code>exo_egress_</code> text survives. A request that carries a placeholder to a host the binding does not cover is rejected <em>before</em> the resolver is ever called, and before any upstream connection is opened. The tests assert this directly: after sending the placeholder to <code>public.test</code> and with a spoofed <code>Host: public.test</code>, <code>resolver.uses</code> is empty and <code>upstream.connections == 0</code> (<span class="src">crates/exoharness/src/egress/tests.rs:795-815</span>).</p>
+
+<figure class="code">
+  <figcaption><strong>The swap itself</strong> <span class="src">crates/exoharness/src/egress_credentials.rs:164-207</span></figcaption>
+  <pre><code class="language-rust">for binding in bindings {
+    if !binding.permits_header(destination) || !replacement.contains(&amp;binding.placeholder) {
+        continue;
+    }
+    let value = resolver
+        .resolve(identity, &amp;binding.config.name, destination)
+        .await?;
+    replacement = replacement.replace(&amp;binding.placeholder, &amp;value);
+    credentials.push((binding.config.name.clone(), value));
+}
+if encode_basic {
+    replacement = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(replacement));
+}
+let mut value = HeaderValue::from_str(&amp;replacement)
+    .map_err(|_| anyhow!("credential cannot be used in an HTTP header"))?;
+value.set_sensitive(true);
+*header_value = value;</code></pre>
+</figure>
+
+<p><code>set_sensitive(true)</code> marks the header so hyper/reqwest debug output redacts it. The substituted pairs are returned so the 401 path knows exactly which credential values were rejected.</p>
+
+<h3 id="host-binding">Host-binding: three allowlists that must all agree</h3>
+<p>A secret reaches an upstream only if all three of these independently permit the destination:</p>
+<ol class="steps">
+<li><strong>The sandbox network policy</strong> (<code>NetworkPolicy::permits_host</code>): can the sandbox talk to that host at all.</li>
+<li><strong>The binding's <code>CredentialNetworkPolicy</code></strong> (<code>Binding::permits_header</code>, <span class="src">crates/exoharness/src/egress_credentials.rs:59-69</span>): is the binding's host set a member <em>and</em> does the policy allow <code>https://host:port/path</code>.</li>
+<li><strong>The secret's own stored <code>CredentialPolicy</code></strong>, evaluated inside <code>BasicVaultHandle::read_for_destination</code> (<span class="src">crates/exoharness/src/vault/local.rs:451-479</span>) with an error that tells the operator to use <code>--allow-origin</code> / <code>--allow-url</code>.</li>
+</ol>
+<p>The docs state the consequence: "Expanding the sandbox's allowlist never expands a credential's allowed destinations." Layer 3 matters because layer 2 is built from the policy at sandbox creation time, whereas layer 3 is read live from the vault on every request, so shrinking or deleting a secret's policy takes effect immediately.</p>
+
+<figure class="code">
+  <figcaption><strong>A surprising guarantee: URL-scoped credentials match path and query exactly, and are checked before the resolver runs</strong> <span class="src">crates/exoharness/src/egress/tests.rs:2537-2569</span></figcaption>
+  <pre><code class="language-rust">policy.credentials[0].networking = CredentialNetworkPolicy::Destinations {
+    allowed_destinations: vec![crate::CredentialDestination::Url {
+        url: "HTTPS://API.TEST:443/auth?tenant=one".into(),
+    }],
+};
+// ...
+for (url, allowed) in [
+    ("https://api.test/auth?tenant=one", true),
+    ("https://api.test/auth?tenant=two", false),
+    ("https://api.test/auth", false),
+    ("https://api.test/auth/?tenant=one", false),
+    ("https://public.test/auth?tenant=one", false),
+] {
+    let response = client.get(url)
+        .header("authorization", format!("Bearer {placeholder}"))
+        .send().await?;
+    assert_eq!(response.status().is_success(), allowed, "{url}");
+}
+assert_eq!(resolver.uses.read().await.len(), 1);</code></pre>
+</figure>
+
+<p>Origin vs URL destinations (<span class="src">crates/exoharness/src/credential_policy.rs:65-72</span>): an <code>Origin</code> policy permits any destination with the same scheme+host+port; a <code>Url</code> policy permits only the identical normalised URL; an <code>Origin</code> never matches inside a <code>Url</code> policy and vice versa. The unit test lists the edge cases (<code>api.example.evil</code>, <code>?tenant=two</code>, trailing slash) at <span class="src">crates/exoharness/src/credential_policy.rs:209-239</span>.</p>
+
+<div class="callout surprise">
+  <p class="callout-title">A non-443 origin grant can never be used through the sandbox proxy</p>
+  <p><code>CredentialDestination::origin("HTTPS://API.EXAMPLE:8443")</code> is accepted and tested (<span class="src">crates/exoharness/src/credential_policy.rs:212</span>), and the docs say credentials "authorize one exact HTTPS origin, including its port". But <code>http_destination</code> only admits <code>("http", 80)</code> and <code>("https", 443)</code> (<span class="src">crates/exoharness/src/egress_credentials.rs:360-363</span>), and model/MCP/Git bindings additionally insist on 443. Such a grant is useful for host-side (non-sandbox) resolution only.</p>
+</div>
+
+<h3 id="resolver-chain">From placeholder to secret: the resolver chain</h3>
+<p>The <code>EgressCredentialResolver</code> trait (<span class="src">crates/exoharness/src/egress_credentials.rs:29-51</span>) is the extension point: <code>resolve(identity, binding_name, destination) -&gt; Result&lt;String, EgressError&gt;</code> plus an optional <code>refresh</code>. The local implementation is <code>LocalEgressResolver</code> (<span class="src">crates/exoharness/src/basic/egress.rs</span>):</p>
+<ol class="steps">
+<li>Load the persisted sandbox record and require <code>sandbox.running</code>.</li>
+<li>If an access policy is installed, rebuild the sandbox's authenticated <code>Caller</code> and re-run <code>harness.check(scope)</code>, so revoking a user's access to the thread revokes the sandbox's secrets.</li>
+<li>Look up <code>sandbox.credentials[binding_name]</code>, a <code>SecretReference { vault_id, secret_id }</code> <strong>pinned when the sandbox was created</strong> (<span class="src">crates/exoharness/src/basic/sandboxes.rs:1777-1790</span>).</li>
+<li><code>egress::vault::resolve_credential</code> builds the target URL from host, port and path and calls <code>vault.resolve_secret(secret_id, target)</code> (<span class="src">crates/exoharness/src/egress_credentials/vault.rs:33-58</span>).</li>
+</ol>
+
+<div class="callout idea">
+  <p class="callout-title">Idea worth stealing: bind names to IDs at attach time, resolve values at use time</p>
+  <p>Binding names for model/Git/MCP credentials are the secret's <em>ID</em> (<code>reference.secret_id.to_string()</code>, <span class="src">crates/executor/src/sandbox_policy.rs:146-165</span>). So rotation (same ID, new value, bumped <code>revision</code>) is picked up on the very next request, while deletion fails closed and "recreating its name does not restore access for the old sandbox" (docs/egress.md). Name-to-ID resolution happens exactly once, at sandbox creation, via <code>find_secret</code>; a later secret with the same name in a higher-precedence vault cannot hijack a running sandbox.</p>
+</div>
+
+<p>Another narrowing step: when the CLI turns a vault secret into a binding it calls <code>CredentialPolicy::for_destination</code>, which <em>replaces</em> the secret's possibly-broad policy with exactly the one destination the harness needs (<span class="src">crates/exoharness/src/credential_policy.rs:114-121</span>). A GitHub token whose policy permits both <code>github.com</code> and <code>api.github.com</code> becomes a Git-origin binding for the repo host plus a separate <code>GH_TOKEN</code> binding for <code>api.github.com</code>; a model key becomes a binding for the model's origin only; an MCP credential becomes a binding for the exact MCP URL (<span class="src">crates/executor/src/sandbox_policy.rs:53-242</span>).</p>
+
+<h3 id="refresh">401 handling and OAuth refresh in the proxy</h3>
+<p>If the upstream answers 401 and credentials were substituted, <code>State::forward</code> calls <code>resolver.refresh(identity, name, destination, rejected_value)</code> for each substituted credential. If any returns a new value, headers are rebuilt from the <em>original, pre-substitution</em> header map and the request is replayed once with the same buffered body (<span class="src">crates/exoharness/src/egress/mod.rs:370-398</span>). The local resolver only returns a value that differs from the rejected one (<span class="src">crates/exoharness/src/basic/egress.rs:62-73</span>). 403 never triggers a refresh. Test <code>oauth_retries_once_with_the_original_mcp_body_and_session</code> checks the three outcomes (refreshed 200, still-401 after one refresh, 403 with zero refresh calls) and that <code>mcp-session-id</code> and the body survive the replay (<span class="src">crates/exoharness/src/egress/tests.rs:1684-1716</span>).</p>
+
+<h2 id="rejections">Typed rejections to sandbox clients</h2>
+<p>Commit <code>58fa2ff</code> (#405) changed the resolver contract from <code>anyhow::Result</code> to a three-variant error so that a resolver can tell the sandbox <em>why</em> a request was refused without leaking internals:</p>
+
+<figure class="code">
+  <figcaption><strong>EgressError: one variant is allowed to speak to the guest</strong> <span class="src">crates/exoharness/src/egress_credentials.rs:324-340</span></figcaption>
+  <pre><code class="language-rust">#[derive(Debug, thiserror::Error)]
+pub enum EgressError {
+    /// A denial with a sandbox-safe message, returned as plain-text HTTP 403.
+    #[error("{0}")]
+    Rejected(String),
+    /// A policy denial whose diagnostic must not be exposed by the native proxy.
+    #[error("egress request denied: {0}")]
+    Denied(#[source] anyhow::Error),
+    /// I/O, corrupt stored state, or another internal failure.
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+pub fn denied(error: impl Into&lt;anyhow::Error&gt;) -&gt; EgressError {
+    EgressError::Denied(error.into())
+}</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><strong>The mapping to HTTP, where the guest actually sees it</strong> <span class="src">crates/exoharness/src/egress/mod.rs:594-618</span></figcaption>
+  <pre><code class="language-rust">Err(error) =&gt; {
+    tracing::debug!(%error, sandbox_id = %state.identity.sandbox_id, "egress request failed");
+    let (status, message) = match error {
+        EgressError::Rejected(message) =&gt; {
+            (StatusCode::FORBIDDEN, format!("{message}\n"))
+        }
+        EgressError::Denied(_) | EgressError::Internal(_) =&gt; (
+            StatusCode::BAD_GATEWAY,
+            "egress request denied or upstream unavailable\n".into(),
+        ),
+    };
+    // ... Full body, content-type: text/plain; charset=utf-8 ...</code></pre>
+</figure>
+
+<table>
+<thead><tr><th>Variant</th><th>Native proxy (guest sees)</th><th>Worker runtime (platform sees)</th></tr></thead>
+<tbody>
+<tr><td><code>Rejected(msg)</code></td><td>403, <code>text/plain</code>, <code>msg\n</code></td><td>403, <code>format!("{error:#}")</code></td></tr>
+<tr><td><code>Denied(_)</code></td><td>502, fixed generic text</td><td>403</td></tr>
+<tr><td><code>Internal(_)</code></td><td>502, fixed generic text</td><td>500</td></tr>
+</tbody>
+</table>
+<p>Worker mapping: <span class="src">crates/worker-runtime/src/operations.rs:148-158</span>. The motivating case is Git: a 403 with a human sentence reaches <code>git</code>'s stderr, where a 502 with a generic string did not. The test <code>credential_refresh_preserves_rejections_and_hides_internal_errors</code> pins the matrix, including that the failing <code>refresh</code> is called exactly once and that "private policy details" never appear in the body (<span class="src">crates/exoharness/src/egress/tests.rs:1719-1757</span>). Another test asserts a <code>Rejected</code> resolver produces zero new upstream connections (<span class="src">crates/exoharness/src/egress/tests.rs:738-751</span>). A session-level test verifies that policy denials (missing credential, Upgrade header) are <code>Denied</code> while a corrupt stored policy is <code>Internal</code> (<span class="src">crates/exoharness/src/egress_credentials/session.rs:159-225</span>).</p>
+
+<div class="callout surprise">
+  <p class="callout-title">Nothing in the repo produces <code>Rejected</code> yet</p>
+  <p>A grep for <code>EgressError::Rejected</code> finds the definition, the two match arms (<span class="src">crates/exoharness/src/egress/mod.rs:599</span>, <span class="src">crates/worker-runtime/src/operations.rs:152</span>) and tests. Both in-tree resolvers (<code>LocalEgressResolver</code> and the session <code>Resolver</code>) convert vault errors through <code>?</code> into <code>Internal</code>, so a message like "secret X is not authorized for https://..." from <code>read_for_destination</code> still surfaces to a local guest as the generic 502. The hook exists for hosted resolvers. Also note the commit message and PR call the type <code>EgressRejection</code>; the merged type is <code>EgressError::Rejected</code>.</p>
+</div>
+
+<h2 id="vaults">Vaults</h2>
+
+<h3 id="vault-model">Data model</h3>
+<p>A <code>VaultRecord</code> is <code>{id, name, created_at}</code>; a vault holds secrets, each with a <code>SecretMetadata</code> (<code>id</code>, <code>name</code>, <code>type</code>, optional <code>policy</code>, monotonically increasing <code>revision</code>) and an encrypted payload (<span class="src">crates/exoharness/src/types.rs:1294-1303</span>). The <code>Secret</code> payload is a tagged enum (<span class="src">crates/exoharness/src/types.rs:1498-1538</span>):</p>
+<table>
+<thead><tr><th><code>Secret</code> variant</th><th>Fields</th><th>Refresh</th></tr></thead>
+<tbody>
+<tr><td><code>Key</code></td><td><code>value</code></td><td>none (rotate with <code>exo vault secret update --token-env</code>)</td></tr>
+<tr><td><code>Oauth</code></td><td><code>access_token</code>, <code>refresh_token</code>, <code>expires_at</code>, <code>refresh: OAuthRefresh</code> (token endpoint, client id/secret, resource, scopes)</td><td>proactive (60 s before expiry) and reactive (after upstream 401)</td></tr>
+<tr><td><code>GithubCli</code></td><td><code>value</code>, <code>account</code></td><td>re-reads <code>gh auth token --user &lt;account&gt;</code> on the runtime host at most every 24 h; only creatable on a local vault (<code>require_portable_secret</code>)</td></tr>
+</tbody>
+</table>
+<p>Validation (<span class="src">crates/exoharness/src/vault.rs:75-101</span>): if a policy is set, the bearer value must be non-empty ASCII graphic (no whitespace or control characters, so it can never smuggle a header line); OAuth token endpoints must be HTTPS or loopback HTTP.</p>
+
+<h3 id="scoping">Scoping and precedence</h3>
+<p>The code has no "user/agent/thread vault" types; scope is composition. A <code>VaultContext</code> lists vaults in <em>increasing</em> precedence and <code>find_secret</code> walks them in reverse, so the last match wins (<span class="src">crates/exoharness/src/vault.rs:178-198</span>):</p>
+<pre class="diagram">
+  global  (always)  &lt;  [personal: the signed-in user's vault, on authenticated servers]
+          &lt;  agent.vaults  &lt;  thread.vaults  (later attachments beat earlier ones)
+</pre>
+<ul>
+<li>Agent: <code>BasicAgentHandle::list_vaults</code> starts from the global vault, adds the caller's default ("personal") vault when authenticated, then the agent's attached vaults. Thread: the agent's list plus the thread's attached vaults (<span class="src">crates/exoharness/src/basic/access.rs:222-290</span>). Unauthenticated local use goes through <code>compose_vaults</code>, which de-duplicates so an explicitly attached vault moves to the end (<span class="src">crates/exoharness/src/vault.rs:164-176</span>).</li>
+<li>Resolution by ID wins over names: a secret literally named like another secret's UUID in a different vault cannot shadow it (<code>secret_ids_cannot_be_shadowed_by_names</code>, <span class="src">crates/exoharness/src/vault/local/tests.rs:464-490</span>).</li>
+<li>For MCP, <code>VaultSelection::from_vaults</code> picks per-server credentials by policy match, preferring an exact URL grant over an origin grant, and errors when two secrets in the same vault tie ("narrow their policies to select one credential"). The selection is saved as a thread artifact and cannot be changed afterwards (<span class="src">crates/managed-agents/src/vaults.rs:49-86</span>, <span class="src">:123-139</span>).</li>
+<li>Names are unique within a vault, and so are <code>Url</code>-style resource policies (one secret per exact MCP URL per vault) (<span class="src">crates/exoharness/src/vault/local.rs:317-325</span>).</li>
+</ul>
+
+<h3 id="presets">Presets and the CLI</h3>
+<p><code>exo vault secret create &lt;vault&gt; [name] ...</code> needs one source: <code>--token-env VAR</code> (import), <code>--preset</code>, <code>--url</code> (OAuth discovery from an MCP URL), <code>--client-id</code> (device flow), or <code>--from-agent FILE</code> (<span class="src">crates/cli/src/vaults.rs:73-95</span>). Destination flags: <code>--allow-origin</code>, <code>--allow-url</code>, or <code>--policy FILE</code> (<span class="src">crates/cli/src/vaults.rs:38-71</span>).</p>
+<table>
+<thead><tr><th>Preset</th><th>Default name</th><th>Default policy</th><th>Source</th></tr></thead>
+<tbody>
+<tr><td><code>openai</code></td><td><code>openai</code></td><td>origin <code>https://api.openai.com</code></td><td>reads <code>OPENAI_API_KEY</code> from the CLI env; rejects OAuth flags</td></tr>
+<tr><td><code>github</code></td><td><code>github</code></td><td>origins <code>https://github.com</code> + <code>https://api.github.com</code></td><td>local: links the <code>gh</code> CLI account as <code>GithubCli</code>; remote: copies the token as a plain <code>Key</code>; or <code>--client-id</code> for device flow</td></tr>
+</tbody>
+</table>
+<p>Those are the only two presets (<span class="src">crates/cli/src/vaults/login.rs:11-15</span>, <span class="src">:82-106</span>). There is no <code>--preset anthropic</code>; use <code>--token-env ANTHROPIC_API_KEY --allow-origin https://api.anthropic.com</code>.</p>
+
+<h3 id="oauth">OAuth login and refresh</h3>
+<ul>
+<li><strong>Interactive login for MCP servers</strong> (<code>--url</code> / <code>--from-agent</code>): <code>prepare_mcp_login</code> does standard discovery via rmcp, falling back to probing for a <code>401 WWW-Authenticate</code> challenge (<span class="src">crates/cli/src/vaults/login.rs:162-185</span>). <code>crate::oauth::authorize_with</code> binds <code>127.0.0.1:0</code>, runs a one-shot actix server for <code>/callback</code>, checks the <code>state</code> parameter against a CSRF token, supports RFC 9207 <code>iss</code>, and times out after 300 s or on Ctrl-C (<span class="src">crates/cli/src/oauth.rs:73-150</span>). Tokens are held in an in-memory credential store and only written to the vault afterwards; <code>failed_authorization_preserves_existing_vault_entry</code> covers the failure case.</li>
+<li><strong>Device flow</strong> (<code>--client-id</code> + <code>--device-url</code>/<code>--token-url</code>, or the GitHub defaults): <span class="src">crates/cli/src/vaults/login.rs:240-298</span>. Error text from the OAuth server is escape-sanitised before printing (test <code>device_login_reports_errors_without_echoing_server_secrets</code>).</li>
+<li><strong>Refresh</strong> lives in the vault, not the proxy: <code>BasicVaultHandle::resolve_credentials</code> refreshes when an OAuth secret expires within 60 s (<span class="src">crates/exoharness/src/vault/local/oauth.rs:19-21</span>), and <code>refresh_secret</code> forces it after an upstream rejection. It uses the <code>oauth2</code> crate with redirects disabled (<span class="src">crates/exoharness/src/vault/local/oauth.rs:110-122</span>).</li>
+</ul>
+
+<figure class="code">
+  <figcaption><strong>Refresh is a compare-and-swap on the secret's revision, run detached from the caller</strong> <span class="src">crates/exoharness/src/vault/local.rs:543-590</span></figcaption>
+  <pre><code class="language-rust">let (done, completion) = futures::channel::oneshot::channel();
+self.refresh_host()?.spawn(Box::pin(async move {
+    let result = vault.refresh(&amp;id, &amp;target, revision, force).await;
+    if done.send(result).is_err() {
+        tracing::debug!("OAuth caller stopped before refresh finished");
+    }
+}));
+// ...
+async fn refresh(&amp;self, id: &amp;SecretId, target: &amp;CredentialDestination, revision: u64, force: bool) -&gt; Result&lt;ResolvedSecret&gt; {
+    let _guard = self.refresh_guard(id).await?;
+    let resolved = self.read_for_destination(id, target).await?;
+    if resolved.revision != revision
+        || (!force &amp;&amp; !self.platform_needs_refresh(id, &amp;resolved)?)
+    {
+        return Ok(resolved);
+    }
+    // ... exchange refresh token, then persist_refreshed():
+    //     bail!("credential changed during refresh; retry the operation") if revision moved
+}</code></pre>
+</figure>
+
+<div class="callout idea">
+  <p class="callout-title">Idea worth stealing: refresh tokens rotate, so never let the caller's cancellation lose the new one</p>
+  <p>Many OAuth servers invalidate the old refresh token the moment they issue a new one. If the request that triggered the refresh is cancelled after the server responds but before the vault write, the grant is bricked. Exo runs the refresh on a spawned task, serialises it with a file lock (<code>oauth.lock</code>, 60 s wait) so multiple processes sharing a state dir cooperate, and persists with a revision check. Tests: <code>refresh_survives_cancellation_and_persists_before_reuse</code> (abort the caller, still see the rotated token on disk after reopening, <span class="src">crates/cli/tests/vault_oauth.rs:795-849</span>), <code>refresh_cannot_restore_a_revoked_or_manually_rotated_secret</code> (delete or overwrite the secret mid-refresh and the refresh result is discarded, <span class="src">crates/cli/tests/vault_oauth.rs:602-648</span>), and <code>refresh_errors_and_redirects_leave_the_grant_intact</code> (a 307 to <code>/leaked</code> is never followed).</p>
+</div>
+
+<h3 id="at-rest">Secret storage at rest</h3>
+<ul>
+<li><strong>Layout.</strong> One JSON catalog <code>&lt;root&gt;/vaults/vaults.json</code> written via temp file + <code>fsync</code> + rename, serialised by an <code>flock</code> on <code>vaults.lock</code> in a mode-0700 directory (<span class="src">crates/exoharness/src/vault/local/native.rs:35-59</span>). Metadata is plaintext JSON; each secret payload is <code>{algorithm, nonce, ciphertext}</code>. On Cloudflare/wasm the same catalog lives in an object store behind an async mutex (<span class="src">crates/exoharness/src/vault/local.rs:84-102</span>).</li>
+<li><strong>Cipher.</strong> AES-256-GCM, random 96-bit nonce (UUIDv4 prefix), key supplied by a <code>SecretKeyProvider</code> (<span class="src">crates/exoharness/src/secrets.rs:14-77</span>).</li>
+<li><strong>Master key.</strong> Chosen by <code>--secret-backend</code> / <code>EXO_SECRET_BACKEND</code>: <code>apple-keychain</code> (macOS Keychain entry holds the 32-byte key only) or <code>file</code> (<code>&lt;root&gt;/master.key</code> or <code>EXO_MASTER_KEY_PATH</code>, created with a 0600 temp file and <code>persist_noclobber</code>) (<span class="src">crates/exoharness/src/secrets/native.rs:6-9</span>, <span class="src">:54-89</span>, <span class="src">:154-169</span>; <span class="src">crates/cli/src/main.rs:409-416</span>). Tests use <code>Static</code>.</li>
+</ul>
+
+<figure class="code">
+  <figcaption><strong>The ciphertext is bound to its own metadata, including the policy</strong> <span class="src">crates/exoharness/src/vault/local.rs:262-270</span></figcaption>
+  <pre><code class="language-rust">fn encrypt(
+    cipher: &amp;SecretCipher,
+    vault_id: VaultId,
+    metadata: &amp;SecretMetadata,
+    secret: &amp;Secret,
+) -&gt; Result&lt;EncryptedSecret&gt; {
+    validate_secret(secret, metadata.policy.as_ref())?;
+    cipher.encrypt_bound(secret, &amp;serde_json::to_vec(&amp;(vault_id, metadata))?)
+}</code></pre>
+</figure>
+
+<figure class="code">
+  <figcaption><strong>Test: editing the plaintext policy makes the secret undecryptable</strong> <span class="src">crates/exoharness/src/vault/local/tests.rs:287-305</span></figcaption>
+  <pre><code class="language-rust">let path = temp.path().join("vaults/vaults.json");
+let mut catalog: Catalog = serde_json::from_slice(&amp;std::fs::read(&amp;path)?)?;
+let attacker = CredentialDestination::url("https://attacker.example/mcp")?;
+catalog.vaults[0].secrets[0].metadata.policy = Some(attacker.clone().into());
+std::fs::write(path, serde_json::to_vec(&amp;catalog)?)?;
+assert!(vault.resolve_secret(&amp;id, &amp;attacker).await.is_err());</code></pre>
+</figure>
+
+<div class="callout idea">
+  <p class="callout-title">Idea worth stealing: put the authorization policy in the AEAD's associated data</p>
+  <p>Because the AAD is <code>(vault_id, metadata)</code> and metadata includes <code>name</code>, <code>id</code>, <code>revision</code> and <code>policy</code>, an attacker with write access to the JSON file (but not the master key) can neither widen a secret's destinations, move a ciphertext between vaults, nor roll back to an older revision's metadata. Policy and secret are one tamper-evident unit. This is how the "where may this be sent" rule gets the same protection as the secret itself.</p>
+</div>
+
+<h2 id="model-credentials">How model credentials flow</h2>
+<p>An agent definition names a credential, never a key: <code>model.credential: openai</code>. Resolution is the same <code>find_secret</code> walk over the thread's vaults; if absent it is a hard error, "Missing model credentials fail instead of falling back to host API keys" (<span class="src">crates/executor/src/harness_helpers.rs:198-210</span>). From there the path depends on where the model client runs.</p>
+
+<table>
+<thead><tr><th>Harness</th><th>Where the HTTP call is made</th><th>What happens to the key</th></tr></thead>
+<tbody>
+<tr><td>Codex (<code>OPENAI_API_KEY</code>), Claude Code (<code>ANTHROPIC_API_KEY</code>), Pi (<code>OPENAI</code>/<code>ANTHROPIC</code>/<code>GEMINI</code>_API_KEY by provider prefix)</td><td>Inside the sandbox</td><td><code>add_model_binding</code> adds an <code>EgressCredentialBinding</code> for that env var, narrowed with <code>for_destination</code> to the model origin; the guest sees a placeholder, the proxy swaps. The key variable per harness comes from <code>sandbox_model_credential_variable</code> (<span class="src">crates/executor/src/managed_agents/config.rs:71-99</span>).</td></tr>
+<tr><td>Basic / RLM / host-side TypeScript</td><td>In the runtime process</td><td><code>resolve_model</code> → <code>resolve_model_key</code> reads the raw key on the host, still gated by the secret's origin policy (<span class="src">crates/exoharness/src/vault.rs:221-233</span>). No sandbox, no placeholder.</td></tr>
+</tbody>
+</table>
+
+<figure class="code">
+  <figcaption><strong>Wiring a vault key into a sandbox policy, with conflict checks</strong> <span class="src">crates/executor/src/sandbox_policy.rs:146-186</span></figcaption>
+  <pre><code class="language-rust">let reference = crate::harness_helpers::model_credential(conversation, agent_config).await?;
+let endpoint = exoharness::vault::model_endpoint(agent_config.base_url.as_deref(), variable)?;
+let host = endpoint.host_str().expect("validated model endpoint");
+let target = exoharness::CredentialDestination::origin(&amp;endpoint.origin().ascii_serialization())?;
+let credential_policy = exoharness::vault::credential_policy(conversation, &amp;reference)
+    .await?
+    .for_destination(target.clone())?;          // fails if the secret's policy doesn't allow it
+let policy = configured.get_or_insert_with(|| default_policy.clone());
+anyhow::ensure!(policy.networking_enabled(), "sandbox models require networking");
+ensure_host_allowed(policy, host, "model endpoint")?;   // Limited networking is NOT auto-expanded
+if let Some(existing) = policy.credentials.iter_mut()
+    .find(|binding| binding.environment_variable == variable)
+{
+    // an environment-declared credential for the same variable must select the same secret
+    // ...
+} else {
+    policy.credentials.push(credential_policy.binding(reference.secret_id.to_string(), variable.into()));
+}</code></pre>
+</figure>
+
+<p>Constraints: <code>model_endpoint</code> only knows <code>OPENAI_API_KEY</code>, <code>ANTHROPIC_API_KEY</code>, <code>GEMINI_API_KEY</code>, and requires HTTPS on 443 with no userinfo, query or fragment (<span class="src">crates/exoharness/src/vault.rs:200-219</span>). Only API keys are supported for sandboxed models; OAuth/subscription caches are not. A missing secret policy yields "credential has no permitted destinations; set its policy with --allow-origin, --allow-url, or --policy" (<span class="src">crates/exoharness/src/vault.rs:251-258</span>).</p>
+
+<h2 id="mcp">MCP and Git credentials</h2>
+<ul>
+<li><strong>Host-side MCP clients</strong> (Basic, RLM, Pi): <code>exo_mcp</code> wraps the rmcp streamable-HTTP transport in <code>CredentialClient</code> so every request calls <code>McpCredentialProvider::resolve</code>, and one retry is made after a 401 using <code>refresh</code> (<span class="src">crates/mcp/src/auth.rs:40-88</span>, <span class="src">crates/mcp/src/client.rs:113-136</span>). The vault-backed provider compares a <code>vault:secret:revision</code> version string with the rejected one so a concurrent refresh by another caller is reused rather than repeated (<span class="src">crates/managed-agents/src/vaults.rs:220-266</span>). Failure messages name the server, secret IDs and selected vaults, never the token (<span class="src">crates/managed-agents/src/vaults.rs:177-204</span>).</li>
+<li><strong>Native MCP clients inside the sandbox</strong> (Codex, Claude Code): each authenticated server gets an env var <code>EXO_MCP_&lt;secret-id&gt;</code> (<span class="src">crates/executor/src/mcp_types.rs:18-20</span>) holding a placeholder, and a binding whose destination is the exact MCP URL including path and query (<span class="src">crates/executor/src/sandbox_policy.rs:188-242</span>). It is the same proxy path as model keys, including 401 refresh. See <a href="tools-and-mcp.html">Tools &amp; MCP</a>.</li>
+<li><strong>Git over HTTPS</strong> uses <code>Authorization: Basic</code>; the proxy decodes <code>user:placeholder</code>, substitutes, re-encodes. The resolver sees method and path and may restrict to the four smart-HTTP endpoints (<code>info/refs</code> for upload/receive-pack, and the two POSTs); the Git test resolver does exactly that and an unlisted repo path gives 502 (<span class="src">crates/exoharness/src/egress/tests.rs:624-708</span>). Authorization of <em>which repository</em> is the resolver's job, not Exo's.</li>
+</ul>
+
+<h2 id="hosted">Hosted variants: sessions and CONNECT servers</h2>
+<p>Two APIs let a hosted runtime reuse the same substitution rules without the native listeners:</p>
+<ul>
+<li><code>EgressSession</code> (<span class="src">crates/exoharness/src/egress_credentials/session.rs:13-102</span>) persists <code>{identity, policy, placeholder env}</code> to storage at <code>sandbox/&lt;id&gt;/egress.json</code>. On re-configure it keeps the placeholder for any binding that is unchanged, so running processes keep working. <code>rewrite</code> re-authorizes against the network policy, rebuilds the bindings from stored placeholders, and returns the rewritten headers plus <em>SHA-256 fingerprints</em> (not values) of the substituted credentials and a <code>refreshed</code> flag. A caller that sees a 401 passes the fingerprints back as <code>rejected</code>, and the vault only refreshes if the current value still hashes to that fingerprint (<span class="src">crates/exoharness/src/egress_credentials/vault.rs:5-16</span>).</li>
+<li><code>serve_connect_proxy</code> / <code>ProxyAuthorizer</code> / <code>ProxySession</code> (<span class="src">crates/exoharness/src/egress/explicit.rs:9-75</span>): a shared listener where each CONNECT is authenticated with Basic credentials and mapped to a sandbox session; <code>None</code> gives 407, an error or a 10 s timeout gives 503. The test <code>hosted_proxy_selects_and_isolates_sessions_on_one_listener</code> exercises it.</li>
+</ul>
+
+<h2 id="docs-vs-code">Docs versus code</h2>
+<table>
+<thead><tr><th>Claim</th><th>Reality</th></tr></thead>
+<tbody>
+<tr><td>website vaults.md: "Shared identities ... Planned. This feature is not implemented yet." with <code>exo vault bind alice --email ...</code></td><td>Implemented: <code>Commands::Vault { Bind }</code> dispatches to <code>identity::run(... BindVault ...)</code> (<span class="src">crates/cli/src/main.rs:1170</span>) and the Slack adapter reads <code>use_sender_vault</code> (<span class="src">crates/executor/src/managed_agents/adapters/slack.rs:357</span>). The docs are stale.</td></tr>
+<tr><td>exoharness/docs/spec.md: "bindings" and conflict "conversation-scoped values override agent-scoped values"</td><td>That spec predates vaults; <code>spec.md</code> and <code>http.md</code> never mention "vault". Today's rule is global &lt; personal &lt; agent &lt; thread by vault attachment order.</td></tr>
+<tr><td>docs/egress.md: "Every credential must specify <code>limited</code> ... <code>allowed_hosts</code>"</td><td>True for environment-supplied bindings, but code also has <code>CredentialNetworkPolicy::Destinations</code> which is what every CLI-generated binding (model, Git, MCP) uses.</td></tr>
+<tr><td>docs/egress.md: "body substitution ... outside the current implementation"</td><td>Accurate; there is no body or URL substitution path at all.</td></tr>
+<tr><td>PR #405 title / message: <code>EgressRejection</code></td><td>Type is <code>EgressError::Rejected</code>; no non-test constructor exists.</td></tr>
+<tr><td>docs/egress.md (Git section): "Exo resolves the selected binding and forwards only requests the resolver authorizes"</td><td>True, but a refused Git operation reaches <code>git</code> as an opaque 502 unless the resolver returns <code>EgressError::Rejected</code>: the in-tree <code>GitResolver</code> test double returns a plain <code>anyhow!</code> (<span class="src">crates/exoharness/src/egress/tests.rs:100-117</span>, 502 asserted at <span class="src">:685-704</span>).</td></tr>
+</tbody>
+</table>
+
+<h2 id="test-map">Where the spec lives: a reading list</h2>
+<p><span class="src">crates/exoharness/src/egress/tests.rs</span> (2.8k lines) is the best specification of the proxy. Quick index:</p>
+<table>
+<thead><tr><th>Test</th><th>Guarantee</th><th>Line</th></tr></thead>
+<tbody>
+<tr><td><code>proxy_substitutes_placeholders_in_header_formats</code></td><td>Bearer / raw / embedded placeholders; <code>connection</code> and <code>proxy-authorization</code> headers cannot carry one</td><td><span class="src">crates/exoharness/src/egress/tests.rs:553</span></td></tr>
+<tr><td><code>proxy_resolves_current_credentials_for_each_request</code></td><td>Rotation and revocation on the next request; typed 403 vs generic 502</td><td><span class="src">crates/exoharness/src/egress/tests.rs:711</span></td></tr>
+<tr><td><code>proxy_rejects_cleartext_wrong_destinations_and_other_sandboxes</code></td><td>No placeholders over plain HTTP, wrong host, spoofed Host, other sandbox's proxy; redirects are returned, not followed</td><td><span class="src">crates/exoharness/src/egress/tests.rs:767</span></td></tr>
+<tr><td><code>connect_stream_uses_supplied_placeholder_and_checks_both_hosts</code></td><td>CONNECT authority, SNI and Host must all agree</td><td><span class="src">crates/exoharness/src/egress/tests.rs:839</span></td></tr>
+<tr><td><code>credential_networking_is_independent_of_environment_networking</code></td><td>Sandbox hosts and credential hosts are separate sets</td><td><span class="src">crates/exoharness/src/egress/tests.rs:966</span></td></tr>
+<tr><td><code>proxy_enforces_request_body_limit</code>, <code>quiet_response_stream_survives_past_the_request_io_timeout</code></td><td>Request body cap; responses (SSE) may idle past the 30 s I/O timeout</td><td><span class="src">crates/exoharness/src/egress/tests.rs:493</span>, <span class="src">:1628</span></td></tr>
+<tr><td><code>hosted_proxy_bounds_connections_and_cancels_pending_tls</code></td><td>Connection cap and cancellation</td><td><span class="src">crates/exoharness/src/egress/tests.rs:2292</span></td></tr>
+<tr><td><code>native_tls_uses_the_external_proxys_identity_and_credential_resolver</code></td><td>External-proxy mode keeps the same resolver</td><td><span class="src">crates/exoharness/src/egress/tests.rs:2792</span></td></tr>
+</tbody>
+</table>
+
+</main>
+<aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/wiki.js"></script>
+</body>
+</html>

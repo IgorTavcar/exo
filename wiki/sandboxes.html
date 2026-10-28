@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sandboxes · Exo internals</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav id="nav"></nav>
+<main>
+<header>
+  <div class="kicker">Runtime internals</div>
+  <h1>Sandboxes</h1>
+  <p class="lede">A sandbox is a named, restartable execution environment that the harness owns and a provider implements. This page covers the two provider traits, what each of the ten backends actually does, the lifecycle and idle-TTL rules, the process model, mounts and resources, snapshots, and the Firecracker stack end to end (OCI image to ext4, jailer, vsock guest agent, Lima on macOS).</p>
+</header>
+
+<h2 id="overview">Overview: who owns what</h2>
+<p>Three layers, each with a narrow job. The <strong>executor</strong> decides what sandbox a thread should have (image, provider, mounts, policy, ports, idle seconds). The <strong>harness</strong> (<code>BasicExoHarness</code>) persists a <code>StoredSandbox</code> record per sandbox, keeps a per-process map of live handles, and records lifecycle in the thread's event log. A <strong>provider</strong> implements <code>ManagedSandboxBackend</code> (factory) and <code>ManagedSandboxHandle</code> (one live sandbox). The harness never inspects provider internals; it only stores an opaque <code>provider_state</code> JSON blob and hands it back on the next <code>acquire</code>.</p>
+
+<svg class="diagram" viewBox="0 0 760 420" role="img" aria-label="Sandbox layering">
+  <defs><marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z"/></marker></defs>
+  <rect class="box-blue" x="20" y="14" width="720" height="64" rx="8"/>
+  <text class="b" x="36" y="36">Executor (crates/executor)</text>
+  <text class="muted" x="36" y="54">conversation_sandbox.rs: spec + find-or-create | sandbox_policy.rs: egress policy | sandbox_resources.rs: Git workspaces</text>
+  <text class="muted" x="36" y="69">previews.rs: host-header proxy | native/local_sandbox.rs: route sandbox ops to a local harness</text>
+  <path class="arrow" d="M380,78 L380,98"/>
+  <rect class="box-teal" x="20" y="98" width="720" height="80" rx="8"/>
+  <text class="b" x="36" y="120">BasicExoHarness (exoharness/src/basic/sandboxes.rs)</text>
+  <text class="muted" x="36" y="138">StoredSandbox JSON per sandbox | running_sandboxes: id -> Arc&lt;dyn ManagedSandboxHandle&gt; (per process)</text>
+  <text class="muted" x="36" y="154">events: SandboxStarted / Stopped / Snapshotted / ProcessStarted / ProcessEvent / sandbox_provider_state</text>
+  <text class="muted" x="36" y="169">SandboxBackendRegistration: lazy factory per provider, cached by sandbox_backend_for_provider</text>
+  <path class="arrow" d="M380,178 L380,198"/>
+  <rect class="box-accent" x="20" y="198" width="720" height="64" rx="8"/>
+  <text class="b" x="36" y="220">ManagedSandboxBackend / ManagedSandboxHandle (exoharness/src/sandbox.rs)</text>
+  <text class="muted" x="36" y="238">acquire, attach, acquire_from_snapshot, suspend, fork_sandbox, terminate | exec, start_process, start_terminal,</text>
+  <text class="muted" x="36" y="253">connect_tcp, snapshot, stop, is_running, activity. Optional capabilities default to bail!()</text>
+  <path class="arrow" d="M130,262 L130,286"/>
+  <path class="arrow" d="M380,262 L380,286"/>
+  <path class="arrow" d="M630,262 L630,286"/>
+  <rect class="box" x="20" y="286" width="220" height="112" rx="8"/>
+  <text class="b" x="34" y="306">Local, same host</text>
+  <text class="muted" x="34" y="324">docker, apple_container (CLI)</text>
+  <text class="muted" x="34" y="340">local_process (no isolation)</text>
+  <text class="muted" x="34" y="356">smolvm (libkrun microVM)</text>
+  <text class="muted" x="34" y="372">firecracker (KVM, jailer)</text>
+  <text class="muted" x="34" y="388">  + Lima bridge on macOS</text>
+  <rect class="box" x="270" y="286" width="220" height="112" rx="8"/>
+  <text class="b" x="284" y="306">Remote, REST/SDK</text>
+  <text class="muted" x="284" y="324">daytona, e2b, sprites</text>
+  <text class="muted" x="284" y="340">vercel, aws_agentcore</text>
+  <text class="muted" x="284" y="360">in-sandbox process bridge (Python)</text>
+  <text class="muted" x="284" y="376">for stdin/streaming where the</text>
+  <text class="muted" x="284" y="390">platform lacks it</text>
+  <rect class="box-warn" x="520" y="286" width="220" height="112" rx="8"/>
+  <text class="b" x="534" y="306">Cloudflare (separate)</text>
+  <text class="muted" x="534" y="324">exoharness/cloudflare/src/sandbox.ts</text>
+  <text class="muted" x="534" y="340">Durable Object + Container,</text>
+  <text class="muted" x="534" y="356">not a Rust provider; its own</text>
+  <text class="muted" x="534" y="372">idle alarm and snapshots</text>
+</svg>
+
+<p>The identity of a sandbox is <code>sandbox_id</code>; the identity of a <em>configuration</em> is <code>sandbox_spec_hash(&amp;SandboxSpec)</code>, a <code>DefaultHasher</code> hash of image, resources, mounts, durable filesystems, egress policy, workdir and TCP ports <span class="src">crates/exoharness/src/sandbox.rs:80-91</span> <span class="src">crates/exoharness/src/sandbox.rs:513-517</span>. Every local backend keys its warm instance on <code>(sandbox_id, spec_hash)</code>, so changing any spec field replaces the warm instance instead of mutating it. The executor mirrors this: <code>ConversationSandboxInfo::matches_spec</code> compares the same fields before reusing a recorded sandbox <span class="src">crates/executor/src/conversation_sandbox.rs:29-41</span>.</p>
+
+<h2 id="provider-traits">The provider abstraction</h2>
+<p>Two async traits in <span class="src">crates/exoharness/src/sandbox.rs</span>. The design rule is visible in the defaults: <strong>every optional capability has a default body that fails loudly</strong> (<code>bail!("sandbox backend does not support ...")</code>) or returns "unknown" (<code>Ok(None)</code>, <code>false</code>), so a provider implements only what it can honestly do and callers probe via <code>supports_tcp()</code>, <code>consumable_snapshot_formats()</code> or by handling the error.</p>
+
+<figure class="code">
+  <figcaption><strong>The per-sandbox handle: required core, optional capabilities that default to bail</strong> <span class="src">crates/exoharness/src/sandbox.rs:213-316</span></figcaption>
+  <pre><code class="language-rust">#[async_trait]
+pub trait ManagedSandboxHandle: Send + Sync {
+    fn id(&amp;self) -&gt; &amp;str;
+
+    fn provider_state(&amp;self) -&gt; Option&lt;Value&gt; {
+        None
+    }
+    // ... effective_image, command_environment, is_running (default Ok(None))
+
+    /// Keep this sandbox available during a turn. Backends whose lifecycle
+    /// already covers turn activity do not need a separate guard.
+    async fn activity(&amp;self) -&gt; Result&lt;crate::SandboxActivity&gt; {
+        Ok(crate::SandboxActivity::noop())
+    }
+
+    async fn exec(&amp;self, command: &amp;SandboxCommand) -&gt; Result&lt;SandboxCommandOutput&gt;;
+
+    async fn start_process(&amp;self, command: &amp;SandboxCommand) -&gt; Result&lt;crate::SandboxProcessParts&gt;;
+
+    /// Start a process whose ID remains usable through this sandbox's process API.
+    /// Once started, dropping a wait or output request must not cancel the process.
+    async fn start_managed_process(
+        &amp;self,
+        _command: &amp;SandboxCommand,
+        _stdin: crate::SandboxProcessStdin,
+    ) -&gt; Result&lt;crate::SandboxProcessId&gt; {
+        bail!("sandbox backend does not support managed processes")
+    }
+    // ... write_process_input, close_process_input, process_events,
+    //     wait_process, cancel_process: same default
+
+    async fn start_terminal(
+        &amp;self,
+        _command: &amp;SandboxCommand,
+        _size: crate::SandboxTerminalSize,
+    ) -&gt; Result&lt;crate::SandboxTerminalParts&gt; {
+        bail!("sandbox backend does not support terminal sessions")
+    }
+
+    fn supports_tcp(&amp;self) -&gt; bool {
+        false
+    }
+
+    async fn connect_tcp(&amp;self, _port: u16) -&gt; Result&lt;Option&lt;BoxSandboxTcpStream&gt;&gt; {
+        Ok(None)
+    }
+
+    async fn stop(&amp;self) -&gt; Result&lt;()&gt;;
+    // ... detach
+
+    /// Capture the requested state and leave the source usable. Reject unsupported
+    /// kinds or writable mounts before capture; never silently omit filesystem state.
+    async fn snapshot(&amp;self, kind: crate::SnapshotKind) -&gt; Result&lt;SnapshotPayload&gt;;
+    // ... snapshot_template, delete_snapshot: default bail
+}</code></pre>
+</figure>
+
+<p>The factory trait <span class="src">crates/exoharness/src/sandbox.rs:350-507</span> has six required methods (<code>is_local</code>, <code>consumable_snapshot_formats</code>, <code>acquire</code>, <code>attach</code>, <code>acquire_from_snapshot</code>, <code>suspend</code>) and optional ones for explicit <code>terminate</code>, <code>fork_sandbox</code>, <code>materialize_resources</code>, <code>resolve_image</code>, <code>with_external_proxy</code>, and reconnect/stop hooks for stateless remote IDs (<code>resolve_existing</code>, <code>stop_existing</code>, <code>stop_requires_provider_state</code>, <code>invalidates_handle</code>). Two contract sentences in the doc comments carry real weight: <code>acquire</code> must "enforce <code>request.spec.policy</code> before returning a usable handle. Attach, restore, and fork must provide the same guarantee or reject the policy", and <code>terminate</code> "must be idempotent".</p>
+
+<figure class="code">
+  <figcaption><strong>Backend factory: acquire, restore, suspend, fork</strong> <span class="src">crates/exoharness/src/sandbox.rs:388-397</span> <span class="src">crates/exoharness/src/sandbox.rs:468-507</span></figcaption>
+  <pre><code class="language-rust">    /// Formats this backend can consume in `acquire_from_snapshot`.
+    fn consumable_snapshot_formats(&amp;self) -&gt; &amp;[SnapshotFormat];
+    // ...
+    /// Enforce `request.spec.policy` before returning a usable handle. Attach,
+    /// restore, and fork must provide the same guarantee or reject the policy.
+    async fn acquire(&amp;self, request: SandboxRequest) -&gt; Result&lt;Arc&lt;dyn ManagedSandboxHandle&gt;&gt;;
+    // ...
+    async fn acquire_from_snapshot(
+        &amp;self,
+        request: SandboxRequest,
+        payload: SnapshotPayload,
+    ) -&gt; Result&lt;Arc&lt;dyn ManagedSandboxHandle&gt;&gt;;
+
+    /// Capture the requested state and release execution resources. Restore it
+    /// with acquire_from_snapshot; unsupported kinds must leave the source intact.
+    /// The returned snapshot has its own lifetime and is deleted with delete_snapshot.
+    /// Used by the hosted sandbox service to checkpoint before releasing a VM.
+    async fn suspend(
+        &amp;self,
+        request: SandboxRequest,
+        kind: crate::SnapshotKind,
+    ) -&gt; Result&lt;SnapshotPayload&gt;;
+    // ...
+    /// Copy the current state of `source` to `target`.
+    async fn fork_sandbox(
+        &amp;self,
+        _source: SandboxRequest,
+        _target: SandboxRequest,
+    ) -&gt; Result&lt;Arc&lt;dyn ManagedSandboxHandle&gt;&gt; {
+        bail!("sandbox backend does not support forking")
+    }</code></pre>
+</figure>
+
+<h3 id="open-strings">Open string identifiers, closed capability checks</h3>
+<p><code>SandboxProvider</code> and <code>SnapshotFormat</code> are <code>Cow&lt;'static, str&gt;</code> newtypes with associated constants rather than enums <span class="src">crates/exoharness/src/types.rs:1020-1045</span> <span class="src">crates/exoharness/src/sandbox.rs:137-197</span>. A third party can register a provider or a private snapshot format without touching core. Compatibility lives in <code>SnapshotFormat::from_serialized</code>, which maps legacy spellings (<code>DockerImageTar</code>, <code>docker_image_tar</code>) to canonical hyphenated names. Registration is a map of lazy factories: <code>SandboxBackendRegistration::from_factory(provider, is_local, retains_disk_when_stopped, factory)</code>; secrets for remote providers are resolved only on first use of that provider <span class="src">crates/exoharness/src/basic/sandboxes.rs:103-155</span> <span class="src">crates/exoharness/src/basic/sandboxes.rs:2644-2665</span>. The per-provider config is a tagged enum stored as a <code>Binding::Sandbox</code> <span class="src">crates/exoharness/src/types.rs:1370-1462</span>.</p>
+
+<div class="callout idea">
+  <p class="callout-title">Idea worth stealing: capability by default-bail plus a declared restore set</p>
+  <p>A backend declares exactly which snapshot formats it can <em>consume</em> (<code>consumable_snapshot_formats</code>), and the harness checks that before dispatch (<code>ensure_snapshot_format_supported</code>, which lists the supported formats in the error). Producers and consumers are decoupled by a string contract, so "teleporting" a Docker snapshot to Daytona needs no code that knows both ends. <span class="src">crates/exoharness/src/basic/sandboxes.rs:1712-1734</span></p>
+</div>
+
+<h2 id="providers">Provider matrix</h2>
+<p>Default provider is <strong>smolvm</strong> (<code>impl Default for SandboxProvider</code>) <span class="src">crates/exoharness/src/types.rs:1023-1027</span>. The ten ids are registered in <span class="src">crates/exoharness/src/basic/native.rs:59-210</span>; the CLI exposes them as <code>--sandbox</code> values <span class="src">crates/cli/src/main.rs:355-388</span>. "Egress" below means what happens to <code>EgressPolicy { networking, allowed_tcp_ports, credentials }</code>; the proxy that implements <code>Limited</code> and credential substitution is described in <a href="egress-and-vaults.html">Egress and vaults</a>. Providers that call <code>EgressPolicy::validate_basic</code> accept only <code>Unrestricted</code>/<code>Disabled</code> and reject port allow-lists, credentials and <code>Limited</code> <span class="src">crates/exoharness/src/types.rs:934-946</span>.</p>
+
+<table>
+  <thead><tr><th>Provider</th><th>Isolation / tech</th><th>Where it runs</th><th>Snapshots (kind, format)</th><th>Idle TTL mapped to</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>smolvm</code></td><td>libkrun microVM driven through the <code>smolvm</code> CLI (own guest kernel)</td><td>Local; macOS, Linux, Windows</td><td>Filesystem only: <code>smolvm-filesystem-ref-v1</code> (reflink/APFS clones of mounts); legacy <code>smolvm-machine-pack</code></td><td>Warm machine; handle reports <code>is_running = false</code> after TTL, owner stops it</td><td><span class="src">crates/exoharness/src/sandbox_provider/smolvm.rs</span></td></tr>
+    <tr><td><code>firecracker</code></td><td>KVM microVM via <code>jailer</code>, guest PID 1 agent on vsock</td><td>Linux root host, or macOS inside a Lima VM</td><td>Both kinds: <code>firecracker-host-ref</code> (full: RAM + disk), <code>firecracker-filesystem-ref-v1</code>; plus <code>fork_sandbox</code></td><td>On-disk lease file mtime; reaped on next acquire</td><td><span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs</span></td></tr>
+    <tr><td><code>docker</code></td><td>OCI container (shared host kernel)</td><td>Local Docker daemon</td><td>Filesystem only: <code>docker-image-tar</code> (<code>docker commit -p</code> + <code>docker save</code>); refuses writable mounts</td><td>Warm container; lazy reap on next <code>acquire</code></td><td><span class="src">crates/exoharness/src/sandbox/native.rs</span></td></tr>
+    <tr><td><code>apple_container</code></td><td>Apple <code>container</code> CLI (one lightweight VM per container)</td><td>Local macOS</td><td>None (bails; "not yet implemented")</td><td>Same code path as Docker</td><td><span class="src">crates/exoharness/src/sandbox/native.rs:776-779</span></td></tr>
+    <tr><td><code>local_process</code></td><td>None: host <code>Command</code> in a mapped cwd</td><td>Local host</td><td>None</td><td>n/a (no lifecycle)</td><td><span class="src">crates/exoharness/src/sandbox/native.rs:785-913</span></td></tr>
+    <tr><td><code>daytona</code></td><td>Daytona-managed sandbox, REST API</td><td>Remote</td><td>Filesystem: <code>daytona-ref</code>; restores <code>daytona-ref</code> and <code>docker-image-tar</code> (teleport)</td><td><code>auto_stop_interval</code> minutes, rounded up, min 1</td><td><span class="src">crates/exoharness/src/sandbox_provider/daytona.rs</span></td></tr>
+    <tr><td><code>e2b</code></td><td>E2B sandbox, REST + per-sandbox <code>envd</code> Connect API</td><td>Remote</td><td><strong>Full only</strong>: <code>e2b-ref</code> (snapshot template id)</td><td><code>timeout</code> + <code>autoPause</code>; no TTL means 300 s, no pause</td><td><span class="src">crates/exoharness/src/sandbox_provider/e2b.rs</span></td></tr>
+    <tr><td><code>sprites</code></td><td>Sprites.dev sandbox, REST + WebSocket exec</td><td>Remote</td><td>Filesystem: <code>sprites-ref</code> (checkpoint id)</td><td>Ignored: sprites hibernate on their own and <code>stop</code> is a no-op (resume by deterministic name from id + spec hash)</td><td><span class="src">crates/exoharness/src/sandbox_provider/sprites.rs</span></td></tr>
+    <tr><td><code>vercel</code></td><td>Vercel Sandbox, REST</td><td>Remote</td><td>None ("not implemented yet")</td><td>Create <code>timeout</code> in ms</td><td><span class="src">crates/exoharness/src/sandbox_provider/vercel.rs</span></td></tr>
+    <tr><td><code>aws_agentcore</code></td><td>Bedrock AgentCore runtime sessions (cargo feature <code>aws-agentcore</code>)</td><td>Remote (AWS)</td><td>None ("not implemented yet")</td><td>Not used; session lifetime is owned by AWS</td><td><span class="src">crates/exoharness/src/sandbox_provider/aws_agentcore.rs</span></td></tr>
+  </tbody>
+</table>
+
+<table>
+  <thead><tr><th>Provider</th><th>Egress / network policy</th><th>Mounts and durable FS</th><th>TCP / preview</th><th>Terminal</th><th>Notable limits</th></tr></thead>
+  <tbody>
+    <tr><td><code>smolvm</code></td><td>Full policy: <code>Limited</code> becomes <code>--allow-host-pattern</code> per host plus a host-loopback interceptor proxy (<code>SmolvmProxy</code>) for credentials</td><td><code>--volume</code> host mounts; managed resource volumes</td><td>Yes: host ports published at machine create, <code>connect_tcp</code> dials 127.0.0.1</td><td>Yes (host PTY around <code>smolvm</code>)</td><td>Warm needs smolvm &gt;= 1.7.2; FS snapshots need &gt;= 1.20.0 and reflink FS; registry image + <code>Disabled</code> network is refused</td></tr>
+    <tr><td><code>firecracker</code></td><td>Full policy: per-VM netns + nft firewall; with a proxy, only proxy endpoints reachable; no TAP at all when disabled</td><td>No host bind mounts; at most 20 resource disks (ext4, virtio-blk); at most 1 durable workspace, must equal the workdir</td><td>Yes: host route to the guest /30 address; requires networking enabled</td><td>Yes on native Linux; not through the Lima bridge</td><td>Root + KVM + cgroup v2; Full snapshot refuses proxy, mounts, durable FS; Full <code>suspend</code> unimplemented; Firecracker &gt;= 1.16.2 for FS capture</td></tr>
+    <tr><td><code>docker</code></td><td><code>Unrestricted</code> / <code>Disabled</code> (<code>--network none</code>) only</td><td><code>--volume</code> host mounts; durable FS become host dirs under <code>EXO_DURABLE_FILE_SYSTEM_ROOT</code></td><td>No (<code>tcp_ports</code> are cleared in <code>prepare_request</code>)</td><td>No</td><td>Only provider that supports <code>attach</code>/<code>detach</code> of an external container</td></tr>
+    <tr><td><code>apple_container</code></td><td>Same as Docker</td><td>Same as Docker</td><td>No</td><td>No</td><td>Runs <code>container system start</code> on first use</td></tr>
+    <tr><td><code>local_process</code></td><td><code>Disabled</code> rejected (cannot enforce)</td><td>Mount guest paths map to host paths for cwd only; durable FS rejected</td><td>No</td><td>No</td><td>No isolation at all</td></tr>
+    <tr><td><code>daytona</code></td><td>Only <code>Unrestricted</code>/<code>Disabled</code> (<code>network_block_all</code>)</td><td>No host mounts, no durable FS</td><td>No</td><td>No</td><td>Processes streamed by polling every 100 ms</td></tr>
+    <tr><td><code>e2b</code></td><td>Only <code>Unrestricted</code>/<code>Disabled</code> (<code>allow_internet_access</code>)</td><td>No host mounts</td><td>No</td><td>No</td><td>gzip Connect envelopes unsupported</td></tr>
+    <tr><td><code>sprites</code></td><td><code>Disabled</code> rejected</td><td>No host mounts</td><td>No</td><td>No</td><td>WebSocket exec</td></tr>
+    <tr><td><code>vercel</code></td><td>Native <code>networkPolicy</code> (allow-all / deny-all / host allow-list); rejects credentials and port lists</td><td>No host mounts, no durable FS</td><td>Ports validated and sent at create; no <code>connect_tcp</code></td><td>No</td><td>No per-command exec timeout; processes via injected Python bridge</td></tr>
+    <tr><td><code>aws_agentcore</code></td><td><code>Disabled</code> rejected (cannot enforce)</td><td>At most one read-write durable FS, mapped to managed session storage under <code>/mnt/</code></td><td>No</td><td>No</td><td>Processes via injected Python bridge</td></tr>
+  </tbody>
+</table>
+
+<p>Evidence for the less obvious cells: Docker <code>prepare_request</code> hard-codes <code>tcp_ports: vec![]</code> <span class="src">crates/exoharness/src/sandbox/native.rs:323-341</span>; the smolvm host-pattern and loopback flags are built in <code>configure_spec_args</code> <span class="src">crates/exoharness/src/sandbox_provider/smolvm.rs:1476-1509</span>; the registry-image/disabled-network refusal is at <span class="src">crates/exoharness/src/sandbox_provider/smolvm.rs:1595-1608</span>; Firecracker's mount and workspace rules are in <code>prepare_request</code> <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:2516-2580</span>; Vercel maps policy to its API in <code>VercelNetworkPolicy::from_policy</code> <span class="src">crates/exoharness/src/sandbox_provider/vercel.rs:780-819</span>; AgentCore's checks are <span class="src">crates/exoharness/src/sandbox_provider/aws_agentcore.rs:395-430</span>.</p>
+
+<h3 id="cloudflare">Cloudflare is a different animal</h3>
+<p>The Cloudflare harness does not go through the Rust provider registry. <code>ExoSandbox</code> is a Durable Object wrapping a Cloudflare Container: <code>acquire</code> stores a <code>SandboxConfig</code>, picks the smallest of <code>standard-2/3/4</code> that satisfies the requested <code>SandboxResourceShape</code>, and starts the container with <code>entrypoint: ["sleep", "infinity"]</code> and <code>enableInternet: false</code>; all HTTP/HTTPS is intercepted into <code>ExoEgress</code> <span class="src">exoharness/cloudflare/src/sandbox.ts:158-214</span> <span class="src">exoharness/cloudflare/src/sandbox.ts:286-321</span>. Idle handling is an alarm: <code>scheduleIdle</code> sets a Durable Object alarm at <code>idleMs</code> and an inactivity timeout 60 s later; the alarm calls <code>stop()</code>, which closes processes, takes a <code>snapshotContainer()</code> checkpoint, and destroys the container. The next <code>start</code> restores from that snapshot. The <code>SandboxActivity</code> guard from the Rust trait maps onto <code>beginActivity</code>/<code>endActivity</code> leases that postpone the alarm <span class="src">exoharness/cloudflare/src/sandbox.ts:243-285</span> <span class="src">exoharness/cloudflare/src/sandbox.ts:445-469</span>.</p>
+
+<h2 id="lifecycle">Lifecycle</h2>
+<p>All lifecycle goes through the thread's <code>ConversationHandle</code> and ends up in <span class="src">crates/exoharness/src/basic/sandboxes.rs</span>. A sandbox is owned by a <code>ResourceScope</code> (agent or thread); the managed-agent default is one per thread.</p>
+<table>
+  <thead><tr><th>Operation</th><th>What happens</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>create</td><td>Unnamed: always new. Named: find-or-create by matching spec (<code>find_matching_sandbox</code>), then re-attach through <code>active_sandbox_handle_locked</code>. Persists <code>StoredSandbox</code>, calls <code>backend.acquire</code>, emits a <code>sandbox_provider_state</code> event when the handle's state changed.</td><td><span class="src">crates/exoharness/src/basic/sandboxes.rs:277-300</span></td></tr>
+    <tr><td>start (resume)</td><td><code>snapshot_id: None</code>: <code>create_sandbox_handle</code> loads the last persisted provider state and calls <code>acquire</code> (a stopped smolvm VM restarts with its retained disks). <code>idle_seconds</code> may override the stored lifecycle.</td><td><span class="src">crates/exoharness/src/basic/sandboxes.rs:1425-1480</span></td></tr>
+    <tr><td>start (from snapshot)</td><td>Loads the payload, checks the target backend consumes its format, then: <em>same provider</em> stop old handle then <code>acquire_from_snapshot</code>; <em>different provider</em> (teleport) acquire the new one first and stop the old one after (make-before-break). Persists <code>effective_image</code> so other processes derive the same warm key.</td><td><span class="src">crates/exoharness/src/basic/sandboxes.rs:1500-1596</span></td></tr>
+    <tr><td>stop</td><td>Attached sandboxes must be detached instead. Uses the cached handle (<code>stop_existing</code>) or, with no handle in this process, loads provider state and calls <code>backend.stop(request)</code>. Marks <code>running=false</code>, emits <code>SandboxStopped</code>.</td><td><span class="src">crates/exoharness/src/basic/sandboxes.rs:595-657</span></td></tr>
+    <tr><td>snapshot</td><td>Requires a live handle in <em>this</em> process (<code>"sandbox ... is not running; start it before snapshotting"</code>); calls <code>handle.snapshot(kind)</code> outside the write lock, then publishes <code>manifest.json</code> (inline <code>payload</code> for backend-owned captures) and a <code>SandboxSnapshotted</code> event. A failed publish calls <code>delete_snapshot</code> on the backend.</td><td><span class="src">crates/exoharness/src/basic/sandboxes.rs:534-585</span> <span class="src">crates/exoharness/src/basic/sandboxes.rs:1324-1423</span></td></tr>
+    <tr><td>fork / restore / terminate</td><td><code>fork_sandbox</code> requires same provider, running, non-attached source; <code>terminate</code> destroys retained backend state and is idempotent.</td><td><span class="src">crates/exoharness/src/basic/sandboxes.rs:302-433</span></td></tr>
+    <tr><td>attach / detach</td><td><code>SandboxAttachment::DockerContainer { container_id }</code> is the only variant; the harness borrows a container it did not create.</td><td><span class="src">crates/exoharness/src/types.rs:1005-1016</span></td></tr>
+  </tbody>
+</table>
+
+<p><code>ensure_full_sandbox_scope</code> rejects create/stop/fork/connect/process operations on a <em>turn</em>-scoped handle <span class="src">crates/exoharness/src/basic/sandboxes.rs:897-902</span>, which is why agents inside a turn cannot create sandboxes or choose images; only the surrounding executor can.</p>
+
+<h3 id="idle-ttl">Idle TTL, and the "honor sandbox idle TTL" change</h3>
+<p>The TTL is a single optional duration, <code>SandboxLifecycleConfig::idle_ttl</code> <span class="src">crates/exoharness/src/sandbox.rs:25-28</span>. Its path: the executor chooses <code>idle_seconds</code> (<code>environment.idle_seconds</code>, default <strong>300</strong>; agent-scoped sandbox fixed at 300) <span class="src">crates/executor/src/conversation_sandbox.rs:302</span>, the harness stores it on <code>StoredSandbox</code> (default 60 when a raw <code>CreateSandboxRequest</code> omits it <span class="src">crates/exoharness/src/basic/sandboxes.rs:1799</span>), and <code>sandbox_request()</code> converts it with <code>idle_ttl: Some(Duration::from_secs(sandbox.idle_seconds))</code> <span class="src">crates/exoharness/src/basic/sandboxes.rs:2624-2626</span>. Note it is <em>always</em> <code>Some</code> on this path.</p>
+<p>What the backends do with it differs, and none of the local ones run a background timer:</p>
+<table>
+  <thead><tr><th>Backend</th><th>Mechanism</th></tr></thead>
+  <tbody>
+    <tr><td><code>None</code> TTL (any local backend)</td><td>"One-shot": Docker <code>OneShotSandboxHandle</code> (<code>run --rm</code> per exec, cannot snapshot), Firecracker boots a VM per command and tears it down (<code>firecracker-oneshot:</code> ids), smolvm boots an ephemeral VM per exec. Reachable only by callers that build a <code>SandboxRequest</code> themselves, because the harness always supplies <code>Some</code>.</td></tr>
+    <tr><td>Docker / Apple</td><td><code>WarmSandboxEntry.last_used_at</code> is touched on each exec; <code>reap_expired_warm_sandboxes</code> runs at the start of the next <code>acquire</code> and schedules <code>docker rm</code>. Separately, on first use of the backend, containers labelled <code>exo.sandbox.key</code> whose <code>owner-pid</code> label is dead and that started more than 24 h ago are removed. <span class="src">crates/exoharness/src/sandbox/native.rs:344-365</span> <span class="src">crates/exoharness/src/sandbox/native.rs:1757-1830</span></td></tr>
+    <tr><td>Firecracker</td><td>In-memory <code>warm_machines</code> plus a lease file per machine whose <em>mtime</em> is the last-use time, published by atomic rename; TTL lives in the immutable machine manifest, so a later CLI process can reap a VM it never started. <code>is_running</code> returns <code>Some(false)</code> when the lease is past the TTL, and expired machines are cleaned at the top of <code>acquire_raw</code> (and in <code>reap_expired</code>, the Lima bridge entry point). <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:766-769</span> <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:1007-1050</span> <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:3003-3122</span></td></tr>
+    <tr><td>smolvm</td><td>Commit <code>8351b1c</code> ("fix(smolvm): honor sandbox idle TTL", #404). Before: warm handles ignored <code>idle_ttl</code>, so an idle VM that still held a persistent exec-server TCP connection stayed "running" forever. Now all handles for one machine share an idle clock (<code>idle_leases: HashMap&lt;String, Weak&lt;Mutex&lt;Instant&gt;&gt;&gt;</code>); acquisition, restore, completed execs and process/terminal starts renew it; status polling and TCP connections do not; <code>is_running</code> reports expiry and <em>the caller</em> stops the VM. <span class="src">crates/exoharness/src/sandbox_provider/smolvm.rs:603-615</span> <span class="src">crates/exoharness/src/sandbox_provider/smolvm.rs:1323-1343</span></td></tr>
+    <tr><td>Daytona, E2B, Vercel</td><td>Translated to the platform's own timer (see matrix); the platform stops or pauses the sandbox.</td></tr>
+    <tr><td>Cloudflare</td><td>Durable Object alarm, postponed by activity leases (above).</td></tr>
+  </tbody>
+</table>
+
+<figure class="code">
+  <figcaption><strong>smolvm expiry is derived, not timed: the handle reports "not running" once the shared clock passes the TTL</strong> <span class="src">crates/exoharness/src/sandbox_provider/smolvm.rs:1323-1333</span></figcaption>
+  <pre><code class="language-rust">    async fn is_running(&amp;self) -&gt; Result&lt;Option&lt;bool&gt;&gt; {
+        if self.request.lifecycle.idle_ttl.is_some_and(|ttl| {
+            self.last_used
+                .lock()
+                .expect("smolvm idle lease poisoned")
+                .elapsed()
+                &gt;= ttl
+        }) {
+            return Ok(Some(false));
+        }
+        let mut status = Command::new(&amp;self.binary);
+        status.args(["machine", "status", "--name", &amp;self.machine, "--json"]);</code></pre>
+</figure>
+
+<p>Why <code>is_running</code> is the lever: the egress runtime and the harness treat <code>Some(false)</code> as "drop this cached handle and re-acquire" <span class="src">crates/exoharness/src/egress/sandbox.rs:240-262</span>. The module comment states the contract: "Warm handles report idle expiry through <code>is_running</code>, like Firecracker. Owners stop expired machines; the backend has no independent shutdown timer" <span class="src">crates/exoharness/src/sandbox_provider/smolvm.rs:1-14</span>.</p>
+
+<div class="callout idea">
+  <p class="callout-title">Idea worth stealing: the lease is a file mtime</p>
+  <p>Firecracker records the TTL in the immutable machine manifest and the last-use time as the mtime of a tiny lease file, refreshed by writing a temp file and renaming it over the lease (readers see the old or new time, never a torn one). Any later process, including a fresh CLI invocation, can compute expiry from disk and reap a VM it never started, with no daemon and no shared memory. <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:3003-3034</span></p>
+</div>
+
+<div class="callout surprise">
+  <p class="callout-title">Surprise: <code>idle_seconds = 0</code> is not "no TTL"</p>
+  <p>The harness always builds <code>idle_ttl: Some(Duration::from_secs(idle_seconds))</code>. A zero therefore means "expired immediately" (Docker's check is <code>last_used_at + ttl &lt;= now</code>), while the true one-shot mode (<code>None</code>) is unreachable through <code>BasicExoHarness</code>. Only direct backend users and tests exercise the one-shot paths.</p>
+</div>
+
+<h2 id="processes">Process execution model</h2>
+<p>Three levels, from raw to durable.</p>
+<ol class="steps">
+  <li><strong><code>exec</code></strong>: run argv to completion, return <code>SandboxCommandOutput { ok, exit_code, stdout: String, stderr: String, command, cwd }</code> <span class="src">crates/exoharness/src/sandbox.rs:103-120</span>. Output is lossy-UTF-8 text. On Firecracker the guest caps each stream at 4 MiB (<code>MAX_CAPTURE_BYTES</code>) and reports "Command output exceeded the guest capture limit" <span class="src">crates/firecracker-guest/src/linux.rs:35</span> <span class="src">crates/firecracker-guest/src/linux.rs:562-642</span>.</li>
+  <li><strong><code>start_process</code></strong>: returns <code>SandboxProcessParts { stdout, stderr, stdin, wait }</code> (boxed async readers/writer plus a future yielding the exit code) <span class="src">crates/exoharness/src/types.rs:1246-1251</span>. This is the primitive every provider implements.</li>
+  <li><strong>Harness processes</strong>: <code>start_sandbox_process</code> wraps the parts in a <code>RunningSandboxProcess</code> with an id (<code>process-&lt;uuid7&gt;</code>), a cursor-numbered event vector, and an event-log writer. Every chunk is appended as <code>EventData::SandboxProcessEvent</code> (<code>Stdout</code>/<code>Stderr</code>/<code>Exit</code>/<code>Error</code>/<code>Cancelled</code>, each with a monotonically increasing <code>cursor</code>), so a restarted server or an unloaded Durable Object can rebuild a <em>finished</em> process from the log; a process still running when its host died errors with "lost its live connection" <span class="src">crates/exoharness/src/basic/sandboxes.rs:2169-2255</span> <span class="src">crates/exoharness/src/basic/sandboxes.rs:1185-1260</span>. Stdin is a mode (<code>Open</code>/<code>None</code>) and callers use <code>write_sandbox_process_input</code> / <code>close_sandbox_process_input</code>; polling is <code>get_sandbox_process_events(after_cursor)</code>.</li>
+</ol>
+
+<p><code>with_process_management</code> <span class="src">crates/exoharness/src/sandbox_process.rs:27-34</span> is a second, provider-side adapter: it wraps any stream-backed handle in a <code>ProcessRegistry</code> and implements <code>start_managed_process</code>, <code>process_events(after)</code>, <code>wait_process</code> and <code>cancel_process</code> with the same cursor semantics. Its drain logic is careful about background children that keep a pipe open after the parent exits: it waits at most 2 s for both streams to drain, then aborts the readers <span class="src">crates/exoharness/src/sandbox_process.rs:179-195</span>. Every in-repo backend (local and remote) installs it on the handles it returns. Within this repository only the module's own tests call the <code>start_managed_process</code>-family methods; the harness's process API (above) is what production paths use. The doc comment says providers with their own process service implement these methods directly instead of installing the adapter.</p>
+
+<h3 id="streaming">How each provider streams</h3>
+<table>
+  <thead><tr><th>Provider</th><th>Streaming / stdin mechanism</th></tr></thead>
+  <tbody>
+    <tr><td>docker, apple_container</td><td>Spawns <code>docker exec</code> / <code>container exec</code> as a child and pipes its stdio (<code>spawn_sandbox_process</code>); warm exec targets the named container.</td></tr>
+    <tr><td>smolvm</td><td>Spawns <code>smolvm machine exec --name ...</code>; a PTY variant wraps the child in a host PTY with resize support <span class="src">crates/exoharness/src/sandbox_provider/smolvm/terminal.rs</span>.</td></tr>
+    <tr><td>firecracker</td><td>Guest <code>StartProcess</code> returns a <code>process_id</code>; the host runs a long-poll loop of <code>Recv</code> requests and a stdin forwarder issuing <code>Write</code>/<code>CloseStdin</code> through <code>process_bridge::process_parts</code> (below).</td></tr>
+    <tr><td>vercel, aws_agentcore</td><td>Inject <code>/tmp/exo-process-bridge.py</code> (a small Python TCP server on 127.0.0.1:48765) and speak the same <code>recv</code>/<code>write</code>/<code>close_stdin</code> protocol through the provider's command API <span class="src">crates/exoharness/src/sandbox_provider/process_bridge.rs:17-33</span>.</td></tr>
+    <tr><td>daytona</td><td>Polls the process API every 100 ms (<code>PROCESS_POLL_INTERVAL</code>).</td></tr>
+    <tr><td>sprites</td><td>WebSocket exec endpoint with <code>stdin=true</code>.</td></tr>
+    <tr><td>e2b</td><td>Connect-protocol streaming against <code>envd</code>.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout idea">
+  <p class="callout-title">Idea worth stealing: one long-poll bridge protocol, three implementations</p>
+  <p><code>process_bridge::Request</code> (<code>ping</code>, <code>write</code> (base64), <code>close_stdin</code>, <code>recv {timeout_seconds}</code>, <code>resize</code>) is the single wire shape. The Firecracker guest agent, the Python script for Vercel/AgentCore, and the host-side <code>process_parts()</code> pump all share it, so a provider with nothing but "run a command and give me stdout" can still offer streaming stdin by running a tiny server inside the sandbox. <code>recv</code> returns up to 64 events or 1 MiB per call and a <code>timeout: true</code> response on idle, which the host loops on. <span class="src">crates/exoharness/src/sandbox_provider/process_bridge.rs:339-382</span> <span class="src">crates/exoharness/src/sandbox_provider/process_bridge.rs:448-500</span></p>
+</div>
+
+<h3 id="pty">PTY: implemented below the API, not wired through it</h3>
+<div class="callout surprise">
+  <p class="callout-title">Surprise: terminals exist in two backends but nothing in the repo asks for one</p>
+  <p>Both the smolvm PTY and the Firecracker guest PTY are implemented and tested, yet the harness rejects <code>SandboxProcessMode::Pty</code> and there is no non-test caller of <code>start_terminal</code>. The Firecracker README's <code>sandbox connect</code> command does not exist in the CLI.</p>
+</div>
+<p><code>ManagedSandboxHandle::start_terminal(command, size) -&gt; SandboxTerminalParts { output, input, wait, control }</code> exists, with <code>control.resize()</code> <span class="src">crates/exoharness/src/types.rs:1254-1270</span>. Implementations: smolvm (host PTY, unix) and Firecracker (guest-owned PTY via <code>StartTerminal</code>, native Linux only). But <code>SandboxProcessMode::Pty</code> is rejected by the harness ("basic sandbox backend only supports exec-mode processes") <span class="src">crates/exoharness/src/basic/sandboxes.rs:2183-2185</span>, and there is no non-test caller of <code>start_terminal</code> in this repository.</p>
+
+<h2 id="mounts">Mounts, durable filesystems, and resources</h2>
+<p>Three distinct things reach <code>SandboxSpec</code>.</p>
+<ul>
+  <li><strong>Host mounts</strong> (<code>SandboxMount { host_path, guest_path, access, internal }</code>): bind mounts of host directories. Supported by Docker/Apple (<code>--volume host:guest[:ro]</code>), smolvm, and local_process (cwd mapping only). Every remote provider and Firecracker reject non-<code>internal</code> mounts <span class="src">crates/exoharness/src/sandbox/native.rs:1600-1608</span>.</li>
+  <li><strong>Durable filesystems</strong> (<code>DurableFileSystem { name, mount_path, mode }</code>): named persistent storage owned by the sandbox. Docker/Apple turn each into a host directory <code>root/&lt;fnv1a(sandbox_id\nname)&gt;</code> under <code>EXO_DURABLE_FILE_SYSTEM_ROOT</code> (or the backend-configured root) and mount it; Firecracker allocates one <code>workspace.ext4</code> disk mounted at the workdir; AgentCore maps one to managed session storage <span class="src">crates/exoharness/src/sandbox/native.rs:930-970</span>.</li>
+  <li><strong>Resources</strong> (git repos, local directories): prepared by the executor before the sandbox exists. The strategy depends on the provider: <code>uses_host_resource_mounts</code> is true for <code>apple_container, docker, local_process, firecracker, smolvm</code> <span class="src">crates/exoharness/src/resources.rs:272-281</span>.</li>
+</ul>
+<table>
+  <thead><tr><th>Resource strategy</th><th>Providers</th><th>How</th></tr></thead>
+  <tbody>
+    <tr><td>Host directory or volume</td><td>docker, apple_container, local_process, smolvm</td><td><code>ResourceStore::materialize</code> produces host paths. On macOS each resource is a case-sensitive APFS sparse image (<code>hdiutil</code>); elsewhere a plain <code>workspace</code> dir. Copies use <code>clonefile</code> / <code>cp --reflink=always</code> and fail rather than fall back to a full copy <span class="src">crates/exoharness/src/local_volume.rs:20-82</span>.</td></tr>
+    <tr><td>Block-device image</td><td>firecracker</td><td><code>backend.materialize_resources</code> builds ext4 images under the state root (XFS with reflink required); on macOS this call crosses the Lima bridge. Resumes are tracked so a thread cannot move between Firecracker and directory-based sandboxes <span class="src">crates/exoharness/src/basic/native.rs:1240-1380</span>.</td></tr>
+    <tr><td>In-sandbox <code>git clone</code></td><td>daytona, e2b, sprites, vercel, aws_agentcore</td><td><code>sandbox_resources::materialize</code> runs a generated shell script via <code>run_in_sandbox</code>; a marker file <code>.git/exo-resource.json</code> holds the resource identity so a restored sandbox never refetches over the agent's changes. Only Git URLs, read-write <span class="src">crates/executor/src/sandbox_resources.rs:8-71</span> <span class="src">crates/executor/src/sandbox_resources.rs:78-110</span>.</td></tr>
+  </tbody>
+</table>
+<p>Conventional guest paths are <code>SANDBOX_HOME_DIR = /home/exo</code> and <code>SANDBOX_MAIN_MOUNT_DIR = /home/exo/workspace</code> (the fallback workdir) <span class="src">crates/exoharness/src/sandbox.rs:509-511</span>. The executor derives <code>default_workdir</code> from, in order: the environment's <code>default_workdir</code>, <code>/workspace</code> if resources exist, the first mount, the first durable filesystem, else <code>/</code> <span class="src">crates/executor/src/conversation_sandbox.rs:258-290</span>.</p>
+
+<h3 id="executor-side">What the executor adds</h3>
+<ul>
+  <li><strong>Find-or-create under a lock</strong>: <code>ensure_conversation_sandbox</code> takes a per-conversation async mutex, walks recorded sandboxes newest-first, reuses the first that is an explicit attachment or matches both spec and policy, restarts it if stopped, optionally runs a health command, and falls back to <code>create_sandbox</code>. Failed resume is a <code>warn</code> and continues to the next candidate <span class="src">crates/executor/src/conversation_sandbox.rs:55-124</span>.</li>
+  <li><strong>Policy assembly</strong>: <code>sandbox_policy</code> starts from the environment policy, then <em>adds</em> egress bindings for Git credentials (HTTPS:443 only, host and <code>api.github.com</code> allow-listed, <code>GH_TOKEN</code> bound), the model credential variable, and native MCP bindings for the Codex and Claude Code harness modules <span class="src">crates/executor/src/sandbox_policy.rs:5-48</span>. Details in <a href="egress-and-vaults.html">Egress and vaults</a>.</li>
+  <li><strong>Agent-scoped sandbox</strong>: <code>ensure_agent_sandbox</code> keeps a durable record artifact (<code>config/agent-sandbox-v2.json</code>); once created, every caller attaches by name even if config drifts, and a new spec requires explicit delete/recreate <span class="src">crates/executor/src/native/agent_sandbox.rs:11-80</span>.</li>
+  <li><strong>Local sandbox over a remote harness</strong>: <code>LocalSandboxExoHarness</code> wraps a remote harness (state elsewhere) and a local one; for providers in <code>local_providers</code> (or all, when forced) it creates the sandbox on the local harness and keeps a remote-id to local-id map, persisted as <code>local_sandbox_mapped</code> events <span class="src">crates/executor/src/native/local_sandbox.rs:44-95</span> <span class="src">crates/executor/src/native/local_sandbox.rs:395-433</span>.</li>
+</ul>
+
+<h2 id="snapshots">Snapshot semantics</h2>
+<figure class="code">
+  <figcaption><strong>Two capture kinds; the format string says who can restore</strong> <span class="src">crates/exoharness/src/types.rs:76-83</span> <span class="src">crates/exoharness/src/sandbox.rs:141-158</span></figcaption>
+  <pre><code class="language-rust">#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotKind {
+    /// All writable filesystems; restore cold-boots without captured RAM or processes.
+    Filesystem,
+    /// Filesystems, memory, and execution state; external connections are not preserved.
+    Full,
+}
+
+impl SnapshotFormat {
+    /// `docker save` output: a tar of OCI image layers + manifest.
+    pub const DockerImageTar: Self = Self::from_static("docker-image-tar");
+    /// Portable content-addressed workspace chunks plus a manifest.
+    pub const WorkspaceChunksV1: Self = Self::from_static("workspace-chunks-v1");
+    /// Reference to a named snapshot in Daytona's registry.
+    pub const DaytonaRef: Self = Self::from_static("daytona-ref");
+    /// Reference to an E2B snapshot template id.
+    pub const E2bRef: Self = Self::from_static("e2b-ref");
+    /// Reference to a Sprites checkpoint id.
+    pub const SpritesRef: Self = Self::from_static("sprites-ref");
+    /// Reference to a `.smolmachine` pack on the local disk.
+    pub const SmolvmMachinePack: Self = Self::from_static("smolvm-machine-pack");
+    pub const SmolvmFilesystemRef: Self = Self::from_static("smolvm-filesystem-ref-v1");
+    /// Reference to an immutable bundle in a Firecracker host's private root.
+    pub const FirecrackerHostRef: Self = Self::from_static("firecracker-host-ref");
+    pub const FirecrackerFilesystemRef: Self = Self::from_static("firecracker-filesystem-ref-v1");
+}</code></pre>
+</figure>
+
+<table>
+  <thead><tr><th></th><th><code>Filesystem</code></th><th><code>Full</code></th></tr></thead>
+  <tbody>
+    <tr><td>Captures</td><td>Every writable disk/mount</td><td>Disks + guest RAM + vCPU/device state</td></tr>
+    <tr><td>Restore</td><td>Cold boot from the captured disks; processes are gone</td><td>Resume mid-execution; open external connections are not preserved</td></tr>
+    <tr><td>Backends</td><td>Docker, Daytona, Sprites, SmolVM, Firecracker</td><td>Firecracker, E2B (E2B accepts <em>only</em> this kind)</td></tr>
+    <tr><td>Rejects</td><td>Docker: any writable mount or durable FS; smolvm: needs a managed lifecycle and reflink-capable FS</td><td>Firecracker: egress proxy, any mounts, any durable FS</td></tr>
+  </tbody>
+</table>
+
+<p>Mechanics that differ from what you might assume:</p>
+<ul>
+  <li><strong>Payload is a reference, not bytes, for most providers.</strong> Firecracker, smolvm, Daytona, E2B and Sprites return a small manifest naming a capture that lives in the backend's namespace; only Docker returns real bytes (the <code>docker save</code> tarball, held in memory as <code>Bytes</code> and written to <code>payload.bin</code>). The harness inlines the payload into <code>manifest.json</code> only for backend-owned captures (<code>smolvm-filesystem-ref-v1</code>, <code>firecracker-host-ref</code>, <code>firecracker-filesystem-ref-v1</code>, per <code>snapshot_capture_provider</code>), so the reference and its metadata publish in one write and so <code>delete_owned_snapshots</code> can call the backend's <code>delete_snapshot</code> when the thread or agent is deleted. Other reference formats (Daytona, E2B, Sprites, legacy smolvm pack) are skipped by that cleanup <span class="src">crates/exoharness/src/basic/sandboxes.rs:1346-1357</span> <span class="src">crates/exoharness/src/basic/sandboxes.rs:1615-1667</span>.</li>
+  <li><strong>Docker</strong>: <code>docker commit -p</code> (pause for consistency), <code>docker save</code>, remove the temp tag. Restore <code>docker load</code>s, swaps <code>spec.image</code> for the loaded tag and creates a fresh warm container; it requires a warm lifecycle and refuses Apple <code>container</code> <span class="src">crates/exoharness/src/sandbox/native.rs:1962-2036</span> <span class="src">crates/exoharness/src/sandbox/native.rs:496-551</span>.</li>
+  <li><strong>Teleport</strong>: <code>start_sandbox</code> with a different <code>provider</code> and a snapshot whose format the new backend consumes. Daytona consumes <code>docker-image-tar</code>, so a local Docker sandbox can resume remotely.</li>
+  <li><strong>Firecracker filesystem capture</strong>: <code>sync</code> every writable mount in the guest, pause the VM, reflink the root overlay, workspace and resource disks, pin the immutable base image by sha256, publish an immutable capture atomically, resume. It supports mounts and egress proxies (a fresh proxy binding is created at restore). <code>suspend(Filesystem)</code> is the same capture plus killing the paused VM <span class="src">crates/exoharness/src/sandbox_provider/firecracker_filesystem.rs:479-587</span>.</li>
+  <li><strong>Restore validation</strong>: Firecracker refuses a snapshot whose recorded <code>FirecrackerRuntimeFingerprint</code> (arch, protocol version, sha256 of firecracker, jailer, kernel, initramfs, vCPU, memory, network device policy, guest-root flag) differs from the running host <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:258-307</span> <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:1207-1218</span>.</li>
+  <li><strong>Storage budgets</strong>: Firecracker and smolvm share <code>capture_store</code> (staged directory, atomic publish, <code>flock</code>-based <code>SnapshotLease</code>); total retained captures are capped at 64 GiB by allocated blocks and are <em>not</em> evicted automatically; delete explicitly with <code>delete_snapshot</code> <span class="src">crates/exoharness/src/sandbox_provider/capture_store.rs</span> <span class="src">crates/exoharness/src/sandbox_provider/snapshot_lease.rs</span> <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:137</span>.</li>
+  <li><strong>Not a conversation rewind</strong>: the event log is untouched, and forking a thread does not restore its sandbox (the architecture doc says the same).</li>
+</ul>
+
+<div class="callout warn">
+  <p class="callout-title">Docs overstate the proxy restriction</p>
+  <p><code>website/docs-src/architecture/sandboxes.md</code> says SmolVM and Firecracker "reject snapshots with an egress proxy". In code the rejection (<code>PROXIED_SNAPSHOT_UNSUPPORTED</code>) applies to Firecracker <em>Full</em> capture and restore only; <code>Filesystem</code> snapshots go through <code>EgressRuntime::acquire(AcquisitionMode::Restore, ...)</code> and get a fresh egress binding <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:1078-1080</span> <span class="src">crates/exoharness/src/sandbox_provider/firecracker_filesystem.rs:321-345</span>. A credential-substituting sandbox can therefore be filesystem-snapshotted and restored.</p>
+</div>
+
+<h2 id="firecracker">The Firecracker stack</h2>
+<p>This is the largest backend (about 5.8 k lines plus image, Lima, bridge, filesystem and guest crates). The design goal, from <span class="src">support/firecracker/README.md</span>: the only host-to-guest channel is a bounded JSON protocol over vsock, the host never mounts or parses guest-controlled data, and each VM is contained by KVM, the jailer, seccomp, a per-VM UID, PID/network namespaces and cgroup v2.</p>
+
+<h3 id="fc-image">1. OCI image to immutable ext4</h3>
+<p><code>resolve_image</code> accepts either a trusted local <code>.ext4</code> path or an OCI reference <span class="src">crates/exoharness/src/sandbox_provider/firecracker_image.rs:116-309</span>. For a registry reference it:</p>
+<ol class="steps">
+  <li>Checks the registry allow-list, then looks in <code>state_root/images/v6/&lt;platform&gt;/&lt;digest&gt;</code>. A digest-pinned reference hits the cache with no registry request.</li>
+  <li>Otherwise authenticates from the Docker credential config (exact registry origin, root-owned paths only, helper executed only at its validated absolute path), pulls the manifest and config, and validates the platform matches the host arch.</li>
+  <li>Preflights the whole manifest before any download: at most 512 layers, no layer larger than 2x the image size, total compressed size at most 4x.</li>
+  <li>Downloads up to 4 layers concurrently into a content-addressed blob store (each verified against its sha256 with size budgets), applying them in order with OCI whiteout handling, checking bytes and inode budgets after every layer.</li>
+  <li>Creates the guest-owned directories and runs <code>mkfs.ext4 -q -F -d &lt;rootfs&gt; &lt;image&gt;</code>, which populates the filesystem without ever mounting attacker-controlled content on the host. The result is chmod <code>0444</code> and published by atomic directory rename <span class="src">crates/exoharness/src/sandbox_provider/firecracker_image.rs:728-858</span>.</li>
+</ol>
+<p>The OCI runtime config (<code>ENTRYPOINT</code>, <code>CMD</code>, <code>USER</code>, env, working dir) is stored in <code>rootfs.config.json</code> and surfaced via <code>resolve_image</code>, but it is <em>not applied</em>: commands and env come from the sandbox API, and workloads start as UID/GID 10001 <span class="src">support/firecracker/README.md</span>. Default image size is 8 GiB (<code>DEFAULT_IMAGE_SIZE_GIB</code>) and caps how much host disk one materialization may consume.</p>
+
+<h3 id="fc-boot">2. Boot: jailer, VM config, overlay root</h3>
+<p>Per VM, <code>prepare_and_launch_blocking</code> builds a jail root, hard-links the immutable base image as <code>rootfs.ext4</code> (read-only), creates a <em>sparse</em> <code>overlay.ext4</code> upper layer with lazy mkfs, hard-links the kernel and initramfs, optionally attaches <code>workspace.ext4</code> and resource disks, writes <code>vm-config.json</code> (root-owned, mode 0400), and spawns Firecracker through the jailer <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:3942-4049</span>. No base filesystem copy ever happens; the guest's initramfs mounts base (read-only) and upper as OverlayFS, moves the merged mount over <code>/</code>, then <code>chroot</code>s so container runtimes see the right mount namespace <span class="src">crates/firecracker-guest/src/linux.rs:1054-1108</span>.</p>
+
+<div class="callout idea">
+  <p class="callout-title">Idea worth stealing: shared immutable lower, sparse per-VM upper</p>
+  <p>One digest-addressed, read-only ext4 per image is hard-linked into every jail; each VM gets only a sparse ext4 for its OverlayFS upper layer (<code>mkfs.ext4</code> with lazy init on a <code>set_len</code> file). Boot never copies the base image, per-VM disk cost is the delta, and a snapshot's base is pinned by sha256 and shared across captures. <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:3966-4002</span></p>
+</div>
+
+<figure class="code">
+  <figcaption><strong>Jailer invocation: unique UID, new PID namespace, cgroup v2 limits, default seccomp</strong> <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:4153-4184</span></figcaption>
+  <pre><code class="language-rust">    let memory_high = (u64::from(record.runtime.memory_mib) + 256) * 1024 * 1024;
+    let cpu_max = format!("{} 100000", u32::from(record.runtime.vcpu_count) * 100_000);
+    // Always use the matching jailer: it creates the mount/PID namespaces and
+    // cgroup, then drops to a unique unprivileged UID before execing Firecracker.
+    let mut command = Command::new(&amp;config.jailer_bin);
+    command
+        .arg("--id")
+        .arg(&amp;record.machine_id)
+        .arg("--exec-file")
+        .arg(&amp;config.firecracker_bin)
+        .arg("--uid")
+        .arg(host_uid.to_string())
+        .arg("--gid")
+        .arg(host_uid.to_string())
+        .arg("--chroot-base-dir")
+        .arg(config.state_root.join("jailer"));
+    if record.network_enabled {
+        command
+            .arg("--netns")
+            .arg(PathBuf::from("/var/run/netns").join(&amp;record.network().namespace));
+    }
+    command
+        .arg("--new-pid-ns")
+        .arg("--cgroup-version")
+        .arg("2")
+        .arg("--cgroup")
+        .arg(format!("memory.max={memory_max}"))
+        .arg("--cgroup")
+        .arg(format!("memory.high={memory_high}"))
+        .arg("--cgroup")
+        .arg(format!("cpu.max={cpu_max}"));</code></pre>
+</figure>
+
+<p>The VM is described declaratively. Notable choices in <code>firecracker_vm_configuration</code> <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:4225-4376</span>:</p>
+<ul>
+  <li>Drives, in order: <code>rootfs</code> (read-only, <code>cache_type: "Unsafe"</code>), <code>overlay</code> (<code>Writeback</code>), optional <code>workspace</code>, then <code>resource_N</code> disks. The guest finds them by letter (<code>/dev/vda</code>, <code>vdb</code>, <code>vdc</code>...).</li>
+  <li>Boot args carry configuration to the guest: <code>rdinit=/init 8250.nr_uarts=0 ... exo_allow_guest_root=1 exo_guest_ip=... exo_workdir=... exo_workspace=... exo_resource_mounts=&lt;base64 JSON&gt;</code>. Hence the 4096-byte check and the "workdir must not contain whitespace" rule.</li>
+  <li>vsock <code>guest_cid = slot + 3</code>; <code>track_dirty_pages: true</code> and <code>smt: false</code>; a rate-limited virtio-rng entropy device (for clone reseeding); per-VM token-bucket rate limiters on the NIC (<code>DEFAULT_NETWORK_BYTES_PER_SECOND</code> = 100 MiB/s).</li>
+  <li>VMM stdio goes to <code>/dev/null</code>, never a growable file, "because a compromised guest kernel can reactivate the serial device" <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:4189-4202</span>.</li>
+</ul>
+<p>Readiness is event-driven: before launch the host binds a Unix listener at <code>&lt;vsock&gt;_10053</code>; when the guest agent is listening it connects to host CID port 10053 and writes one byte, so the host waits on a socket edge rather than polling pings <span class="src">crates/firecracker-guest/src/linux.rs:965-1000</span>.</p>
+
+<h3 id="fc-protocol">3. Guest agent and the vsock protocol</h3>
+<p>The guest is a static Rust binary running as PID 1 from an initramfs (<code>support/firecracker/build-guest.sh</code> then <code>build-initramfs.sh</code>). <code>run()</code> mounts pseudo filesystems, sets up the overlay root, hostname, network, workspace and resource mounts, spawns an orphan reaper, binds a vsock listener on port 10052, signals readiness, and serves one request per connection on a new thread <span class="src">crates/firecracker-guest/src/linux.rs:902-955</span>. Hard limits: 32 concurrent connections, 128 managed processes, 45 s socket timeout; connections whose peer CID is not the host (<code>VMADDR_CID_HOST</code>) are dropped, so a workload cannot ask PID 1 to run something by connecting to itself.</p>
+
+<figure class="code">
+  <figcaption><strong>The whole host to guest API (protocol v4): a tagged enum, one JSON message per vsock connection</strong> <span class="src">crates/firecracker-protocol/src/lib.rs:32-73</span></figcaption>
+  <pre><code class="language-rust">#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GuestRequest&lt;B&gt; {
+    Ping,
+    Exec {
+        argv: Vec&lt;String&gt;,
+        env: HashMap&lt;String, String&gt;,
+        cwd: String,
+        timeout_ms: Option&lt;u64&gt;,
+    },
+    StartProcess {
+        argv: Vec&lt;String&gt;,
+        env: HashMap&lt;String, String&gt;,
+        cwd: String,
+    },
+    // StartTerminal { argv, env, cwd, size: TerminalSize },
+    ProcessBridge {
+        process_id: String,
+        request: B,
+    },
+    KillProcess {
+        process_id: String,
+    },
+    SyncFilesystem {
+        path: String,
+    },
+    MountResources {
+        mounts: Vec&lt;GuestResourceMount&gt;,
+    },
+    ConfigureNetwork {
+        address: Ipv4Addr,
+        gateway: Ipv4Addr,
+        prefix: u8,
+    },
+}</code></pre>
+</figure>
+
+<p>Framing is a 4-byte big-endian length followed by JSON wrapped in <code>Message { protocol_version, payload }</code>; requests are capped at 1 MiB and responses at 16 MiB (<code>decode_frame_length</code>). The host side, <code>vsock_request</code>, opens the VMM's Unix socket, sends Firecracker's host-initiated handshake <code>CONNECT 10052\n</code>, reads a bounded <code>OK ...</code> acknowledgement (reads at most 129 bytes so a hostile VMM cannot grow the buffer), then writes the frame and reads one response <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:5574-5615</span>. Because every call is a fresh connection, streaming is done by the <code>ProcessBridge</code> long-poll (<code>Write</code>, <code>CloseStdin</code>, <code>Recv { timeout_seconds }</code>, <code>Resize</code>), not by holding a socket open. The generic parameter <code>B</code> lets the host reuse <code>process_bridge::Request</code> as the bridge payload while the guest uses <code>GuestProcessRequest</code>.</p>
+<p>Handshake identity: <code>Ping</code> returns <code>GuestIdentity { implementation_version, build_id }</code>; the host rejects empty values, and also rejects any response whose <code>protocol_version</code> differs <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:5296-5321</span> <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:5349-5361</span>. Timeouts are enforced in the guest by <code>SIGKILL</code> to the command's process group; explicit cancellation is also process-group based, so a descendant that creates a new session can survive until the VM stops (documented limitation).</p>
+
+<h3 id="fc-network">4. Network</h3>
+<p>Each VM with networking gets a network namespace <code>fc-&lt;slot&gt;</code>, a veth pair, a TAP inside the namespace, and an nftables table <code>exo_fc_&lt;slot&gt;</code>. Addresses are carved from <code>10.240.0.0/14</code> as two /30 blocks per slot (a transit pair and a guest pair) <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:3292-3312</span>. The default firewall drops IPv6, anti-spoofs source addresses, rejects the whole Exo range (guest-to-guest), and rejects the <code>BLOCKED_EGRESS_CIDRS</code> list (RFC1918, link-local/metadata, CGNAT, multicast, ...) unless an operator adds <code>--firecracker-allowed-egress-cidr</code> <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:144-156</span> <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:3506-3600</span>. With a configured egress proxy the rules change to proxy-endpoints-only (<code>proxy_network_firewall_rules</code>); see <a href="egress-and-vaults.html">Egress and vaults</a> for what the proxy does with the traffic. When networking is disabled no TAP device exists at all; exec still works because control is vsock.</p>
+
+<h3 id="fc-snapshot">5. Full snapshots and forks</h3>
+<p>A Full capture (<code>capture_snapshot_template</code>) is the delicate path. Sequence: refuse if host swap is enabled; take <code>snapshot-capture.lock</code>; enforce the 64 GiB retained budget and a free-disk reserve; pause the VM via the jailed API socket; seed the memory file with a reflink of the previous capture (or the restore template); ask Firecracker for a <code>Diff</code> snapshot (dirty pages only); reflink the overlay disk while still paused; resume; then <em>copy</em> state and memory out of the jail, seal them root-owned <code>0444</code>, drop a <code>complete</code> marker and publish.</p>
+
+<figure class="code">
+  <figcaption><strong>Pause window covers memory + overlay disk only; memory is a diff over a reflinked seed</strong> <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:4935-5001</span></figcaption>
+  <pre><code class="language-rust">    let result = with_paused_snapshot_source(&amp;root, &amp;source.machine_id, false, || {
+        let base = if memory_base.try_exists()? {
+            Some(memory_base.clone())
+        } else {
+            source
+                .snapshot_template
+                .as_ref()
+                .map(|base| snapshot_template_dir(config, &amp;base.key).map(|dir| dir.join("memory")))
+                .transpose()?
+        };
+        if let Some(base) = base {
+            let memory = temporary.join("memory-seed");
+            copy_sparse_reflink(&amp;base, &amp;memory)?;
+            // ... chown to the jailer uid, then linkat into the jail output dir as "memory"
+        }
+        // A fresh VM's first sparse snapshot is complete on its own. Subsequent
+        // captures apply dirty pages over a private reflink of the latest memory.
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&amp;capture_pending)?
+            .sync_all()?;
+        tracing::info_span!("firecracker.snapshot_memory").in_scope(|| {
+            firecracker_api_request(
+                &amp;api,
+                "PUT",
+                "/snapshot/create",
+                &amp;FirecrackerSnapshotCreate {
+                    snapshot_type: "Diff",
+                    snapshot_path: &amp;snapshot_path,
+                    mem_file_path: &amp;memory_path,
+                },
+                FIRECRACKER_SNAPSHOT_CREATE_TIMEOUT,
+            )
+            .context("creating Firecracker snapshot")
+        })?;
+        // ... log captured memory size
+        // Only the disk copy must happen inside the pause window: the overlay
+        // has to match the memory image byte-for-byte, and the source starts
+        // writing to it again the moment it resumes.
+        copy_sparse_reflink(&amp;root.join("overlay.ext4"), &amp;temporary.join("overlay.ext4"))?;
+        Ok::&lt;(), anyhow::Error&gt;(())
+    });</code></pre>
+</figure>
+
+<p>Two crash-safety details: a <code>snapshot-pending</code> marker blocks further captures from the same sandbox until it is restarted ("Firecracker may already have cleared dirty bits, so repeating a diff against the previous base would be unsafe"), and the published snapshot is a <em>copy</em>, never a hard link, because a compromised VMM could hold an open fd to a hard-linked file and keep writing a "trusted" template <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:5002-5013</span>.</p>
+<p><code>fork_sandbox</code> uses the same capture with <code>SnapshotTemplateLifecycle::Machine</code> (a single-use template tied to the target) and immediately restores it into a different sandbox id, holding both sandboxes' lifecycle locks in deterministic order. The clone gets its own TAP/IP slot; after boot the host sends <code>ConfigureNetwork</code> so the restored guest stops using the source's in-memory address <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:1567-1634</span> <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:2168-2180</span>. Forks need guest kernel 5.18+ with VMGenID to reseed the CSPRNG.</p>
+
+<h3 id="fc-state">6. Machine records, fingerprints, adoption</h3>
+<p>Each VM has a <code>MachineRecord</code> manifest (<code>machine_id</code>, <code>spec_hash</code>, <code>runtime</code> fingerprint, <code>resolved_image</code>, network <code>slot</code>, <code>idle_ttl_seconds</code>, optional snapshot template) written under <code>state_root/manifests</code> <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:396-411</span>. <code>machine_id</code> is derived from the sandbox id and spec hash, which is how a new process finds a VM started by an earlier one. <code>ensure_machine</code> adopts a running VM only if the pid file is live, the spec hash and runtime fingerprint match, and a vsock <code>Ping</code> succeeds; otherwise it cleans up and relaunches <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:2044-2100</span>. Lifecycle is serialized with per-machine and per-sandbox async locks (<code>MachineLifecycleLocks</code>), and a capacity reservation (<code>max_machines</code>) is held from admission until the VMM is up or cleaned up.</p>
+<p>The exposed state returned to the harness is deliberately tiny: <code>FirecrackerProviderState { machine_id, spec_hash, guest_ip }</code> <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:245-255</span>. Preview traffic uses <code>guest_ip</code>: <code>connect_tcp</code> is a plain <code>TcpStream::connect((guest_ip, port))</code> via a host route to the VM's /30 <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:1799-1806</span>.</p>
+
+<h3 id="lima">7. macOS: Lima as the outer VM</h3>
+<p>Firecracker needs Linux and KVM. On Apple M3+ the backend factory selects <code>LimaFirecrackerSandboxBackend</code> at compile time (<code>cfg(target_os = "macos")</code>) <span class="src">crates/exoharness/src/sandbox_provider/mod.rs:144-177</span>. The native CLI stays on macOS; a dedicated Lima VM (<code>--vm-type=vz --nested-virt</code>) runs the <em>same</em> <code>FirecrackerSandboxBackend</code> code inside a root process, reached over stdio.</p>
+
+<pre class="diagram">
+macOS (native exo CLI)                       Lima VM "exo-firecracker" (vz, nested KVM)
++-------------------------------+   limactl   +---------------------------------------+
+| LimaFirecrackerSandboxBackend |   shell --  | firecracker-bridge  (root, sudo -n)   |
+|  - EgressRuntime + vault      |   sudo      |   run_firecracker_bridge()            |
+|    credential resolver        |   bridge    |   FirecrackerSandboxBackend (Linux)   |
+|  - LimaBridgeManager          |&lt;===========&gt;|     jailer -> firecracker -> microVM  |
++-------------------------------+ len-prefixed|     guest PID1 &lt;-vsock CONNECT 10052-&gt; |
+   Request/Response frames      JSON frames   |   egress listeners (Create/Accept)    |
+   StreamData/StreamClosed for                +---------------------------------------+
+   stdout, stderr, tcp, egress
+</pre>
+
+<ul>
+  <li><strong>Bring-up</strong>: <code>prepare_bridge</code> lists Lima instances and <em>refuses</em> to continue if the named one does not exist, because <code>limactl start &lt;name&gt;</code> silently creates a default VM that mounts the user's whole home directory. Then it starts the VM, checks <code>/dev/kvm</code> read/write, installs <code>xfsprogs</code>, builds the <code>firecracker-bridge</code> example with <code>cargo</code> inside the VM (low-memory flags: one job, lld linker), and installs it to the root-owned <code>/usr/local/libexec/exo-firecracker-bridge</code> so <code>sudo</code> never runs a binary the build user can replace <span class="src">crates/exoharness/src/sandbox_provider/firecracker_lima.rs:666-770</span>.</li>
+  <li><strong>Protocol</strong>: <code>FirecrackerBridgeRequest</code> is one variant per backend operation (<code>Acquire</code>, <code>Exec</code>, <code>StartProcess</code>, <code>ConnectTcp</code>, <code>Snapshot</code>, <code>Fork</code>, <code>MaterializeResources</code>, <code>EgressCreate/Bind/Accept/Close</code>, ...) with the full <code>FirecrackerConfig</code> and request attached to each call; the bridge process keeps a <code>BridgeBackendCache</code> that builds one <code>FirecrackerSandboxBackend</code> per distinct config (and runs the XFS storage preparation on first use). Server frames add <code>StreamOpened/StreamData/StreamClosed</code> with channels <code>Stdout</code>, <code>Stderr</code>, <code>Tcp</code>; frames are capped at 16 MiB and stream chunks at 64 KiB <span class="src">crates/exoharness/src/sandbox_provider/firecracker_bridge.rs:18-24</span> <span class="src">crates/exoharness/src/sandbox_provider/firecracker_bridge.rs:26-170</span> <span class="src">crates/exoharness/src/sandbox_provider/firecracker_bridge.rs:220-250</span>.</li>
+  <li><strong>Egress stays on the Mac</strong>: the <code>EgressRuntime</code> and credential resolver are constructed in the macOS process; the VM only exposes listeners, and accepted proxy connections are relayed back over the bridge as <code>Tcp</code> streams (<code>EgressAccept</code>) <span class="src">crates/exoharness/src/sandbox_provider/firecracker_lima.rs:1590-1645</span>. Vault secrets never need to enter the VM.</li>
+  <li><strong>Storage</strong>: resource and snapshot features need XFS with <code>reflink=1</code>. Exo provisions a sparse XFS image inside Lima at the state root on first start (<code>mkfs.xfs -m reflink=1</code> on a sparse file sized to 80% of the free space) <span class="src">crates/exoharness/src/sandbox_provider/firecracker_lima_storage.rs:20-100</span>. <code>support/firecracker/lima-admin.sh</code> restarts the VM or wipes per-microVM state, refusing any state root outside <code>/var/lib/exo/firecracker/</code>.</li>
+  <li><strong>Gaps vs native Linux</strong>: the Lima handle implements no <code>start_terminal</code>; one-shot (no TTL) Lima sandboxes cannot be stopped, snapshotted or TCP-connected. The README says plainly this is a development path, not a production trust boundary (the Lima user has passwordless sudo and a writable checkout mount).</li>
+</ul>
+
+<div class="callout surprise">
+  <p class="callout-title">Surprise: the "bridge" is the real backend</p>
+  <p>The macOS backend does not reimplement anything. <code>run_firecracker_bridge</code> instantiates the ordinary Linux <code>FirecrackerSandboxBackend</code> and maps each frame to a trait call, which is why snapshot payloads cross as base64 strings and why even <code>MaterializeResources</code> and <code>ResolveImage</code> are bridge requests: the OCI pull and <code>mkfs.ext4</code> run inside Lima, never on macOS.</p>
+</div>
+
+<h2 id="previews">Preview and port forwarding</h2>
+<p>A sandbox publishes TCP ports through <code>tcp_ports</code> on its environment (nonzero, no duplicates) and they become part of sandbox identity. Reaching them is a two-step capability: the provider must implement <code>connect_tcp</code> (smolvm, Firecracker, Firecracker-over-Lima only), and a host-side proxy must route to it.</p>
+<ul>
+  <li><strong>Browser previews</strong>: <code>PreviewProxy</code> listens on <code>127.0.0.1</code> (port persisted in <code>previews/listener.json</code> so URLs survive restarts), routes by <code>Host</code> header, and for each service port serves <code>http://&lt;port&gt;.&lt;slug&gt;-&lt;sha256(thread_id)[..8]&gt;.&lt;domain&gt;:&lt;listener_port&gt;</code>. <code>previews_for</code> derives the hostnames; <code>register</code> installs one route per port plus a "Sandbox services" index page <span class="src">crates/executor/src/previews.rs:36-88</span> <span class="src">crates/executor/src/previews.rs:206-232</span>.</li>
+  <li><strong>Per-request resolution</strong>: on each request <code>handle</code> parses headers with <code>httparse</code> (32 KiB cap, exactly one <code>Host</code>), finds the running sandbox that publishes the port (<code>published_sandbox</code>), calls <code>thread.connect_sandbox_tcp</code>, replays the already-read request bytes, then <code>copy_bidirectional</code>. A miss yields <code>502 "Preview unavailable. Start the sandbox and its services."</code>; the sandbox id is cached but dropped on error <span class="src">crates/executor/src/previews.rs:259-270</span> <span class="src">crates/executor/src/previews.rs:311-387</span>.</li>
+  <li><strong>CLI</strong>: <code>exo sandbox forward</code> does the same for a local TCP port (<code>SandboxCommands::Forward</code> to <code>port_forward::run</code>) <span class="src">crates/cli/src/port_forward.rs:8-33</span>.</li>
+  <li>The agent is told the URLs in its instructions ("Use these browser origins for links, API URLs and CORS ... Previews live while the owning Exo process runs") <span class="src">crates/executor/src/previews.rs:91-104</span>.</li>
+</ul>
+<p>Provider-specific wiring: smolvm publishes each port to a host ephemeral port when the machine is created (<code>host_ports</code>), with <code>--outbound-localhost-only</code> when outbound networking is off; harness code special-cases smolvm in <code>connect_sandbox_tcp</code> so a probe never restarts the machine <span class="src">crates/exoharness/src/basic/sandboxes.rs:659-696</span>. Firecracker requires networking enabled and warns that the host route makes in-sandbox services reachable by any local process.</p>
+
+<h2 id="docs-vs-code">Docs versus code</h2>
+<table>
+  <thead><tr><th>Document</th><th>Says</th><th>Code</th></tr></thead>
+  <tbody>
+    <tr><td><span class="src">exoharness/docs/design/local-sandbox.md</span></td><td>Status "proposed"; recommends Apple <code>container</code> as the first backend; describes a checkpoint store, structured store, sibling-service topology</td><td>Default provider is smolvm; Apple container has no snapshots; I found no checkpoint store or sibling-service topology in the sandbox code. Read it as history of the warm-sandbox and mount decisions only.</td></tr>
+    <tr><td><span class="src">exoharness/docs/sandbox-snapshots.md</span> "Known limits"</td><td>Containers created by one process are not adopted by another</td><td>Docker adopts by label: <code>find_running_docker_warm_sandbox</code> filters on <code>exo.sandbox.key</code> and <code>exo.sandbox.spec-hash</code> and marks the entry <code>owned=false</code> <span class="src">crates/exoharness/src/sandbox/native.rs:1234-1272</span>. (Snapshot capture itself still requires a handle live in this process.)</td></tr>
+    <tr><td><span class="src">docs/providers.md</span></td><td>"Providers"</td><td>Unrelated to sandboxes: it documents <em>Exo provider profiles</em> (remote Exo servers, <code>exo provider switch</code>).</td></tr>
+    <tr><td><span class="src">support/firecracker/README.md</span></td><td>Mentions <code>sandbox connect</code> and <code>sandbox exec</code></td><td>The CLI has <code>sandbox run | forward | attach | detach</code> only <span class="src">crates/cli/src/main.rs:774-815</span>.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="takeaways">Reading order</h2>
+<ol class="steps">
+  <li><span class="src">crates/exoharness/src/sandbox.rs</span> (517 lines): the whole contract.</li>
+  <li><span class="src">crates/exoharness/src/basic/sandboxes.rs</span>: lifecycle orchestration and persistence.</li>
+  <li><span class="src">crates/exoharness/src/sandbox/native.rs</span>: the simplest complete backend (Docker warm containers).</li>
+  <li><span class="src">crates/firecracker-protocol/src/lib.rs</span> then <span class="src">crates/firecracker-guest/src/linux.rs</span>: the guest side in 1.6 k lines.</li>
+  <li><span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs</span>: start at <code>acquire_resolved_locked</code>, <code>ensure_machine</code>, <code>prepare_and_launch_blocking</code>, <code>capture_snapshot_template</code>.</li>
+</ol>
+<p>Related pages: <a href="egress-and-vaults.html">Egress and vaults</a> for the proxy and credential substitution that sandbox networking plugs into, <a href="data-model.html">Data model</a> for the sandbox events in the thread log, and <a href="managed-agents.html">Managed agents</a> for environments and per-thread sandbox scoping.</p>
+
+</main>
+<aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/wiki.js"></script>
+</body>
+</html>

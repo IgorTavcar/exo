@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ideas worth stealing · Exo internals</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<nav id="nav"></nav>
+<main>
+<header>
+  <div class="kicker">Distilled</div>
+  <h1>Ideas worth stealing</h1>
+  <p class="lede">The design and engineering techniques in Exo that transfer to other systems, grouped by theme. Each one names the code that implements it and the wiki page with the full context.</p>
+</header>
+
+<p>These were picked while reading every subsystem: they are the places where the code solves a problem in a way that is not the obvious one. Most come down to one habit. <strong>Treat the append-only event log as the only source of truth, and make every other piece of state either derivable from it or a disposable cache.</strong> The sections below start with what that habit buys (recovery), then the log's own design, then security, portability, and finally agent and prompt techniques.</p>
+
+<h2>Durability and recovery</h2>
+
+<div class="callout idea">
+  <p class="callout-title">Commit the recovery payload with the turn-start event</p>
+  <p><code>start_local_turn</code> serializes a <code>TurnWork</code> (resolved agent config, thread config, request, streaming flag) and passes it as <code>initial_events</code> to <code>begin_turn</code>. It lands in the same write as <code>TurnStarted</code> and the user input. Recovery needs no side table: scan for started-but-not-ended turns, parse the work back out of the log, call <code>resume_turn</code>.</p>
+  <p><span class="src">crates/executor/src/harness_executor.rs:44-72</span> · <span class="src">crates/executor/src/harness_executor.rs:745-762</span> · <span class="src">crates/exoharness/src/types.rs:397-406</span> · <a href="harnesses.html">harnesses</a> · <a href="data-model.html">data model</a></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Completion marker committed with the final answer</p>
+  <p>The last model response and <code>exo.runtime.turn_completed</code> go into one <code>add_events</code> call. If the process dies between "answer written" and "turn ended", the queue sees the marker and only writes <code>TurnEnded</code>; the model is not called again.</p>
+  <p><span class="src">crates/executor/src/basic.rs:197-205</span> · <span class="src">crates/executor/src/harness_executor.rs:824-854</span> · <span class="src">crates/executor/src/turn_queue.rs:731-742</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Turn status is a pure function of events; the queue holds only scheduling state</p>
+  <p><code>journal_status_from_events</code> yields <code>Unstarted / Running / Finished</code> from <code>TurnStarted</code>, <code>TurnEnded</code> and <code>Error</code>. The queue stores order, control (Run / Cancel / Suspend) and idempotency receipts, nothing about progress. A crashed, suspended or cancelled turn is classified identically at runtime and at startup recovery, and when the two disagree the journal wins.</p>
+  <p><span class="src">crates/executor/src/turn_queue.rs:843-892</span> · <span class="src">crates/executor/src/turn_queue.rs:706-812</span> · <span class="src">crates/exoharness/src/turn_coordinator/stored.rs:13-27</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">A round marker so recovery never re-samples the model</p>
+  <p><code>BasicExecutor</code> writes <code>exo.basic.tool_round</code> before a round's <code>tool_requested</code> events. On recovery <code>load_turn_progress</code> rebuilds the saved round and finishes its tools instead of calling the model again, because a second sample "could produce a different set of tool calls".</p>
+  <p><span class="src">crates/executor/src/basic.rs:206-213</span> · <span class="src">crates/executor/src/basic.rs:319-427</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Write-ahead intent around a non-idempotent RPC</p>
+  <p>The Codex harness appends <code>codex_turn_start_intent</code> before calling <code>turn/start</code> and <code>codex_turn_started</code> (with the native turn id) after. An intent with no start means the outcome is unknowable, so recovery fails the turn rather than risk executing it twice.</p>
+  <p><span class="src">exoharness/typescript/codex/harness.ts:584-633</span> · <span class="src">exoharness/typescript/codex/harness.ts:223-227</span> · <a href="native-harnesses.html">native harnesses</a></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Idempotent projection with per-item markers</p>
+  <p>Every native Codex item projected into Exo events is followed by a <code>codex_item_projected</code> marker keyed <code>turnId:itemId</code>. Recovery pages backwards through only the unfinished turn, collects the markers, and re-projects just what is missing from a <code>thread/read</code> snapshot.</p>
+  <p><span class="src">exoharness/typescript/codex/harness.ts:118-233</span> · <span class="src">exoharness/typescript/codex/harness.ts:1223-1303</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Suspend only at a tool-quiescent boundary</p>
+  <p><code>HarnessTurn</code> tracks in-flight <code>tool_call_id</code>s from acknowledged events. <code>suspension_boundary()</code> returns a mutex guard only when none are pending, and the caller drops the execution future while holding it. No new <code>tool_requested</code> can be journaled in between, so a suspend can never lose a tool request.</p>
+  <p><span class="src">crates/executor/src/harness_events.rs:42-73</span> · <span class="src">crates/executor/src/harness_adapter.rs:225-262</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Capability-gated, fail-closed recovery</p>
+  <p>Executors declare <code>can_resume_pending_approval</code>, <code>can_suspend_turn</code> and <code>can_reconcile_unresolved_tool_call</code>; the default <code>resume_turn</code> bails. <code>restore_recovery_tools</code> replays the tool and approval events and permits resume only when the unresolved call is parked at an approval or is a client tool. Everything else errors "cannot safely resume". Safety is opt-in per harness.</p>
+  <p><span class="src">crates/executor/src/harness_executor.rs:92-103</span> · <span class="src">crates/executor/src/harness_adapter.rs:328-406</span> · <a href="tools-and-mcp.html">tools &amp; MCP</a></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Refuse to reattach to a native turn that might be blocked on a lost approval</p>
+  <p>A live Codex turn waiting on an approval holds the request on a connection that no longer exists. <code>assertNativeToolSafety</code> fails recovery if any <code>commandExecution</code>, <code>mcpToolCall</code>, <code>dynamicToolCall</code>, <code>webSearch</code> or <code>fileChange</code> item is still in progress, so recovery fails fast instead of hanging.</p>
+  <p><span class="src">exoharness/typescript/codex/recovery.ts:46-79</span> · <span class="src">exoharness/typescript/codex/harness.ts:534-543</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Write-ahead records for machine-sent wakeups</p>
+  <p>The scheduler stores a <code>ScheduledFireRecord</code> (full prompt, <code>(task, slot)</code> dedupe key) before delivering the wakeup, and <code>redeliver_pending_wakes</code> sweeps at startup. The source comment gives the reason: the wakeup is the only thing that tells the conversation the run happened, and nothing retries a machine-sent event. A missed-fire policy (<code>Skip / Once / All</code>, capped at 100) works on an anchored grid.</p>
+  <p><span class="src">crates/executor/src/native/scheduler_runtime.rs:71-102</span> · <span class="src">crates/executor/src/native/scheduler_runtime.rs:338-358</span> · <span class="src">crates/executor/src/native/scheduler_types.rs:72-90</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Repair the prompt at read time, never the log</p>
+  <p>Dangling tool calls from an interrupted turn are never "fixed" in storage. <code>extend_message_history</code> synthesises <code>{"ok":false,"error":"tool execution did not complete before the previous turn ended"}</code> when it materialises the prompt. The log stays an honest record; the prompt stays valid for the provider API. (See the <a href="surprises.html">surprises page</a> for the caching wrinkle.)</p>
+  <p><span class="src">crates/executor/src/message_history.rs:130-151</span></p>
+</div>
+
+<h2>Event-log design</h2>
+
+<div class="callout idea">
+  <p class="callout-title">One id as cursor, clock and filename</p>
+  <p><code>EventId</code> is a UUIDv7. <code>Event.created_at</code> is derived from <code>id.timestamp()</code>, every cursor and watch bound is an event id, and event objects are named by id, so a directory listing is already a sorted log. Thread "recency" is <code>latest_event_id.unwrap_or(thread.id)</code>.</p>
+  <p><span class="src">crates/exoharness/src/uuid7.rs:8-22</span> · <span class="src">crates/exoharness/src/basic.rs:2475</span> · <span class="src">crates/exoharness/src/basic.rs:1375-1377</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Atomic multi-event commit is one object PUT with a self-describing name</p>
+  <p>A multi-event append is a single <code>&lt;first&gt;_&lt;last&gt;.batch.json</code> object. The id range in the name lets <code>get_event</code>, pagination and watch prune without a separate index, and there is no transaction layer over the dumb key-value store.</p>
+  <p><span class="src">crates/exoharness/src/basic.rs:2482-2497</span> · <span class="src">crates/exoharness/src/basic.rs:158-162</span> · <span class="src">crates/exoharness/src/basic.rs:85-156</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Derive the head from the log; <code>record.json</code> is a commit marker</p>
+  <p><code>load_conversation_record</code> overwrites <code>latest_event_id</code> with the max id parsed from the <code>events/</code> keys ("the event log is authoritative if a crash preceded the metadata write"). Appends never rewrite <code>record.json</code>, and a thread exists once <code>record.json</code> is written, which happens last.</p>
+  <p><span class="src">crates/exoharness/src/basic.rs:2820-2832</span> · <span class="src">crates/exoharness/src/basic.rs:2846</span> · <span class="src">crates/exoharness/src/basic_tests.rs:1163-1165</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Subscribe before you list: gapless replay-then-live</p>
+  <p><code>watch_events</code> creates its <code>broadcast(64)</code> subscription first, then lists stored batches after the bound. A lagged observer resubscribes and rescans storage from its last emitted key. Fast consumers cost zero storage reads, and a test pins that.</p>
+  <p><span class="src">crates/exoharness/src/basic.rs:1833-1932</span> · <span class="src">crates/exoharness/src/basic_tests.rs:39-110</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Durable plus ephemeral stream, with checkpoints</p>
+  <p>The SSE watch is <code>select(durable watch_events, in-memory progress broadcast)</code>. Text deltas and "Preparing workspace" statuses are minted with fresh UUIDv7s and never persisted. <code>turn_stream</code> emits a <code>Checkpoint{event_id}</code> after each durable event so a client knows where to resume with <code>?after=</code>.</p>
+  <p><span class="src">crates/executor/src/managed_agents/service.rs:768-826</span> · <span class="src">crates/executor/src/harness_events.rs:322-394</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Approvals and client-tool results are events, not in-memory state</p>
+  <p><code>authorize</code> appends <code>agent_runtime.approval_requested</code>, then watches events until a matching <code>approval_response</code> appears from any connection. Disconnects, restarts and multiple observers all work because the log is the rendezvous. Client tool results use the same pattern.</p>
+  <p><span class="src">crates/executor/src/permissions.rs:124-286</span> · <span class="src">crates/executor/src/frontend_tools.rs:151-192</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Accept now, execute later; retries replay completion</p>
+  <p><code>accept_local_turn</code> only authorizes, resolves config and enqueues, so admission never waits on a VM start. A duplicate idempotency key re-registers the observer under the original turn id and replays completion from the journal if the turn already finished.</p>
+  <p><span class="src">crates/executor/src/turn_queue.rs:357-482</span> · <span class="src">crates/executor/src/native/http_provider.rs:72-103</span></p>
+</div>
+
+<h2>Credentials and network security</h2>
+
+<div class="callout idea">
+  <p class="callout-title">Put the destination policy inside the AEAD's associated data</p>
+  <p>Vault secrets are AES-256-GCM encrypted with AAD = <code>(vault_id, SecretMetadata)</code>, and the metadata includes the destination policy. Editing <code>vaults.json</code> to widen a secret's allowed hosts, or moving a ciphertext to another vault, makes decryption fail. "Where may this be sent" is as tamper-evident as the secret itself.</p>
+  <p><span class="src">crates/exoharness/src/vault/local.rs:262-270</span> · <span class="src">crates/exoharness/src/vault/local/tests.rs:287-305</span> · <a href="egress-and-vaults.html">egress &amp; vaults</a></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Validate placeholders before resolving anything</p>
+  <p><code>validate_credentials</code> strips every placeholder this destination may resolve and fails if any <code>exo_egress_</code> text remains. A placeholder aimed at the wrong host is rejected with zero resolver calls and zero upstream connections.</p>
+  <p><span class="src">crates/exoharness/src/egress_credentials.rs:126-162</span> · <span class="src">crates/exoharness/src/egress/tests.rs:795-815</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Bind names to ids at attach time, resolve values at use time</p>
+  <p>Sandbox bindings are named by the secret's UUID. <code>find_secret</code> runs once at sandbox creation and the <code>SecretReference</code> is persisted. Rotation (same id, new revision) is live on the next request, deletion fails closed, and a new same-named secret in a higher-precedence vault cannot hijack a running sandbox.</p>
+  <p><span class="src">crates/executor/src/sandbox_policy.rs:146-165</span> · <span class="src">crates/exoharness/src/basic/sandboxes.rs:1777-1790</span> · <span class="src">crates/exoharness/src/basic/egress.rs:9-46</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Narrow a broad secret policy to the one destination a harness needs</p>
+  <p><code>CredentialPolicy::for_destination</code> replaces a secret's multi-origin policy with exactly the model origin, Git origin or MCP URL for that sandbox binding, and errors if the secret does not allow it. A key that is allowed at three hosts is only injectable at one inside any given sandbox.</p>
+  <p><span class="src">crates/exoharness/src/credential_policy.rs:114-121</span> · <span class="src">crates/executor/src/sandbox_policy.rs:53-242</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">A throwaway CA whose key is dropped</p>
+  <p><code>tls_configuration</code> generates a CA per sandbox, signs exactly one leaf with SANs for the intercepted hosts, and returns only the CA certificate PEM and an acceptor. The CA private key never leaves the function. Trust is injected through env vars pointing at a copied bundle, not by editing the system store.</p>
+  <p><span class="src">crates/exoharness/src/egress/mod.rs:555-584</span> · <span class="src">crates/exoharness/src/egress/mod.rs:823-830</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">In unrestricted mode, only MITM the credential hosts</p>
+  <p>The proxy peeks the TLS ClientHello SNI and tunnels unrelated HTTPS bytes untouched, so public TLS stays end-to-end and only the hosts that carry credentials are intercepted.</p>
+  <p><span class="src">crates/exoharness/src/egress/mod.rs:656-717</span> · <span class="src">crates/exoharness/src/egress/tests.rs:1782-1867</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">DNS as policy</p>
+  <p>In limited mode the proxy's own DNS service returns NXDOMAIN for names that are not allowed. On Firecracker it also admits the resolved IPs into a per-VM nftables set (1 h timeout) <em>before</em> answering the guest, so a connection cannot race the firewall rule.</p>
+  <p><span class="src">crates/exoharness/src/egress/transport.rs:394-462</span> · <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:3592-3661</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Refresh tokens rotate, so detach refresh from the caller</p>
+  <p>OAuth refresh runs on a spawned host task under a file lock, with a revision compare-and-swap when persisting. Cancelling the requester cannot lose a rotated refresh token, and a mid-refresh delete or manual rotation cannot be resurrected. The MCP client uses the same revision idea: it refreshes on 401 only if the rejected token is still the current revision, then retries once.</p>
+  <p><span class="src">crates/exoharness/src/vault/local.rs:543-590</span> · <span class="src">crates/cli/tests/vault_oauth.rs:602-648</span> · <span class="src">crates/mcp/src/client.rs:113-136</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Authority as a hashed principal, re-checked on every access</p>
+  <p>For chat callers, each (deployment, agent, thread, adapter, sender context, identity grant) is serialized and hashed into a principal <code>adapter-{sha256}</code>. The stored authority is re-checked against the live agent definition on every access, so revoking access is a config edit.</p>
+  <p><span class="src">crates/executor/src/managed_agents/adapters/access.rs:15-177</span> · <span class="src">crates/executor/src/managed_agents/adapters/mod.rs:144-215</span> · <a href="managed-agents.html">managed agents</a></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Pin MCP credentials per thread, selected by destination URL</p>
+  <p><code>VaultSelection::from_vaults</code> picks a secret whose policy permits the server URL (exact match preferred, ambiguity is an error), saves the choice as a thread artifact and refuses to change it. Later starts verify that MCP destinations still match.</p>
+  <p><span class="src">crates/managed-agents/src/vaults.rs:49-111</span> · <span class="src">crates/managed-agents/src/vaults.rs:123-139</span></p>
+</div>
+
+<h2>Portability and API shape</h2>
+
+<div class="callout idea">
+  <p class="callout-title">One request enum, three transports, one handler</p>
+  <p><code>protocol::Request</code> is served by <code>ExoHarnessServer::handle_request</code> whether it arrives as <code>POST /request</code>, as an <code>exo_request</code> JSONL line from a TypeScript harness, or inside wasm. <code>HttpExoHarness</code> re-implements the whole handle-trait family over a transport, so a remote store is a drop-in <code>Arc&lt;dyn ExoHarness&gt;</code>.</p>
+  <p><span class="src">crates/exoharness/src/server.rs:84</span> · <span class="src">crates/executor/src/native/typescript.rs:449-462</span> · <span class="src">crates/exoharness/src/http/client.rs:41-72</span> · <a href="architecture.html">architecture</a></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Sans-IO Rust in wasm</p>
+  <p><code>WorkerRuntime.poll()</code> drains a task list, polls a <code>FuturesUnordered</code> until nothing wakes, and returns <code>HostCall</code>s as data. JavaScript performs them and calls <code>resolve(id, ...)</code>. The same <code>LocalProvider</code> runs on Tokio natively and inside a Cloudflare Durable Object, with no async runtime shipped to wasm.</p>
+  <p><span class="src">crates/worker-runtime/src/lib.rs:44-60</span> · <span class="src">crates/worker-runtime/src/lib.rs:200-243</span> · <span class="src">exoharness/cloudflare/src/runtime.ts:49-183</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">A single route table for native and Worker hosts</p>
+  <p><code>managed_agents::http::route</code> pattern-matches <code>(method, path segments)</code>, and a <code>Platform</code> trait carries the few differences. The <code>routes!</code> macro re-matches the same patterns to distinguish 405 from 404.</p>
+  <p><span class="src">crates/executor/src/managed_agents/http.rs:1-47</span> · <span class="src">crates/executor/src/managed_agents/http.rs:119-136</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">One CLI, two runtimes, decided once; an exhaustive match is the allow-list</p>
+  <p><code>providers::runtime()</code> returns an <code>executor::Runtime</code> backed by either <code>HttpProvider</code> or <code>LocalProvider</code>. <code>validate_http_command</code> is an exhaustive match that destructures its arg structs without <code>..</code>, so adding a flag does not compile until someone decides whether a remote supports it. Tests then loop <code>for provider in ["local","remote"]</code> over the same fixture for free parity coverage.</p>
+  <p><span class="src">crates/cli/src/providers.rs:17-110</span> · <span class="src">crates/cli/src/providers.rs:112-173</span> · <span class="src">crates/cli/tests/support/mod.rs:49-168</span> · <a href="cli-and-server.html">CLI</a></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Strict serde as the compatibility policy</p>
+  <p><code>deny_unknown_fields</code> on the frontmatter, model, permission policies, MCP entries and stored JSON means typos and unimplemented features fail loudly. <code>serde_path_to_error</code> plus a small <code>Diagnostic</code> prints <code>file:line:col</code>, the field path and a caret excerpt. Resources are parsed into a literal intermediate type because flattened tagged enums lose leaf paths in serde errors.</p>
+  <p><span class="src">crates/managed-agents/src/frontmatter.rs:13-33</span> · <span class="src">crates/managed-agents/src/frontmatter.rs:78-125</span> · <span class="src">crates/managed-agents/src/frontmatter.rs:154-222</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Definition is the latest artifact version; rollback is an append</p>
+  <p>A managed agent has no table of its own. <code>managed-agents/agent.json</code> is an agent-scoped artifact and "current" is the highest version. A failed update writes the previous definition back as a new version, so history is never deleted.</p>
+  <p><span class="src">crates/managed-agents/src/lib.rs:21-23</span> · <span class="src">crates/executor/src/harness_executor.rs:1042-1087</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Deterministic identity instead of distributed locking</p>
+  <p>The Slack adapter derives the route key as <code>sha256(account/conversation)</code> and the thread slug as <code>slack-{sha256(route_key)}</code>. Lookup by slug makes racing first messages converge on one thread. Its stream chunks, renderer state and observer cursor are saved in a single <code>Outbox::Stream</code> receipt, so a lost inbox save cannot cause a double post. A deployment's fingerprint covers the definition <em>and</em> secret revisions, so rotating a token reconnects without an agent edit.</p>
+  <p><span class="src">crates/executor/src/managed_agents/adapters/mod.rs:673-683</span> · <span class="src">crates/executor/src/managed_agents/adapters/mod.rs:810-901</span> · <span class="src">crates/executor/src/managed_agents/adapters/mod.rs:440-453</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Pin the vendor CLI version in one file shared by image, harness and worker</p>
+  <p><code>exoharness/containers/codex-sandbox/version</code> is read by the Dockerfile, by the harness (a startup <code>codex --version</code> check with a "rebuild the image" message) and by the Cloudflare runtime.</p>
+  <p><span class="src">exoharness/typescript/codex/harness.ts:1489-1498</span> · <span class="src">exoharness/cloudflare/src/runtime-io.ts:5</span></p>
+</div>
+
+<h2>Harness and tooling techniques</h2>
+
+<div class="callout idea">
+  <p class="callout-title">Warm process reuse recorded in the event log</p>
+  <p><code>startSandboxProcess({reuseKey})</code> appends a <code>typescript_sandbox_process_reuse</code> event. A new runner, even after a restart, finds the newest generation for that key, re-attaches at the cursor of its last output event and never resurrects an older generation. A vendor server can outlive the harness runner with no extra state store.</p>
+  <p><span class="src">crates/executor/src/typescript_runtime.rs:306-467</span> · <span class="src">crates/executor/src/typescript_runtime.rs:789-884</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Tunnel host RPC through a UI primitive</p>
+  <p>Pi's RPC mode has no tool-callback channel, so the generated extension calls <code>ctx.ui.input(method, JSON)</code> and the harness answers the <code>extension_ui_request</code> with an <code>extension_ui_response</code>. The same trick carries both authorization and execution of Exo tools into a sandboxed agent that was never designed for it.</p>
+  <p><span class="src">exoharness/examples/typescript/pi-harness.ts:28-63</span> · <span class="src">exoharness/examples/typescript/pi-harness.ts:173-232</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Match an anonymous approval to its call by message plus deep-equal args</p>
+  <p>Codex's MCP approval elicitation carries no call id. The harness tracks <code>mcpToolCall</code> items from <code>item/started</code> and matches by server, exact prompt string and <code>isDeepStrictEqual</code> on arguments, deleting matches so duplicates stay independent. The failure mode is deny.</p>
+  <p><span class="src">exoharness/typescript/codex/mcp-approval.ts:9-35</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Chunked replay that never splits a call from its output</p>
+  <p><code>codexReplayChunks</code> groups items into units that close all pending <code>function_call</code> ids, packs units into 256k-character chunks, and calls <code>thread/compact/start</code> between chunks. A long Exo history can be replayed into a fresh Codex thread without exceeding its window.</p>
+  <p><span class="src">exoharness/typescript/codex/replay.ts:54-144</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">An <code>authorization: "runtime"</code> flag prevents double approval</p>
+  <p>TS tools that delegate to Rust (<code>shell</code>, MCP, client tools) are marked so the TS registry skips <code>authorizeTool</code>, and the Rust <code>execute_tool</code> handler authorizes exactly once. TS-native tools use the explicit <code>AuthorizeTool</code> request.</p>
+  <p><span class="src">exoharness/typescript/harness/tools.ts:29-34</span> · <span class="src">crates/executor/src/typescript_runtime.rs:173-199</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Validate tool schemas at install time</p>
+  <p>Provider strict mode would make the API reject <em>every</em> turn over one bad schema. <code>validateStrictToolParameters</code> therefore runs in <code>manage_tool</code> (reject the install) and at registration (skip the one broken tool). Persisted tool config can also hold secrets by reference: a string value exactly <code>"${NAME}"</code> is resolved from host env at load, so the lockfile never stores the secret.</p>
+  <p><span class="src">exoharness/typescript/harness/tools.ts:331-386</span> · <span class="src">exoharness/typescript/harness/tool-modules.ts:261-296</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Progress as a tracing target</p>
+  <p>Backends log with <code>target: "exoharness::progress"</code>. The CLI maps that to spinner text on a TTY or plain lines otherwise, using a custom tracing <code>Layer</code>. The library stays headless and every backend gets progress UI for free. In the same spirit, <code>--token-env</code> accepts only an environment variable <em>name</em>, so secrets never land in argv or shell history.</p>
+  <p><span class="src">crates/cli/src/turn_display.rs:14-66</span> · <span class="src">crates/cli/src/main.rs:2510-2537</span></p>
+</div>
+
+<h2>Agent design and prompting</h2>
+
+<p>Prompt text is collected on <a href="prompts.html">its own page</a>; the transferable techniques are these.</p>
+
+<div class="callout idea">
+  <p class="callout-title">Recompute instructions every round instead of storing them</p>
+  <p>Instructions are prepended to the replayed history on each model call, and the harness <code>instructions</code> hook is async. The prompt can carry the current game screenshot, todo list, memory block or skill index without any of it accumulating in the log. The Game Boy harness uses this: tools return only text, and a fresh screenshot plus RAM state is injected each round, so stale frames never pile up.</p>
+  <p><span class="src">exoharness/typescript/harness/index.ts:754-762</span> · <span class="src">exoharness/typescript/model-runtime/turn-loop.ts:150-155</span> · <span class="src">exoharness/examples/gameboy-agent/agent/harness.ts:82-104</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Context as a variable (recursive language model)</p>
+  <p>The root prompt holds only the latest request, the transcript length and a 400-character preview. The model reads the flattened transcript with code in a JS REPL and recurses via a tool-less <code>subquery</code>. It finishes by setting <code>globalThis.Final</code>. Everything is logged as <code>rlm_*</code> custom events.</p>
+  <p><span class="src">crates/executor/src/native/rlm.rs:613-636</span> · <span class="src">exoharness/examples/typescript/rlm-harness.ts:106-123</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Pick the failure mode per store by regenerability</p>
+  <p>Memory (not regenerable) throws on write when corrupt but degrades its read path to a "memory unavailable, do not assume it is empty" developer message so prompt assembly never bricks. Todos (regenerable) silently reset. Skills publish content before the index entry for the same reason.</p>
+  <p><span class="src">examples/self-improving-agent/tools/memory-tools.ts:190-209</span> · <span class="src">examples/self-improving-agent/tools/todo-tools.ts:60-66</span> · <span class="src">exoharness/typescript/harness/skill-tools.ts:507-528</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Narrow facade plus detached helper for self-restart</p>
+  <p><code>rebuild_and_restart_exo</code> writes a durable <code>queued</code> record, spawns a detached bash helper and returns immediately. The helper waits 2 s so the turn can finish, runs the guardian, then records the outcome as a conversation event. A failed build leaves the old system running because the build happens before anything is stopped. The agent can restart its own host without ever holding a host shell.</p>
+  <p><span class="src">examples/self-improving-agent/tools/guardian-tools.ts:88-167</span> · <span class="src">examples/self-improving-agent/scripts/deferred-rebuild-and-restart:37-73</span> · <a href="examples.html">examples</a></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Claim-by-delete drain markers</p>
+  <p>The guardian creates <code>.exo/exo-scheduler.restart</code>. The scheduler claims it with <code>remove_file(...).is_ok()</code> between passes and exits; an unclaimed marker after 15 s means kill the process tree. No signals, no IPC, and exactly one claimant by atomic unlink.</p>
+  <p><span class="src">examples/self-improving-agent/scripts/exo-service-guardian:277-316</span> · <span class="src">examples/self-improving-agent/scheduler-runner/src/main.rs:155-157</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Repeat a rule at every place the model looks when it errs</p>
+  <p>The "no zod / inputSchema / runtime imports" list for agent-written tools appears in a developer instruction, the tool description, the parameter description and the self-improving manual. The same goes for "never pass /tmp or an absolute sandbox path" to <code>manage_tool</code>. Redundant on purpose, since each location is where a different failure surfaces.</p>
+  <p><span class="src">exoharness/typescript/model-runtime/turn-loop.ts:98</span> · <span class="src">exoharness/typescript/harness/built-in-tools.ts:149</span> · <span class="src">exoharness/typescript/harness/built-in-tools.ts:169</span></p>
+</div>
+
+<h2>Sandboxes and isolation</h2>
+
+<div class="callout idea">
+  <p class="callout-title">Traits that bail by default, plus a declared restore set</p>
+  <p><code>ManagedSandboxHandle</code> and <code>ManagedSandboxBackend</code> make only the core mandatory. Managed processes, terminals, TCP, fork and snapshot deletion all default to <code>bail!("... does not support ...")</code> or <code>Ok(None)</code>. Restore compatibility is a declared list (<code>consumable_snapshot_formats</code>) that the harness checks before dispatch, so producers and consumers never need to know about each other. <code>SandboxProvider</code> and <code>SnapshotFormat</code> are open-string newtypes, so a third party can add a backend or a private format without touching a core enum.</p>
+  <p><span class="src">crates/exoharness/src/sandbox.rs:213-316</span> · <span class="src">crates/exoharness/src/sandbox.rs:388-390</span> · <span class="src">crates/exoharness/src/types.rs:1020-1045</span> · <a href="sandboxes.html">sandboxes</a></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Shared immutable lower layer, sparse per-VM upper</p>
+  <p>One digest-cached read-only ext4 image is hard-linked into every Firecracker jail. Each VM only gets a lazily formatted sparse ext4 that serves as the OverlayFS upper, and the guest moves the merged mount over <code>/</code>. No base-image copy at boot.</p>
+  <p><span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:3966-4002</span> · <span class="src">crates/firecracker-guest/src/linux.rs:1054-1108</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">A runtime fingerprint gates adoption and restore</p>
+  <p><code>FirecrackerRuntimeFingerprint</code> holds the arch, protocol version, sha256 of the firecracker, jailer, kernel and initramfs, vCPU, memory, device policy and guest-root flag. It is stored in every machine manifest and snapshot manifest, and a running VM or snapshot is reused only when it matches the current host.</p>
+  <p><span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:258-307</span> · <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:1207-1218</span> · <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:2044-2075</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Idle TTL as a lease-file mtime</p>
+  <p>The TTL is in the immutable machine manifest, and last use is the mtime of a lease file replaced by write-temp-and-rename. Any later process can compute expiry from disk and reap VMs it never started, with no daemon.</p>
+  <p><span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:3003-3034</span> · <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:3090-3122</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Keep the pause window minimal for full snapshots, and never hard-link out of the jail</p>
+  <p>Memory is a <code>Diff</code> snapshot over a reflinked seed of the previous memory file with dirty-page tracking. Only the memory and overlay-disk reflinks happen while the VM is paused. The published template is a copy, never a hard link, because a compromised VMM may hold a file descriptor into jail files. A <code>snapshot-pending</code> marker blocks re-capture after an interrupted diff.</p>
+  <p><span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:4935-5013</span> · <span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:4868-4874</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">One long-poll process bridge, three transports</p>
+  <p><code>process_bridge::Request</code> (<code>write</code>, <code>close_stdin</code>, <code>recv{timeout}</code>, <code>resize</code>) is the wire shape for the Firecracker guest agent, for a Python script injected into Vercel and AgentCore sandboxes, and for the host pump. Any provider that can only "run a command" gets streaming stdin and stdout.</p>
+  <p><span class="src">crates/exoharness/src/sandbox_provider/process_bridge.rs:226-300</span> · <span class="src">crates/exoharness/src/sandbox_provider/process_bridge.rs:339-382</span> · <span class="src">crates/firecracker-protocol/src/lib.rs:73-81</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Edge-triggered guest readiness over vsock</p>
+  <p>The host binds <code>&lt;vsock&gt;_10053</code> before boot. The guest agent connects once its own listener is up and writes one byte, so boot waits on a socket event instead of a ping loop.</p>
+  <p><span class="src">crates/exoharness/src/sandbox_provider/firecracker.rs:5144-5156</span> · <span class="src">crates/firecracker-guest/src/linux.rs:965-1000</span></p>
+</div>
+
+<div class="callout idea">
+  <p class="callout-title">Refuse to create a Lima VM implicitly</p>
+  <p>The macOS path will not <code>limactl start</code> an instance that does not exist, because that would silently create a VM mounting <code>$HOME</code>. The inner Linux backend is the same <code>FirecrackerSandboxBackend</code>, driven over a stdio bridge, while credentials and the egress runtime stay in the macOS process.</p>
+  <p><span class="src">crates/exoharness/src/sandbox_provider/firecracker_lima.rs:1590-1645</span> · <span class="src">crates/exoharness/src/sandbox_provider/firecracker_bridge.rs:220-250</span></p>
+</div>
+
+</main>
+<aside class="toc" id="toc"></aside>
+</div>
+<script src="assets/wiki.js"></script>
+</body>
+</html>

@@ -5,6 +5,7 @@
     "coverage/**",
     "node_modules/**",
     "website/docs-src/**",
+    "wiki/**",
     "scratch/**",
     "eval/harbor/datasets/swebench-lite/task-template/**"
   ],
